@@ -12,6 +12,9 @@ use axum::Router;
 use serde_json::{json, Value};
 use sotto_server::cloud_provider::{PayerKind, ProviderEnvironment};
 use sotto_server::cloud_provider_stripe::{StripeAllocationBinding, StripeCoverageConfig};
+use sotto_server::cloud_provider_stripe_corrections::{
+    StripeCorrectionUnresolved, StripePersonalInvoiceCorrectionEvidence,
+};
 use sotto_server::cloud_provider_stripe_http::{
     StripeCreditNoteResource, StripeCreditNoteStatus, StripeCreditNoteType, StripeDisputeResource,
     StripeDisputeStatus, StripeReadClient, StripeReadError, StripeReadLimits, StripeReadSession,
@@ -274,6 +277,28 @@ fn observation_responses(
     responses
 }
 
+fn correction_observation_responses(
+    refunds: Vec<Value>,
+    disputes: Vec<Value>,
+    credit_notes: Vec<Value>,
+) -> HashMap<String, Vec<MockResponse>> {
+    let mut responses =
+        observation_responses(paid_invoice(), personal_line("il_1"), paid_payment());
+    responses.insert(
+        "/v1/refunds".into(),
+        vec![MockResponse::json(list(refunds, false))],
+    );
+    responses.insert(
+        "/v1/disputes".into(),
+        vec![MockResponse::json(list(disputes, false))],
+    );
+    responses.insert(
+        "/v1/credit_notes".into(),
+        vec![MockResponse::json(list(credit_notes, false))],
+    );
+    responses
+}
+
 #[tokio::test]
 async fn assembles_a_personal_invoice_observation_from_complete_reads() {
     let mut responses = HashMap::new();
@@ -315,6 +340,118 @@ async fn assembles_a_personal_invoice_observation_from_complete_reads() {
         observation.evidence_reference(),
         "stripe:invoice:in_1:line:il_1"
     );
+}
+
+#[tokio::test]
+async fn assembles_invoice_corrections_without_combining_their_amounts() {
+    let server = mock_server(correction_observation_responses(
+        vec![refund("re_1", json!("succeeded"))],
+        vec![dispute("du_1", "needs_response")],
+        vec![credit_note("cn_1", "issued", "post_payment")],
+    ))
+    .await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+    let result = client
+        .personal_invoice_correction_evidence(&mut session, "in_1", &personal_binding())
+        .await
+        .unwrap();
+
+    let StripePersonalInvoiceCorrectionEvidence::Associated(associated) = result else {
+        panic!("expected associated correction evidence");
+    };
+    assert_eq!(associated.observation().invoice_id(), "in_1");
+    assert_eq!(associated.refunds().len(), 1);
+    assert_eq!(associated.refunds()[0].id(), "re_1");
+    assert_eq!(associated.disputes().len(), 1);
+    assert_eq!(associated.disputes()[0].id(), "du_1");
+    assert_eq!(associated.credit_notes().len(), 1);
+    assert_eq!(associated.credit_notes()[0].id(), "cn_1");
+    assert_eq!(associated.refunds()[0].amount(), 299);
+    assert_eq!(associated.credit_notes()[0].post_payment_amount(), 299);
+    assert!(!format!("{associated:?}").contains("598"));
+}
+
+#[tokio::test]
+async fn unresolved_correction_links_never_become_verified_collections() {
+    let missing_parent = with_fields(
+        refund("re_orphan", json!("succeeded")),
+        &[("payment_intent", Some(Value::Null))],
+    );
+    let unknown_status = refund("re_unknown", json!("provider_future_state"));
+    let missing_dispute_parent = with_fields(
+        dispute("du_orphan", "needs_response"),
+        &[("payment_intent", Some(Value::Null))],
+    );
+    let unknown_note_type = credit_note("cn_unknown", "issued", "future_type");
+    let server = mock_server(correction_observation_responses(
+        vec![unknown_status, missing_parent],
+        vec![missing_dispute_parent],
+        vec![unknown_note_type],
+    ))
+    .await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+    let result = client
+        .personal_invoice_correction_evidence(&mut session, "in_1", &personal_binding())
+        .await
+        .unwrap();
+
+    let StripePersonalInvoiceCorrectionEvidence::Unresolved(unresolved) = result else {
+        panic!("expected unresolved correction evidence");
+    };
+    assert_eq!(unresolved.invoice_id(), "in_1");
+    assert!(unresolved.reasons().contains(
+        &StripeCorrectionUnresolved::RefundMissingPaymentIntent {
+            refund_id: "re_orphan".into()
+        }
+    ));
+    assert!(unresolved
+        .reasons()
+        .contains(&StripeCorrectionUnresolved::RefundUnknownStatus {
+            refund_id: "re_unknown".into(),
+            status: "provider_future_state".into()
+        }));
+    assert!(unresolved.reasons().contains(
+        &StripeCorrectionUnresolved::DisputeMissingPaymentIntent {
+            dispute_id: "du_orphan".into()
+        }
+    ));
+    assert!(unresolved
+        .reasons()
+        .contains(&StripeCorrectionUnresolved::CreditNoteUnknownType {
+            credit_note_id: "cn_unknown".into(),
+            note_type: "future_type".into()
+        }));
+}
+
+#[tokio::test]
+async fn correction_contradictions_override_unresolved_records() {
+    let unresolved = with_fields(
+        refund("re_orphan", json!("succeeded")),
+        &[("payment_intent", Some(Value::Null))],
+    );
+    let contradictory_note = with_fields(
+        credit_note("cn_other", "issued", "post_payment"),
+        &[("customer", Some(json!("cus_other")))],
+    );
+    let server = mock_server(correction_observation_responses(
+        vec![unresolved],
+        Vec::new(),
+        vec![contradictory_note],
+    ))
+    .await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+    assert!(matches!(
+        client
+            .personal_invoice_correction_evidence(&mut session, "in_1", &personal_binding())
+            .await,
+        Err(StripeReadError::ParentMismatch)
+    ));
 }
 
 #[tokio::test]
