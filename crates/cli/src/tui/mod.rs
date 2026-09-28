@@ -97,6 +97,12 @@ impl Drop for TerminalGuard {
                 Show
             );
         }
+        // `set_hook` panics on a thread that is already panicking, and a panic in a destructor
+        // during unwinding aborts the process. Mid-unwind the dashboard's hook has already
+        // restored the terminal and the process is on its way out, so leave it installed.
+        if std::thread::panicking() {
+            return;
+        }
         if let Some(prev) = self.original_panic_hook.take() {
             std::panic::set_hook(Box::new(move |panic_info| {
                 prev(panic_info);
@@ -211,5 +217,23 @@ mod tests {
             "a panic after the dashboard closed must not touch the terminal"
         );
         assert!(reached_previous, "the previous hook must handle it instead");
+    }
+
+    #[test]
+    fn terminal_guard_dropped_by_a_panic_lets_it_unwind() {
+        let (_, restore) = recording_restore();
+        let mut outcome = None;
+
+        // Without the `panicking()` check this never returns: dropping the guard mid-unwind
+        // calls `set_hook` on a panicking thread and the whole test binary aborts.
+        sentinel_ran_during(|| {
+            outcome = Some(std::panic::catch_unwind(move || {
+                let mut guard = TerminalGuard::new();
+                guard.install_panic_hook(restore);
+                panic!("dashboard panicked");
+            }));
+        });
+
+        assert!(matches!(outcome, Some(Err(_))), "the panic must unwind");
     }
 }
