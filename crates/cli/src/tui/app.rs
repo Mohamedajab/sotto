@@ -444,4 +444,88 @@ mod tests {
         tui_app.page_up(20);
         assert_eq!(tui_app.selected_filtered_index, 0);
     }
+
+    #[test]
+    fn all_movement_paths_reset_revealed_cache() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::default();
+        let app = App::new(&store, &keychain);
+        for i in 0..10 {
+            app.set(
+                &config,
+                &format!("KEY_{i:02}"),
+                format!("secret-value-{i}").as_bytes(),
+            )
+            .unwrap();
+        }
+
+        struct MovementCase {
+            name: &'static str,
+            start_idx: usize,
+            action: fn(&mut TuiApp),
+        }
+
+        let movements = [
+            MovementCase {
+                name: "move_selection_up",
+                start_idx: 5,
+                action: |a| a.move_selection_up(),
+            },
+            MovementCase {
+                name: "move_selection_down",
+                start_idx: 5,
+                action: |a| a.move_selection_down(),
+            },
+            MovementCase {
+                name: "move_selection_home",
+                start_idx: 5,
+                action: |a| a.move_selection_home(),
+            },
+            MovementCase {
+                name: "move_selection_end",
+                start_idx: 5,
+                action: |a| a.move_selection_end(),
+            },
+            MovementCase {
+                name: "page_up",
+                start_idx: 5,
+                action: |a| a.page_up(2),
+            },
+            MovementCase {
+                name: "page_down",
+                start_idx: 5,
+                action: |a| a.page_down(2),
+            },
+        ];
+
+        for case in movements {
+            let mut tui_app = TuiApp::new(&app, &store, config.clone(), &theme).unwrap();
+            tui_app.selected_filtered_index = case.start_idx;
+            tui_app.toggle_reveal().unwrap();
+            assert!(
+                tui_app.revealed,
+                "secret must be revealed before move for {}",
+                case.name
+            );
+            assert!(
+                tui_app.decrypted_cache.is_some(),
+                "cache must be populated before move for {}",
+                case.name
+            );
+
+            // Execute movement
+            (case.action)(&mut tui_app);
+
+            assert!(
+                !tui_app.revealed,
+                "{} must reset revealed state to false",
+                case.name
+            );
+            assert!(
+                tui_app.decrypted_cache.is_none(),
+                "{} must clear decrypted cleartext cache",
+                case.name
+            );
+        }
+    }
 }
