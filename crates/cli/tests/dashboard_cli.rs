@@ -1,4 +1,4 @@
-//! Integration tests for bare `sotto` invocations and dashboard launch behavior.
+//! Integration tests for bare `sotto` invocations and dashboard launch behaviour.
 
 use std::process::Command;
 
@@ -32,7 +32,7 @@ fn non_interactive_bare_sotto_prints_help_to_stderr_and_exits_2() {
     );
     assert!(
         !data_dir.exists(),
-        "bare non-interactive invocation must not initialize data dir"
+        "bare non-interactive invocation must not initialise data dir"
     );
 }
 
@@ -74,6 +74,7 @@ mod pty_tests {
         status: std::process::ExitStatus,
         stdout: Vec<u8>,
         stderr: Vec<u8>,
+        termios_after_exit: Option<nix::sys::termios::Termios>,
     }
 
     fn run_on_pty_with_input(command: &mut Command, input: &[u8]) -> PtyRun {
@@ -104,6 +105,8 @@ mod pty_tests {
             master_file.write_all(input).expect("write input to pty");
         }
 
+        let slave_check = stdout_pty.slave.try_clone().expect("clone slave pty");
+
         let mut child = command.spawn().expect("spawn on a pseudo terminal");
 
         drop(stdout_pty.slave);
@@ -116,11 +119,14 @@ mod pty_tests {
         let stdout_reader = read_master(stdout_pty.master);
         let stderr_reader = read_master(stderr_pty.master);
         let status = wait_bounded(&mut child);
+        let termios_after_exit = tcgetattr(&slave_check).ok();
+        drop(slave_check);
 
         PtyRun {
             status,
             stdout: stdout_reader.join().expect("stdout reader"),
             stderr: stderr_reader.join().expect("stderr reader"),
+            termios_after_exit,
         }
     }
 
@@ -232,6 +238,68 @@ mod pty_tests {
         assert!(
             stderr.contains("no identity"),
             "expected no identity error: {stderr}"
+        );
+    }
+
+    #[test]
+    fn bare_sotto_on_pty_launches_dashboard_and_restores_terminal_on_quit() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let data_dir = scratch.path().join("sotto-data");
+
+        // Initialise a valid sotto project and identity non-interactively
+        let init_output = Command::new(env!("CARGO_BIN_EXE_sotto"))
+            .current_dir(scratch.path())
+            .env("SOTTO_DATA_DIR", &data_dir)
+            .env("SOTTO_PASSWORD", "test-master-password")
+            .arg("init")
+            .output()
+            .expect("run sotto init");
+        assert_eq!(
+            init_output.status.code(),
+            Some(0),
+            "init must succeed: {}",
+            String::from_utf8_lossy(&init_output.stderr)
+        );
+
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_sotto"));
+        cmd.current_dir(scratch.path())
+            .env("SOTTO_DATA_DIR", &data_dir)
+            .env("TERM", "xterm-256color")
+            .env_remove("SOTTO_TOKEN")
+            .env_remove("SOTTO_THEME")
+            .env_remove("CI");
+
+        // Send 'q' to quit dashboard immediately upon launch
+        let run = run_on_pty_with_input(&mut cmd, b"q");
+        assert_eq!(run.status.code(), Some(0));
+
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        // Alternate screen entered and left
+        assert!(
+            stdout.contains("\x1b[?1049h"),
+            "expected alternate screen enter sequence \\x1b[?1049h in stdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("\x1b[?1049l"),
+            "expected alternate screen leave sequence \\x1b[?1049l in stdout: {stdout}"
+        );
+        // Cursor hidden and shown
+        assert!(
+            stdout.contains("\x1b[?25l"),
+            "expected cursor hide sequence \\x1b[?25l in stdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("\x1b[?25h"),
+            "expected cursor show sequence \\x1b[?25h in stdout: {stdout}"
+        );
+
+        // Verify canonical mode (raw mode disabled) was restored on slave pty
+        let termios = run
+            .termios_after_exit
+            .expect("slave pty termios after child exit");
+        assert!(
+            termios.local_flags.contains(LocalFlags::ICANON),
+            "expected ICANON flag restored after dashboard exit"
         );
     }
 }

@@ -54,6 +54,11 @@ impl TerminalGuard {
         self.entered_screen = true;
         execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture, Hide)?;
 
+        self.install_panic_hook();
+        Ok(())
+    }
+
+    fn install_panic_hook(&mut self) {
         let original = std::panic::take_hook();
         let original_arc = Arc::new(original);
         let panic_prev = Arc::clone(&original_arc);
@@ -70,7 +75,6 @@ impl TerminalGuard {
         }));
 
         self.original_panic_hook = Some(original_arc);
-        Ok(())
     }
 }
 
@@ -133,7 +137,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
-    fn terminal_guard_restores_panic_hook_on_teardown() {
+    fn terminal_guard_restores_panic_hook_on_drop() {
         let sentinel_flag = Arc::new(AtomicBool::new(false));
         let flag_clone = Arc::clone(&sentinel_flag);
 
@@ -145,27 +149,51 @@ mod tests {
 
         {
             let mut guard = TerminalGuard::new();
-            let original = std::panic::take_hook();
-            let original_arc = Arc::new(original);
-            let panic_prev = Arc::clone(&original_arc);
-
-            std::panic::set_hook(Box::new(move |panic_info| {
-                let _ = disable_raw_mode();
-                panic_prev(panic_info);
-            }));
-
-            guard.original_panic_hook = Some(original_arc);
-            // Verify inner hook was installed
+            guard.install_panic_hook();
             assert!(guard.original_panic_hook.is_some());
         } // guard drops here and must restore sentinel hook
 
-        // Retrieve restored hook and verify sentinel was reinstated
-        let restored_hook = std::panic::take_hook();
+        // Trigger a panic inside catch_unwind to verify the sentinel hook was restored
+        let _ = std::panic::catch_unwind(|| {
+            panic!("test panic to trigger restored sentinel hook");
+        });
+
         // Restore initial hook for test runner safety before asserting
+        let _ = std::panic::take_hook();
         std::panic::set_hook(test_prev);
 
-        // Verify restored hook was not None
-        drop(restored_hook);
-        assert!(!sentinel_flag.load(Ordering::SeqCst));
+        assert!(
+            sentinel_flag.load(Ordering::SeqCst),
+            "sentinel panic hook must be executed after terminal guard is dropped"
+        );
+    }
+
+    #[test]
+    fn terminal_guard_panic_hook_executes_and_delegates() {
+        let sentinel_flag = Arc::new(AtomicBool::new(false));
+        let flag_clone = Arc::clone(&sentinel_flag);
+
+        let test_prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |_| {
+            flag_clone.store(true, Ordering::SeqCst);
+        }));
+
+        let mut guard = TerminalGuard::new();
+        guard.install_panic_hook();
+
+        // While guard is active, a panic must execute the guard's hook and delegate
+        let _ = std::panic::catch_unwind(|| {
+            panic!("test panic while terminal guard is active");
+        });
+
+        assert!(
+            sentinel_flag.load(Ordering::SeqCst),
+            "guard panic hook must delegate to previous hook when a panic occurs"
+        );
+
+        // Teardown
+        drop(guard);
+        let _ = std::panic::take_hook();
+        std::panic::set_hook(test_prev);
     }
 }
