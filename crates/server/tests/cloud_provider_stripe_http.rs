@@ -384,6 +384,49 @@ async fn assembles_invoice_corrections_without_combining_their_amounts() {
 }
 
 #[tokio::test]
+async fn correction_evidence_is_stable_when_provider_pages_change_order() {
+    let first = mock_server(correction_observation_responses(
+        vec![
+            refund("re_2", json!("failed")),
+            refund("re_1", json!("succeeded")),
+        ],
+        vec![dispute("du_2", "won"), dispute("du_1", "needs_response")],
+        vec![
+            credit_note("cn_2", "void", "mixed"),
+            credit_note("cn_1", "issued", "post_payment"),
+        ],
+    ))
+    .await;
+    let second = mock_server(correction_observation_responses(
+        vec![
+            refund("re_1", json!("succeeded")),
+            refund("re_2", json!("failed")),
+        ],
+        vec![dispute("du_1", "needs_response"), dispute("du_2", "won")],
+        vec![
+            credit_note("cn_1", "issued", "post_payment"),
+            credit_note("cn_2", "void", "mixed"),
+        ],
+    ))
+    .await;
+    let first_client =
+        StripeReadClient::for_test(API_KEY, &config(), first.origin.clone(), limits()).unwrap();
+    let second_client =
+        StripeReadClient::for_test(API_KEY, &config(), second.origin.clone(), limits()).unwrap();
+    let mut first_session = first_client.session();
+    let mut second_session = second_client.session();
+    let first_result = first_client
+        .personal_invoice_correction_evidence(&mut first_session, "in_1", &personal_binding())
+        .await
+        .unwrap();
+    let second_result = second_client
+        .personal_invoice_correction_evidence(&mut second_session, "in_1", &personal_binding())
+        .await
+        .unwrap();
+    assert_eq!(first_result, second_result);
+}
+
+#[tokio::test]
 async fn unresolved_correction_links_never_become_verified_collections() {
     let missing_parent = with_fields(
         refund("re_orphan", json!("succeeded")),
