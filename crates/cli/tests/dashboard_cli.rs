@@ -62,7 +62,9 @@ mod pty_tests {
     use std::fs::File;
     use std::io::{Read, Write};
     use std::os::fd::OwnedFd;
+    use std::path::PathBuf;
     use std::process::{Child, Stdio};
+    use std::sync::OnceLock;
     use std::time::{Duration, Instant};
 
     use nix::errno::Errno;
@@ -241,6 +243,111 @@ mod pty_tests {
         );
     }
 
+    fn guard_probe_binary() -> PathBuf {
+        static PROBE: OnceLock<PathBuf> = OnceLock::new();
+        PROBE
+            .get_or_init(|| {
+                let binary = PathBuf::from(env!("CARGO_BIN_EXE_sotto"));
+                let profile_dir = binary.parent().expect("profile directory").to_path_buf();
+                let probe = profile_dir.join("examples").join("terminal_guard_probe");
+                let target_dir = profile_dir.parent().expect("target directory");
+                let profile = profile_dir
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .expect("profile name");
+                let profile = if profile == "debug" { "dev" } else { profile };
+                let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+                let output = Command::new(cargo)
+                    .args([
+                        "build",
+                        "--quiet",
+                        "--example",
+                        "terminal_guard_probe",
+                        "--profile",
+                    ])
+                    .arg(profile)
+                    .arg("--target-dir")
+                    .arg(target_dir)
+                    .current_dir(env!("CARGO_MANIFEST_DIR"))
+                    .output()
+                    .expect("build the probe example");
+                assert!(
+                    output.status.success(),
+                    "cargo build --example terminal_guard_probe failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(
+                    probe.is_file(),
+                    "probe example missing at {}",
+                    probe.display()
+                );
+                probe
+            })
+            .clone()
+    }
+
+    #[test]
+    fn terminal_guard_on_pty_restores_screen_and_raw_mode_on_drop() {
+        let mut cmd = Command::new(guard_probe_binary());
+        cmd.env("TERMINAL_GUARD_MODE", "lifecycle");
+
+        let run = run_on_pty_with_input(&mut cmd, b"");
+        assert_eq!(run.status.code(), Some(0));
+
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        assert!(
+            stdout.contains("\x1b[?1049h"),
+            "expected alternate screen enter sequence \\x1b[?1049h: {stdout}"
+        );
+        assert!(
+            stdout.contains("\x1b[?1049l"),
+            "expected alternate screen leave sequence \\x1b[?1049l: {stdout}"
+        );
+        assert!(
+            stdout.contains("\x1b[?25l"),
+            "expected cursor hide sequence \\x1b[?25l: {stdout}"
+        );
+        assert!(
+            stdout.contains("\x1b[?25h"),
+            "expected cursor show sequence \\x1b[?25h: {stdout}"
+        );
+
+        let termios = run
+            .termios_after_exit
+            .expect("slave pty termios after child exit");
+        assert!(
+            termios.local_flags.contains(LocalFlags::ICANON),
+            "expected ICANON flag restored after terminal guard drop"
+        );
+    }
+
+    #[test]
+    fn terminal_guard_on_pty_restores_screen_and_raw_mode_on_panic() {
+        let mut cmd = Command::new(guard_probe_binary());
+        cmd.env("TERMINAL_GUARD_MODE", "panic");
+
+        let run = run_on_pty_with_input(&mut cmd, b"");
+        assert!(!run.status.success(), "expected probe to fail via panic");
+
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        assert!(
+            stdout.contains("\x1b[?1049l"),
+            "expected alternate screen leave sequence \\x1b[?1049l on panic: {stdout}"
+        );
+        assert!(
+            stdout.contains("\x1b[?25h"),
+            "expected cursor show sequence \\x1b[?25h on panic: {stdout}"
+        );
+
+        let termios = run
+            .termios_after_exit
+            .expect("slave pty termios after child panic");
+        assert!(
+            termios.local_flags.contains(LocalFlags::ICANON),
+            "expected ICANON flag restored by panic hook"
+        );
+    }
+
     #[test]
     fn bare_sotto_on_pty_launches_dashboard_and_restores_terminal_on_quit() {
         let scratch = tempfile::tempdir().expect("scratch directory");
@@ -254,6 +361,18 @@ mod pty_tests {
             .arg("init")
             .output()
             .expect("run sotto init");
+
+        if init_output.status.code() == Some(5) {
+            let stderr = String::from_utf8_lossy(&init_output.stderr);
+            if stderr.contains("Platform secure storage failure")
+                || stderr.contains("org.freedesktop.secrets")
+                || stderr.contains("keychain error")
+            {
+                eprintln!("skipping: OS keychain not available in headless environment");
+                return;
+            }
+        }
+
         assert_eq!(
             init_output.status.code(),
             Some(0),
