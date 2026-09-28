@@ -54,24 +54,34 @@ impl TerminalGuard {
         self.entered_screen = true;
         execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture, Hide)?;
 
+        self.install_panic_hook(restore_terminal);
+        Ok(())
+    }
+
+    /// Chain a hook that runs `restore` before the previous hook prints the panic. The restore
+    /// step is a parameter so tests can observe the hook without driving a real terminal.
+    fn install_panic_hook(&mut self, restore: impl Fn() + Send + Sync + 'static) {
         let original = std::panic::take_hook();
         let original_arc = Arc::new(original);
         let panic_prev = Arc::clone(&original_arc);
 
         std::panic::set_hook(Box::new(move |panic_info| {
-            let _ = disable_raw_mode();
-            let _ = execute!(
-                io::stdout(),
-                LeaveAlternateScreen,
-                DisableMouseCapture,
-                Show
-            );
+            restore();
             panic_prev(panic_info);
         }));
 
         self.original_panic_hook = Some(original_arc);
-        Ok(())
     }
+}
+
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(
+        io::stdout(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        Show
+    );
 }
 
 impl Drop for TerminalGuard {
