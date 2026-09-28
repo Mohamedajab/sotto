@@ -371,6 +371,16 @@ async fn assembles_invoice_corrections_without_combining_their_amounts() {
     assert_eq!(associated.refunds()[0].amount(), 299);
     assert_eq!(associated.credit_notes()[0].post_payment_amount(), 299);
     assert!(!format!("{associated:?}").contains("598"));
+    let calls = server.state.calls.lock().unwrap();
+    assert!(calls.iter().any(|call| call
+        .path_and_query
+        .starts_with("/v1/refunds?payment_intent=pi_1")));
+    assert!(calls.iter().any(|call| call
+        .path_and_query
+        .starts_with("/v1/disputes?payment_intent=pi_1")));
+    assert!(calls.iter().any(|call| call
+        .path_and_query
+        .starts_with("/v1/credit_notes?invoice=in_1")));
 }
 
 #[tokio::test]
@@ -452,6 +462,65 @@ async fn correction_contradictions_override_unresolved_records() {
             .await,
         Err(StripeReadError::ParentMismatch)
     ));
+}
+
+#[tokio::test]
+async fn correction_operation_does_not_return_partial_results_after_a_late_failure() {
+    let mut responses =
+        observation_responses(paid_invoice(), personal_line("il_1"), paid_payment());
+    responses.insert(
+        "/v1/refunds".into(),
+        vec![
+            MockResponse::json(list(vec![refund("re_1", json!("succeeded"))], true)),
+            MockResponse::status(StatusCode::INTERNAL_SERVER_ERROR, "{}"),
+            MockResponse::status(StatusCode::INTERNAL_SERVER_ERROR, "{}"),
+        ],
+    );
+    let server = mock_server(responses).await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+    assert!(matches!(
+        client
+            .personal_invoice_correction_evidence(&mut session, "in_1", &personal_binding())
+            .await,
+        Err(StripeReadError::Retryable { status: 500 })
+    ));
+    assert!(!server
+        .state
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|call| call.path_and_query.starts_with("/v1/disputes")));
+}
+
+#[tokio::test]
+async fn correction_operation_shares_the_invoice_session_record_budget() {
+    let mut bounded = limits();
+    bounded.max_records = 2;
+    let server = mock_server(correction_observation_responses(
+        vec![refund("re_1", json!("succeeded"))],
+        Vec::new(),
+        Vec::new(),
+    ))
+    .await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), bounded).unwrap();
+    let mut session = client.session();
+    assert!(matches!(
+        client
+            .personal_invoice_correction_evidence(&mut session, "in_1", &personal_binding())
+            .await,
+        Err(StripeReadError::RecordBoundExceeded)
+    ));
+    assert!(!server
+        .state
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|call| call.path_and_query.starts_with("/v1/disputes")));
 }
 
 #[tokio::test]
