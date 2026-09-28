@@ -195,7 +195,9 @@ fn draw_right_pane(f: &mut Frame, app: &TuiApp, area: Rect) {
         ]));
         lines.push(Line::from(""));
 
-        // Secret value inspection
+        // Secret value inspection: ratatui's grapheme cell buffer structurally sanitises
+        // ANSI escapes and control characters before terminal output, making manual
+        // display_secret escaping unnecessary.
         lines.push(Line::from(Span::styled("Value:", styles.muted())));
 
         if app.revealed {
@@ -420,5 +422,126 @@ mod tests {
         // Verify version badge appears in list
         assert!(content.contains("DATABASE_URL"));
         assert!(content.contains("v1"));
+    }
+
+    #[test]
+    fn terminal_size_boundary_render_sweep() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::default();
+        let app = App::new(&store, &keychain);
+        app.set(&config, "DATABASE_URL", b"postgres://localhost")
+            .unwrap();
+        app.set(&config, "API_KEY", b"super-secret-token").unwrap();
+
+        let sizes: [(u16, u16); 10] = [
+            (80, 24),
+            (40, 12),
+            (20, 10),
+            (10, 6),
+            (5, 4),
+            (3, 3),
+            (2, 2),
+            (1, 1),
+            (80, 1),
+            (1, 24),
+        ];
+
+        for (width, height) in sizes {
+            for show_help in [false, true] {
+                for revealed in [false, true] {
+                    let mut tui_app = TuiApp::new(&app, &store, config.clone(), &theme).unwrap();
+                    tui_app.show_help = show_help;
+                    if revealed {
+                        tui_app.toggle_reveal().unwrap();
+                    }
+                    let backend = TestBackend::new(width, height);
+                    let mut terminal = Terminal::new(backend).unwrap();
+                    terminal
+                        .draw(|f| draw(f, &tui_app))
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "failed rendering at size {width}x{height} (help={show_help}, revealed={revealed}): {e}"
+                            );
+                        });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn render_masked_and_revealed_inspector() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::default();
+        let app = App::new(&store, &keychain);
+        app.set(&config, "SECRET_TOKEN", b"super-secret-cleartext")
+            .unwrap();
+
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // Masked state
+        terminal.draw(|f| draw(f, &tui_app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let content = format!("{buffer:?}");
+        assert!(content.contains("••••••••••••••••••••"));
+        assert!(content.contains("press `r` to reveal plaintext"));
+        assert!(!content.contains("super-secret-cleartext"));
+
+        // Revealed state
+        tui_app.toggle_reveal().unwrap();
+        terminal.draw(|f| draw(f, &tui_app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let content = format!("{buffer:?}");
+        assert!(content.contains("super-secret-cleartext"));
+        assert!(content.contains("plaintext unmasked"));
+    }
+
+    #[test]
+    fn render_help_modal_shortcuts() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::default();
+        let app = App::new(&store, &keychain);
+
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        tui_app.show_help = true;
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| draw(f, &tui_app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let content = format!("{buffer:?}");
+
+        assert!(content.contains("Keyboard Shortcuts"));
+        assert!(content.contains("Toggle this help screen"));
+        assert!(content.contains("Copy secret to clipboard"));
+        assert!(content.contains("Cycle active environment"));
+    }
+
+    #[test]
+    fn render_search_mode_and_filtering() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::default();
+        let app = App::new(&store, &keychain);
+        app.set(&config, "DATABASE_URL", b"postgres://localhost")
+            .unwrap();
+        app.set(&config, "API_TOKEN", b"token").unwrap();
+
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        tui_app.search_mode = true;
+        tui_app.search_query = "DATA".into();
+        tui_app.apply_filter();
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| draw(f, &tui_app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let content = format!("{buffer:?}");
+
+        assert!(content.contains("Search (typing... Esc to clear)"));
+        assert!(content.contains("DATABASE_URL"));
+        assert!(!content.contains("API_TOKEN"));
     }
 }

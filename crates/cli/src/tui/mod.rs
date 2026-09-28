@@ -32,14 +32,20 @@ use std::sync::Arc;
 
 type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static>;
 
-struct TerminalGuard {
+pub struct TerminalGuard {
     raw_mode: bool,
     entered_screen: bool,
     original_panic_hook: Option<Arc<PanicHook>>,
 }
 
+impl Default for TerminalGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TerminalGuard {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             raw_mode: false,
             entered_screen: false,
@@ -47,7 +53,7 @@ impl TerminalGuard {
         }
     }
 
-    fn enter(&mut self) -> Result<()> {
+    pub fn enter(&mut self) -> Result<()> {
         enable_raw_mode()?;
         self.raw_mode = true;
 
@@ -60,7 +66,7 @@ impl TerminalGuard {
 
     /// Chain a hook that runs `restore` before the previous hook prints the panic. The restore
     /// step is a parameter so tests can observe the hook without driving a real terminal.
-    fn install_panic_hook(&mut self, restore: impl Fn() + Send + Sync + 'static) {
+    pub fn install_panic_hook(&mut self, restore: impl Fn() + Send + Sync + 'static) {
         let original = std::panic::take_hook();
         let original_arc = Arc::new(original);
         let panic_prev = Arc::clone(&original_arc);

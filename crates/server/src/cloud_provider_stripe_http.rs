@@ -89,6 +89,8 @@ pub enum StripeReadError {
     AccountMismatch,
     #[error("Stripe resource mode did not match the configured environment")]
     ContextMismatch,
+    #[error("Stripe resource named a different parent than the one requested")]
+    ParentMismatch,
     #[error("Stripe authentication failed with status {status}")]
     Authentication { status: u16 },
     #[error("Stripe permission was denied with status {status}")]
@@ -397,6 +399,90 @@ impl StripeReadClient {
             validate_mode(payment.livemode, self.environment)?;
         }
         Ok(payments)
+    }
+
+    /// Enumerate every refund Stripe returns for one PaymentIntent, whatever its status.
+    ///
+    /// Each page repeats the `payment_intent` filter. An empty result means only that this
+    /// filtered enumeration returned no refunds. It is not a consistent snapshot: refunds can be
+    /// created or change state during or after the read.
+    pub async fn payment_intent_refunds(
+        &self,
+        session: &mut StripeReadSession,
+        payment_intent_id: &str,
+    ) -> Result<Vec<StripeRefundResource>, StripeReadError> {
+        self.ensure_account(session).await?;
+        validate_identifier(payment_intent_id)?;
+        let query = vec![("payment_intent".to_owned(), payment_intent_id.to_owned())];
+        self.list(session, "v1/refunds", query, |value| {
+            let refund = parse_refund(value)?;
+            if refund
+                .payment_intent_id
+                .as_deref()
+                .is_some_and(|id| id != payment_intent_id)
+            {
+                return Err(StripeReadError::ParentMismatch);
+            }
+            // Stripe documents no mode on refunds, so the verified account supplies it. A mode
+            // that is present anyway must still agree with that account.
+            if refund.livemode.is_some() {
+                validate_mode(refund.livemode, self.environment)?;
+            }
+            Ok(refund)
+        })
+        .await
+    }
+
+    /// Enumerate every dispute Stripe returns for one PaymentIntent, whatever its status.
+    ///
+    /// Each page repeats the `payment_intent` filter. An empty result means only that this
+    /// filtered enumeration returned no disputes. It is not a consistent snapshot: disputes can be
+    /// opened or change state during or after the read.
+    pub async fn payment_intent_disputes(
+        &self,
+        session: &mut StripeReadSession,
+        payment_intent_id: &str,
+    ) -> Result<Vec<StripeDisputeResource>, StripeReadError> {
+        self.ensure_account(session).await?;
+        validate_identifier(payment_intent_id)?;
+        let query = vec![("payment_intent".to_owned(), payment_intent_id.to_owned())];
+        self.list(session, "v1/disputes", query, |value| {
+            let dispute = parse_dispute(value)?;
+            if dispute
+                .payment_intent_id
+                .as_deref()
+                .is_some_and(|id| id != payment_intent_id)
+            {
+                return Err(StripeReadError::ParentMismatch);
+            }
+            validate_mode(Some(dispute.livemode), self.environment)?;
+            Ok(dispute)
+        })
+        .await
+    }
+
+    /// Enumerate every credit note Stripe returns for one invoice, issued or void.
+    ///
+    /// Each page repeats the `invoice` filter. An empty result means only that this filtered
+    /// enumeration returned no credit notes. It is not a consistent snapshot: notes can be issued
+    /// or voided during or after the read.
+    pub async fn invoice_credit_notes(
+        &self,
+        session: &mut StripeReadSession,
+        invoice_id: &str,
+    ) -> Result<Vec<StripeCreditNoteResource>, StripeReadError> {
+        self.ensure_account(session).await?;
+        validate_identifier(invoice_id)?;
+        let query = vec![("invoice".to_owned(), invoice_id.to_owned())];
+        self.list(session, "v1/credit_notes", query, |value| {
+            let note = parse_credit_note(value)?;
+            if note.invoice_id != invoice_id {
+                return Err(StripeReadError::ParentMismatch);
+            }
+            validate_mode(Some(note.livemode), self.environment)?;
+            Ok(note)
+        })
+        .await
     }
 
     pub async fn personal_invoice_observation(
@@ -841,6 +927,164 @@ impl StripeInvoicePaymentResource {
     }
 }
 
+/// One refund returned by [`StripeReadClient::payment_intent_refunds`].
+///
+/// This is evidence about a single object, not an interpreted correction. The list filter does not
+/// prove ownership: `payment_intent_id` is `None` when Stripe omitted the reference, and a later
+/// assembler must resolve that link through an authenticated parent read or treat it as
+/// unsupported. Charge reconciliation and deduplication against credit notes are also left to
+/// that later boundary. Stripe documents no mode on refunds, so `livemode` is normally `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StripeRefundResource {
+    pub id: String,
+    pub payment_intent_id: Option<String>,
+    pub charge_id: Option<String>,
+    pub amount: i64,
+    pub currency: String,
+    pub created: i64,
+    /// Stripe documents this as nullable. `None` is an absent status, never a settled refund.
+    pub status: Option<StripeRefundStatus>,
+    pub livemode: Option<bool>,
+}
+
+/// Refund states stay distinct so that a pending or failed refund cannot read as a completed one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StripeRefundStatus {
+    Pending,
+    RequiresAction,
+    Succeeded,
+    Failed,
+    Canceled,
+    /// A token this contract does not know. It must not be read as no correction.
+    Unknown(String),
+}
+
+impl StripeRefundStatus {
+    fn from_token(token: String) -> Self {
+        match token.as_str() {
+            "pending" => Self::Pending,
+            "requires_action" => Self::RequiresAction,
+            "succeeded" => Self::Succeeded,
+            "failed" => Self::Failed,
+            "canceled" => Self::Canceled,
+            _ => Self::Unknown(token),
+        }
+    }
+}
+
+/// One dispute returned by [`StripeReadClient::payment_intent_disputes`].
+///
+/// This is evidence about a single object, not an access decision. As with refunds, an absent
+/// `payment_intent_id` stays absent and must be resolved by a later authenticated read before it
+/// can be attributed to the requested PaymentIntent. Evidence, reasons, balance transactions and
+/// payment method details are not retained.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StripeDisputeResource {
+    pub id: String,
+    pub payment_intent_id: Option<String>,
+    pub charge_id: String,
+    pub amount: i64,
+    pub currency: String,
+    pub created: i64,
+    pub status: StripeDisputeStatus,
+    pub livemode: bool,
+}
+
+/// Dispute states stay distinct. An inquiry, an open dispute and each outcome can have different
+/// consequences, so none of them collapses into a single disputed flag here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StripeDisputeStatus {
+    WarningNeedsResponse,
+    WarningUnderReview,
+    WarningClosed,
+    NeedsResponse,
+    UnderReview,
+    Won,
+    Lost,
+    Prevented,
+    /// A token this contract does not know. It must not be read as no dispute or as resolved.
+    Unknown(String),
+}
+
+impl StripeDisputeStatus {
+    fn from_token(token: String) -> Self {
+        match token.as_str() {
+            "warning_needs_response" => Self::WarningNeedsResponse,
+            "warning_under_review" => Self::WarningUnderReview,
+            "warning_closed" => Self::WarningClosed,
+            "needs_response" => Self::NeedsResponse,
+            "under_review" => Self::UnderReview,
+            "won" => Self::Won,
+            "lost" => Self::Lost,
+            "prevented" => Self::Prevented,
+            _ => Self::Unknown(token),
+        }
+    }
+}
+
+/// One credit note returned by [`StripeReadClient::invoice_credit_notes`].
+///
+/// A credit note is not automatically a cash refund. `pre_payment_amount` reduced what the invoice
+/// asked for, while `post_payment_amount` was refunded, credited to the customer balance or
+/// credited outside Stripe. The note's embedded `lines` and `refunds` are previews rather than
+/// complete lists, so neither is retained or offered as evidence. Line enumeration, credit
+/// allocation and deduplication against refunds belong to a later boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StripeCreditNoteResource {
+    pub id: String,
+    pub invoice_id: String,
+    pub customer_id: String,
+    pub amount: i64,
+    pub pre_payment_amount: i64,
+    pub post_payment_amount: i64,
+    pub currency: String,
+    pub created: i64,
+    pub status: StripeCreditNoteStatus,
+    pub credit_note_type: StripeCreditNoteType,
+    pub livemode: bool,
+}
+
+/// A voided note must stay distinguishable from an issued one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StripeCreditNoteStatus {
+    Issued,
+    Void,
+    /// A token this contract does not know. It must not be read as void or as issued.
+    Unknown(String),
+}
+
+impl StripeCreditNoteStatus {
+    fn from_token(token: String) -> Self {
+        match token.as_str() {
+            "issued" => Self::Issued,
+            "void" => Self::Void,
+            _ => Self::Unknown(token),
+        }
+    }
+}
+
+/// Whether the note was issued before payment, after it, or across both. Stripe's prose names
+/// only the first two, but its enum also documents `mixed`, which is kept rather than rejected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StripeCreditNoteType {
+    PrePayment,
+    PostPayment,
+    Mixed,
+    /// A token this contract does not know. It must not be read as either payment phase.
+    Unknown(String),
+}
+
+impl StripeCreditNoteType {
+    fn from_token(token: String) -> Self {
+        match token.as_str() {
+            "pre_payment" => Self::PrePayment,
+            "post_payment" => Self::PostPayment,
+            "mixed" => Self::Mixed,
+            _ => Self::Unknown(token),
+        }
+    }
+}
+
 fn parse_subscription(value: &Value) -> Result<StripeSubscriptionResource, StripeReadError> {
     Ok(StripeSubscriptionResource {
         id: required_id(value, "subscription.id")?,
@@ -933,6 +1177,72 @@ fn parse_invoice_payment(value: &Value) -> Result<StripeInvoicePaymentResource, 
             payment.get("payment_intent"),
             "payment.payment_intent",
         )?,
+    })
+}
+
+fn parse_refund(value: &Value) -> Result<StripeRefundResource, StripeReadError> {
+    require_object(value, "refund", "refund.object")?;
+    Ok(StripeRefundResource {
+        id: required_id(value, "refund.id")?,
+        payment_intent_id: optional_validated_ref(
+            value.get("payment_intent"),
+            "refund.payment_intent",
+        )?,
+        charge_id: optional_validated_ref(value.get("charge"), "refund.charge")?,
+        amount: required_non_negative_i64(value.get("amount"), "refund.amount")?,
+        currency: required_currency(value.get("currency"), "refund.currency")?,
+        created: required_non_negative_i64(value.get("created"), "refund.created")?,
+        status: optional_token(value.get("status"), "refund.status")?
+            .map(StripeRefundStatus::from_token),
+        livemode: optional_bool(value.get("livemode"), "refund.livemode")?,
+    })
+}
+
+fn parse_dispute(value: &Value) -> Result<StripeDisputeResource, StripeReadError> {
+    require_object(value, "dispute", "dispute.object")?;
+    Ok(StripeDisputeResource {
+        id: required_id(value, "dispute.id")?,
+        payment_intent_id: optional_validated_ref(
+            value.get("payment_intent"),
+            "dispute.payment_intent",
+        )?,
+        charge_id: required_validated_ref(value.get("charge"), "dispute.charge")?,
+        amount: required_non_negative_i64(value.get("amount"), "dispute.amount")?,
+        currency: required_currency(value.get("currency"), "dispute.currency")?,
+        created: required_non_negative_i64(value.get("created"), "dispute.created")?,
+        status: optional_token(value.get("status"), "dispute.status")?
+            .map(StripeDisputeStatus::from_token)
+            .ok_or(StripeReadError::MalformedResponse("dispute.status"))?,
+        livemode: optional_bool(value.get("livemode"), "dispute.livemode")?
+            .ok_or(StripeReadError::MalformedResponse("dispute.livemode"))?,
+    })
+}
+
+fn parse_credit_note(value: &Value) -> Result<StripeCreditNoteResource, StripeReadError> {
+    require_object(value, "credit_note", "credit note.object")?;
+    Ok(StripeCreditNoteResource {
+        id: required_id(value, "credit note.id")?,
+        invoice_id: required_validated_ref(value.get("invoice"), "credit note.invoice")?,
+        customer_id: required_validated_ref(value.get("customer"), "credit note.customer")?,
+        amount: required_non_negative_i64(value.get("amount"), "credit note.amount")?,
+        pre_payment_amount: required_non_negative_i64(
+            value.get("pre_payment_amount"),
+            "credit note.pre_payment_amount",
+        )?,
+        post_payment_amount: required_non_negative_i64(
+            value.get("post_payment_amount"),
+            "credit note.post_payment_amount",
+        )?,
+        currency: required_currency(value.get("currency"), "credit note.currency")?,
+        created: required_non_negative_i64(value.get("created"), "credit note.created")?,
+        status: optional_token(value.get("status"), "credit note.status")?
+            .map(StripeCreditNoteStatus::from_token)
+            .ok_or(StripeReadError::MalformedResponse("credit note.status"))?,
+        credit_note_type: optional_token(value.get("type"), "credit note.type")?
+            .map(StripeCreditNoteType::from_token)
+            .ok_or(StripeReadError::MalformedResponse("credit note.type"))?,
+        livemode: optional_bool(value.get("livemode"), "credit note.livemode")?
+            .ok_or(StripeReadError::MalformedResponse("credit note.livemode"))?,
     })
 }
 
@@ -1058,6 +1368,13 @@ fn optional_validated_ref(
     Ok(Some(reference.to_owned()))
 }
 
+fn required_validated_ref(
+    value: Option<&Value>,
+    field: &'static str,
+) -> Result<String, StripeReadError> {
+    optional_validated_ref(value, field)?.ok_or(StripeReadError::MalformedResponse(field))
+}
+
 fn required_string(value: &Value, field: &'static str) -> Result<String, StripeReadError> {
     value
         .get(field)
@@ -1085,6 +1402,66 @@ fn required_i64(value: &Value, field: &'static str) -> Result<i64, StripeReadErr
         .get(field)
         .and_then(Value::as_i64)
         .ok_or(StripeReadError::MalformedResponse(field))
+}
+
+/// Minor-unit amounts and timestamps. Null is rejected rather than read as zero, and a negative
+/// value cannot describe a correction amount or a creation time.
+fn required_non_negative_i64(
+    value: Option<&Value>,
+    field: &'static str,
+) -> Result<i64, StripeReadError> {
+    value
+        .and_then(Value::as_i64)
+        .filter(|value| *value >= 0)
+        .ok_or(StripeReadError::MalformedResponse(field))
+}
+
+/// Stripe documents currencies as three-letter lowercase ISO codes. Anything else is shape drift,
+/// and accepting other casings would let later comparisons disagree about the same currency.
+fn required_currency(
+    value: Option<&Value>,
+    field: &'static str,
+) -> Result<String, StripeReadError> {
+    value
+        .and_then(Value::as_str)
+        .filter(|currency| currency.len() == 3 && currency.bytes().all(|b| b.is_ascii_lowercase()))
+        .map(str::to_owned)
+        .ok_or(StripeReadError::MalformedResponse(field))
+}
+
+fn require_object(
+    value: &Value,
+    object: &'static str,
+    field: &'static str,
+) -> Result<(), StripeReadError> {
+    if value.get("object").and_then(Value::as_str) == Some(object) {
+        Ok(())
+    } else {
+        Err(StripeReadError::MalformedResponse(field))
+    }
+}
+
+/// A status or type token. Unknown tokens are kept, so they must look like Stripe enum values:
+/// holding arbitrary provider text would let free text into retained evidence and Debug output.
+/// Documented tokens are well under 64 bytes, so the bound only stops text riding in as unknown.
+fn optional_token(
+    value: Option<&Value>,
+    field: &'static str,
+) -> Result<Option<String>, StripeReadError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_str()
+            .filter(|token| {
+                !token.is_empty()
+                    && token.len() <= 64
+                    && token
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            })
+            .map(|token| Some(token.to_owned()))
+            .ok_or(StripeReadError::MalformedResponse(field)),
+    }
 }
 
 fn validate_identifier(value: &str) -> Result<(), StripeReadError> {
