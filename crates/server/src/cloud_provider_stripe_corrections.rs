@@ -369,18 +369,26 @@ pub(crate) fn assemble(
             errors.push(StripeReadError::ContextMismatch);
             continue;
         }
-        if let StripeCreditNoteStatus::Unknown(status) = &note.status {
+        let unknown_status = if let StripeCreditNoteStatus::Unknown(status) = &note.status {
             unresolved.push(StripeCorrectionUnresolved::CreditNoteUnknownStatus {
                 credit_note_id: note.id.clone(),
                 status: status.clone(),
             });
-            continue;
-        }
-        if let StripeCreditNoteType::Unknown(note_type) = &note.credit_note_type {
+            true
+        } else {
+            false
+        };
+        let unknown_type = if let StripeCreditNoteType::Unknown(note_type) = &note.credit_note_type
+        {
             unresolved.push(StripeCorrectionUnresolved::CreditNoteUnknownType {
                 credit_note_id: note.id.clone(),
                 note_type: note_type.clone(),
             });
+            true
+        } else {
+            false
+        };
+        if unknown_status || unknown_type {
             continue;
         }
         verified_credit_notes.push(StripeVerifiedCreditNote {

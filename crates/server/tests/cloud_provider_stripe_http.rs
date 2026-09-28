@@ -437,11 +437,11 @@ async fn unresolved_correction_links_never_become_verified_collections() {
         dispute("du_orphan", "needs_response"),
         &[("payment_intent", Some(Value::Null))],
     );
-    let unknown_note_type = credit_note("cn_unknown", "issued", "future_type");
+    let unknown_note = credit_note("cn_unknown", "future_status", "future_type");
     let server = mock_server(correction_observation_responses(
         vec![unknown_status, missing_parent],
         vec![missing_dispute_parent],
-        vec![unknown_note_type],
+        vec![unknown_note],
     ))
     .await;
     let client =
@@ -477,6 +477,12 @@ async fn unresolved_correction_links_never_become_verified_collections() {
         .contains(&StripeCorrectionUnresolved::CreditNoteUnknownType {
             credit_note_id: "cn_unknown".into(),
             note_type: "future_type".into()
+        }));
+    assert!(unresolved
+        .reasons()
+        .contains(&StripeCorrectionUnresolved::CreditNoteUnknownStatus {
+            credit_note_id: "cn_unknown".into(),
+            status: "future_status".into()
         }));
 }
 
