@@ -13,7 +13,8 @@ use serde_json::{json, Value};
 use sotto_server::cloud_provider::{PayerKind, ProviderEnvironment};
 use sotto_server::cloud_provider_stripe::{StripeAllocationBinding, StripeCoverageConfig};
 use sotto_server::cloud_provider_stripe_corrections::{
-    StripeCorrectionUnresolved, StripePersonalInvoiceCorrectionEvidence,
+    evaluate_personal_invoice_access, StripeCorrectionUnresolved,
+    StripePersonalInvoiceAccessDecision, StripePersonalInvoiceCorrectionEvidence,
 };
 use sotto_server::cloud_provider_stripe_http::{
     StripeCreditNoteResource, StripeCreditNoteStatus, StripeCreditNoteType, StripeDisputeResource,
@@ -381,6 +382,34 @@ async fn assembles_invoice_corrections_without_combining_their_amounts() {
     assert!(calls.iter().any(|call| call
         .path_and_query
         .starts_with("/v1/credit_notes?invoice=in_1")));
+}
+
+#[tokio::test]
+async fn known_corrections_retain_the_original_paid_term() {
+    let server = mock_server(correction_observation_responses(
+        vec![refund("re_full", json!("succeeded"))],
+        vec![dispute("du_lost", "lost")],
+        vec![credit_note("cn_issued", "issued", "post_payment")],
+    ))
+    .await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+    let evidence = client
+        .personal_invoice_correction_evidence(&mut session, "in_1", &personal_binding())
+        .await
+        .unwrap();
+
+    let StripePersonalInvoiceAccessDecision::RetainPaidTerm(term) =
+        evaluate_personal_invoice_access(&evidence)
+    else {
+        panic!("expected known corrections to retain the paid term");
+    };
+    assert_eq!(term.invoice_id(), "in_1");
+    assert_eq!(term.allocation_reference(), "alloc_1");
+    assert_eq!(term.evidence_reference(), "stripe:invoice:in_1:line:il_1");
+    assert_eq!(term.period_start(), 1_700_000_000);
+    assert_eq!(term.period_end(), 1_702_592_000);
 }
 
 #[tokio::test]

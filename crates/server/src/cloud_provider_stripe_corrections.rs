@@ -1,7 +1,7 @@
 //! Pure association of a personal invoice with its Stripe correction evidence.
 //!
-//! This module deliberately does not decide whether a correction changes Cloud access. It turns
-//! transport resources into either explicitly associated evidence or an unresolved result.
+//! This module turns transport resources into explicitly associated evidence or an unresolved
+//! result, then applies the personal invoice access policy to that sealed result.
 
 use std::collections::HashSet;
 
@@ -59,6 +59,66 @@ impl StripeCorrectionUnresolved {
 pub enum StripePersonalInvoiceCorrectionEvidence {
     Associated(Box<StripeAssociatedCorrectionEvidence>),
     Unresolved(StripeUnresolvedCorrections),
+}
+
+/// The access-policy result for one validated personal invoice observation.
+///
+/// Known refunds, disputes and credit notes preserve the original paid term. They do not get
+/// converted into a net amount or an entitlement end date. Unresolved association evidence stays
+/// unresolved until a later boundary can establish it; it cannot produce a partial policy result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StripePersonalInvoiceAccessDecision {
+    RetainPaidTerm(StripeRetainedPaidTerm),
+    NeedsEvidence(StripeUnresolvedCorrections),
+}
+
+/// The original paid interval retained by the personal correction policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StripeRetainedPaidTerm {
+    observation: StripePersonalInvoiceObservation,
+}
+
+impl StripeRetainedPaidTerm {
+    pub fn invoice_id(&self) -> &str {
+        self.observation.invoice_id()
+    }
+
+    pub fn allocation_reference(&self) -> &str {
+        self.observation.allocation_reference()
+    }
+
+    pub fn evidence_reference(&self) -> &str {
+        self.observation.evidence_reference()
+    }
+
+    pub const fn period_start(&self) -> i64 {
+        self.observation.period_start()
+    }
+
+    pub const fn period_end(&self) -> i64 {
+        self.observation.period_end()
+    }
+}
+
+/// Apply the agreed personal correction policy to sealed invoice evidence.
+///
+/// A partial or full refund, dispute, or credit note does not shorten the paid term by itself.
+/// Early termination requires a separate confirmed cancellation workflow, which is deliberately
+/// absent from this operation. This function is pure and does not establish current account
+/// eligibility or publish a coverage projection.
+pub fn evaluate_personal_invoice_access(
+    evidence: &StripePersonalInvoiceCorrectionEvidence,
+) -> StripePersonalInvoiceAccessDecision {
+    match evidence {
+        StripePersonalInvoiceCorrectionEvidence::Associated(associated) => {
+            StripePersonalInvoiceAccessDecision::RetainPaidTerm(StripeRetainedPaidTerm {
+                observation: associated.observation.clone(),
+            })
+        }
+        StripePersonalInvoiceCorrectionEvidence::Unresolved(unresolved) => {
+            StripePersonalInvoiceAccessDecision::NeedsEvidence(unresolved.clone())
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
