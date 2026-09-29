@@ -702,6 +702,7 @@ impl StripeReadClient {
                         continue;
                     }
                     let detailed = self.invoice(session, &listed.id).await?;
+                    validate_invoice_ownership(&detailed, binding)?;
                     if !invoice_headers_match(&listed, &detailed) {
                         unresolved.push(
                             StripePersonalInvoiceHistoryUnresolved::InvoiceChangedDuringRead {
@@ -1077,6 +1078,7 @@ pub struct StripeInvoiceResource {
     pub id: String,
     pub customer_id: Option<String>,
     pub subscription_id: Option<String>,
+    pub legacy_subscription_id: Option<String>,
     pub parent_type: Option<String>,
     pub status: Option<String>,
     pub currency: Option<String>,
@@ -1091,8 +1093,18 @@ pub struct StripeInvoiceResource {
 /// A non-paid invoice retained by personal history collection without becoming coverage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StripeNonPaidInvoice {
-    pub invoice_id: String,
-    pub status: String,
+    invoice_id: String,
+    status: String,
+}
+
+impl StripeNonPaidInvoice {
+    pub fn invoice_id(&self) -> &str {
+        &self.invoice_id
+    }
+
+    pub fn status(&self) -> &str {
+        &self.status
+    }
 }
 
 /// One invoice accounted for by a bounded personal history traversal.
@@ -1213,7 +1225,7 @@ fn history_reason_invoice_id(reason: &StripePersonalInvoiceHistoryUnresolved) ->
 fn history_entry_invoice_id(entry: &StripePersonalInvoiceHistoryEntry) -> &str {
     match entry {
         StripePersonalInvoiceHistoryEntry::Paid(term) => term.invoice_id(),
-        StripePersonalInvoiceHistoryEntry::NonPaid(invoice) => &invoice.invoice_id,
+        StripePersonalInvoiceHistoryEntry::NonPaid(invoice) => invoice.invoice_id(),
     }
 }
 
@@ -1465,10 +1477,20 @@ fn parse_invoice(value: &Value) -> Result<StripeInvoiceResource, StripeReadError
             ));
         }
     };
+    let legacy_subscription_id =
+        optional_validated_ref(value.get("subscription"), "invoice.subscription")?;
+    if parent_subscription_id
+        .as_deref()
+        .zip(legacy_subscription_id.as_deref())
+        .is_some_and(|(nested, legacy)| nested != legacy)
+    {
+        return Err(StripeReadError::ContextMismatch);
+    }
     Ok(StripeInvoiceResource {
         id: required_id(value, "invoice.id")?,
         customer_id: optional_validated_ref(value.get("customer"), "invoice.customer")?,
         subscription_id: parent_subscription_id,
+        legacy_subscription_id,
         parent_type,
         status: optional_string(value.get("status"), "invoice.status")?,
         currency: optional_string(value.get("currency"), "invoice.currency")?,
@@ -1482,6 +1504,24 @@ fn parse_invoice(value: &Value) -> Result<StripeInvoiceResource, StripeReadError
         allocation_reference: optional_allocation_reference(value.get("metadata"))?,
         livemode: optional_bool(value.get("livemode"), "invoice.livemode")?,
     })
+}
+
+fn validate_invoice_ownership(
+    invoice: &StripeInvoiceResource,
+    binding: &StripeAllocationBinding,
+) -> Result<(), StripeReadError> {
+    if invoice
+        .customer_id
+        .as_deref()
+        .is_some_and(|customer_id| customer_id != binding.customer_id())
+        || invoice
+            .subscription_id
+            .as_deref()
+            .is_some_and(|subscription_id| subscription_id != binding.subscription_id())
+    {
+        return Err(StripeReadError::ContextMismatch);
+    }
+    Ok(())
 }
 
 fn parse_invoice_line(value: &Value) -> Result<StripeInvoiceLineResource, StripeReadError> {
