@@ -1476,6 +1476,87 @@ async fn invoice_history_does_not_return_a_prefix_after_a_late_page_failure() {
 }
 
 #[tokio::test]
+async fn malformed_invoice_parent_does_not_become_missing_evidence() {
+    let mut responses = HashMap::new();
+    responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
+    let mut invoice = non_paid_invoice("in_1", "open");
+    invoice["parent"]["subscription_details"] = json!("malformed");
+    responses.insert(
+        "/v1/invoices".into(),
+        vec![MockResponse::json(list(vec![invoice], false))],
+    );
+    let server = mock_server(responses).await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+
+    assert!(matches!(
+        client
+            .subscription_invoices(&mut session, "sub_1", Some("cus_1"))
+            .await,
+        Err(StripeReadError::MalformedResponse(
+            "invoice.parent.subscription_details"
+        ))
+    ));
+}
+
+#[tokio::test]
+async fn invoice_history_wraps_later_correction_uncertainty_without_a_paid_subset() {
+    let mut responses =
+        observation_responses(paid_invoice(), personal_line("il_1"), paid_payment());
+    responses.insert(
+        "/v1/subscriptions/sub_1".into(),
+        vec![MockResponse::json(json!({
+            "id":"sub_1","customer":"cus_1","status":"active","livemode":false
+        }))],
+    );
+    responses.insert(
+        "/v1/invoices".into(),
+        vec![MockResponse::json(list(vec![paid_invoice()], false))],
+    );
+    responses.insert(
+        "/v1/refunds".into(),
+        vec![MockResponse::json(list(
+            vec![with_fields(
+                refund("re_missing_status", json!("succeeded")),
+                &[("status", None)],
+            )],
+            false,
+        ))],
+    );
+    responses.insert(
+        "/v1/disputes".into(),
+        vec![MockResponse::json(list(Vec::new(), false))],
+    );
+    responses.insert(
+        "/v1/credit_notes".into(),
+        vec![MockResponse::json(list(Vec::new(), false))],
+    );
+    let server = mock_server(responses).await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+
+    let result = client
+        .personal_invoice_history(&mut session, &personal_binding())
+        .await
+        .unwrap();
+    let StripePersonalInvoiceHistoryResult::NeedsEvidence(needs_evidence) = result else {
+        panic!("expected unresolved history");
+    };
+    assert!(needs_evidence.reasons().iter().any(|reason| matches!(
+        reason,
+        sotto_server::cloud_provider_stripe_http::StripePersonalInvoiceHistoryUnresolved::InvoiceCorrections { invoice_id, evidence }
+            if invoice_id == "in_1"
+                && evidence.reasons().contains(
+                    &StripeCorrectionUnresolved::RefundMissingStatus {
+                        refund_id: "re_missing_status".into()
+                    }
+                )
+    )));
+}
+
+#[tokio::test]
 async fn rejects_wrong_account_mode_redirect_and_invalid_pagination() {
     let mut responses = HashMap::new();
     responses.insert(

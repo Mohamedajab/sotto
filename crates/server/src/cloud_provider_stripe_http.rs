@@ -1452,17 +1452,19 @@ fn parse_invoice(value: &Value) -> Result<StripeInvoiceResource, StripeReadError
         .map(|parent| optional_string(parent.get("type"), "invoice.parent.type"))
         .transpose()?
         .flatten();
-    let parent_subscription_id = parent
-        .and_then(|parent| parent.get("subscription_details"))
-        .and_then(Value::as_object)
-        .map(|details| {
-            optional_validated_ref(
-                details.get("subscription"),
-                "invoice.parent.subscription_details.subscription",
-            )
-        })
-        .transpose()?
-        .flatten();
+    let parent_subscription_id = match parent.and_then(|parent| parent.get("subscription_details"))
+    {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(details)) => optional_validated_ref(
+            details.get("subscription"),
+            "invoice.parent.subscription_details.subscription",
+        )?,
+        Some(_) => {
+            return Err(StripeReadError::MalformedResponse(
+                "invoice.parent.subscription_details",
+            ));
+        }
+    };
     Ok(StripeInvoiceResource {
         id: required_id(value, "invoice.id")?,
         customer_id: optional_validated_ref(value.get("customer"), "invoice.customer")?,
