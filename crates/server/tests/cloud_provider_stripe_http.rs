@@ -1235,7 +1235,14 @@ async fn collects_all_personal_invoices_under_one_session_and_keeps_non_paid_sta
                 }],
                 true,
             )),
-            MockResponse::json(list(vec![non_paid_invoice("in_3", "void")], false)),
+            MockResponse::json(list(
+                vec![
+                    non_paid_invoice("in_3", "void"),
+                    non_paid_invoice("in_4", "draft"),
+                    non_paid_invoice("in_5", "uncollectible"),
+                ],
+                false,
+            )),
         ],
     );
     responses.insert(
@@ -1276,7 +1283,7 @@ async fn collects_all_personal_invoices_under_one_session_and_keeps_non_paid_sta
     };
     assert_eq!(history.subscription_id(), "sub_1");
     assert_eq!(history.customer_id(), "cus_1");
-    assert_eq!(history.entries().len(), 3);
+    assert_eq!(history.entries().len(), 5);
     assert!(matches!(
         &history.entries()[0],
         StripePersonalInvoiceHistoryEntry::Paid(term) if term.invoice_id() == "in_1"
@@ -1284,12 +1291,22 @@ async fn collects_all_personal_invoices_under_one_session_and_keeps_non_paid_sta
     assert!(matches!(
         &history.entries()[1],
         StripePersonalInvoiceHistoryEntry::NonPaid(invoice)
-            if invoice.invoice_id == "in_2" && invoice.status == "open"
+            if invoice.invoice_id() == "in_2" && invoice.status() == "open"
     ));
     assert!(matches!(
         &history.entries()[2],
         StripePersonalInvoiceHistoryEntry::NonPaid(invoice)
-            if invoice.invoice_id == "in_3" && invoice.status == "void"
+            if invoice.invoice_id() == "in_3" && invoice.status() == "void"
+    ));
+    assert!(matches!(
+        &history.entries()[3],
+        StripePersonalInvoiceHistoryEntry::NonPaid(invoice)
+            if invoice.invoice_id() == "in_4" && invoice.status() == "draft"
+    ));
+    assert!(matches!(
+        &history.entries()[4],
+        StripePersonalInvoiceHistoryEntry::NonPaid(invoice)
+            if invoice.invoice_id() == "in_5" && invoice.status() == "uncollectible"
     ));
     let calls = server.state.calls.lock().unwrap();
     let invoice_list_calls: Vec<_> = calls
@@ -1304,6 +1321,200 @@ async fn collects_all_personal_invoices_under_one_session_and_keeps_non_paid_sta
     assert!(invoice_list_calls
         .iter()
         .any(|call| call.path_and_query.contains("starting_after=in_2")));
+}
+
+#[tokio::test]
+async fn empty_personal_invoice_history_is_observed_without_a_paid_subset() {
+    let mut responses = HashMap::new();
+    responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
+    responses.insert(
+        "/v1/subscriptions/sub_1".into(),
+        vec![MockResponse::json(json!({
+            "id":"sub_1","customer":"cus_1","status":"active","livemode":false
+        }))],
+    );
+    responses.insert(
+        "/v1/invoices".into(),
+        vec![MockResponse::json(list(Vec::new(), false))],
+    );
+    let server = mock_server(responses).await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+
+    let StripePersonalInvoiceHistoryResult::Observed(history) = client
+        .personal_invoice_history(&mut session, &personal_binding())
+        .await
+        .unwrap()
+    else {
+        panic!("expected empty observed history");
+    };
+    assert!(history.entries().is_empty());
+}
+
+#[tokio::test]
+async fn personal_invoice_history_preserves_annual_paid_terms() {
+    let mut annual_invoice = paid_invoice();
+    annual_invoice["amount_paid"] = json!(2999);
+    annual_invoice["amount_due"] = json!(2999);
+    let mut responses = annual_observation_responses();
+    responses.insert(
+        "/v1/subscriptions/sub_1".into(),
+        vec![MockResponse::json(json!({
+            "id":"sub_1","customer":"cus_1","status":"active","livemode":false
+        }))],
+    );
+    responses.insert(
+        "/v1/invoices".into(),
+        vec![MockResponse::json(list(vec![annual_invoice], false))],
+    );
+    let server = mock_server(responses).await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+
+    let StripePersonalInvoiceHistoryResult::Observed(history) = client
+        .personal_invoice_history(&mut session, &personal_binding())
+        .await
+        .unwrap()
+    else {
+        panic!("expected annual history");
+    };
+    let StripePersonalInvoiceHistoryEntry::Paid(term) = &history.entries()[0] else {
+        panic!("expected annual paid term");
+    };
+    assert_eq!(term.period_start(), 1_700_000_000);
+    assert_eq!(term.period_end(), 1_731_536_000);
+}
+
+#[tokio::test]
+async fn personal_invoice_history_is_order_invariant_for_non_paid_pages() {
+    let mut first_responses = HashMap::new();
+    first_responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
+    first_responses.insert(
+        "/v1/subscriptions/sub_1".into(),
+        vec![MockResponse::json(json!({
+            "id":"sub_1","customer":"cus_1","status":"active","livemode":false
+        }))],
+    );
+    first_responses.insert(
+        "/v1/invoices".into(),
+        vec![MockResponse::json(list(
+            vec![
+                non_paid_invoice("in_b", "void"),
+                non_paid_invoice("in_a", "open"),
+            ],
+            false,
+        ))],
+    );
+    let first_server = mock_server(first_responses).await;
+    let first_client =
+        StripeReadClient::for_test(API_KEY, &config(), first_server.origin.clone(), limits())
+            .unwrap();
+    let mut first_session = first_client.session();
+    let StripePersonalInvoiceHistoryResult::Observed(first) = first_client
+        .personal_invoice_history(&mut first_session, &personal_binding())
+        .await
+        .unwrap()
+    else {
+        panic!("expected first observed history");
+    };
+
+    let mut second_responses = HashMap::new();
+    second_responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
+    second_responses.insert(
+        "/v1/subscriptions/sub_1".into(),
+        vec![MockResponse::json(json!({
+            "id":"sub_1","customer":"cus_1","status":"active","livemode":false
+        }))],
+    );
+    second_responses.insert(
+        "/v1/invoices".into(),
+        vec![MockResponse::json(list(
+            vec![
+                non_paid_invoice("in_a", "open"),
+                non_paid_invoice("in_b", "void"),
+            ],
+            false,
+        ))],
+    );
+    let second_server = mock_server(second_responses).await;
+    let second_client =
+        StripeReadClient::for_test(API_KEY, &config(), second_server.origin.clone(), limits())
+            .unwrap();
+    let mut second_session = second_client.session();
+    let StripePersonalInvoiceHistoryResult::Observed(second) = second_client
+        .personal_invoice_history(&mut second_session, &personal_binding())
+        .await
+        .unwrap()
+    else {
+        panic!("expected second observed history");
+    };
+
+    assert_eq!(first, second);
+}
+
+#[tokio::test]
+async fn personal_invoice_history_rejects_conflicting_legacy_parent() {
+    let mut invoice = non_paid_invoice("in_legacy", "open");
+    invoice["subscription"] = json!("sub_other");
+    let mut responses = HashMap::new();
+    responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
+    responses.insert(
+        "/v1/subscriptions/sub_1".into(),
+        vec![MockResponse::json(json!({
+            "id":"sub_1","customer":"cus_1","status":"active","livemode":false
+        }))],
+    );
+    responses.insert(
+        "/v1/invoices".into(),
+        vec![MockResponse::json(list(vec![invoice], false))],
+    );
+    let server = mock_server(responses).await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+
+    assert!(matches!(
+        client
+            .personal_invoice_history(&mut session, &personal_binding())
+            .await,
+        Err(StripeReadError::ContextMismatch)
+    ));
+}
+
+#[tokio::test]
+async fn personal_invoice_history_rejects_detail_ownership_changes() {
+    let listed = paid_invoice();
+    let mut detailed = paid_invoice();
+    detailed["customer"] = json!("cus_other");
+    let mut responses = HashMap::new();
+    responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
+    responses.insert(
+        "/v1/subscriptions/sub_1".into(),
+        vec![MockResponse::json(json!({
+            "id":"sub_1","customer":"cus_1","status":"active","livemode":false
+        }))],
+    );
+    responses.insert(
+        "/v1/invoices".into(),
+        vec![MockResponse::json(list(vec![listed], false))],
+    );
+    responses.insert(
+        "/v1/invoices/in_1".into(),
+        vec![MockResponse::json(detailed)],
+    );
+    let server = mock_server(responses).await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+
+    assert!(matches!(
+        client
+            .personal_invoice_history(&mut session, &personal_binding())
+            .await,
+        Err(StripeReadError::ContextMismatch)
+    ));
 }
 
 #[tokio::test]
