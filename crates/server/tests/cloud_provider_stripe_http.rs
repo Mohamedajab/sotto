@@ -413,6 +413,184 @@ async fn known_corrections_retain_the_original_paid_term() {
 }
 
 #[tokio::test]
+async fn every_supported_correction_state_retains_the_paid_term_without_amount_arithmetic() {
+    let refunds = vec![
+        with_fields(
+            refund("re_zero", json!("pending")),
+            &[("amount", Some(json!(0)))],
+        ),
+        with_fields(
+            refund("re_partial", json!("requires_action")),
+            &[("amount", Some(json!(100)))],
+        ),
+        refund("re_succeeded", json!("succeeded")),
+        refund("re_failed", json!("failed")),
+        refund("re_canceled", json!("canceled")),
+    ];
+    let disputes = [
+        "warning_needs_response",
+        "warning_under_review",
+        "warning_closed",
+        "needs_response",
+        "under_review",
+        "won",
+        "lost",
+        "prevented",
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, status)| dispute(&format!("du_{index}"), status))
+    .collect();
+    let credit_notes = [
+        ("issued", "pre_payment"),
+        ("issued", "post_payment"),
+        ("issued", "mixed"),
+        ("void", "pre_payment"),
+        ("void", "post_payment"),
+        ("void", "mixed"),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, (status, note_type))| {
+        with_fields(
+            credit_note(&format!("cn_{index}"), status, note_type),
+            &[("amount", Some(json!(100)))],
+        )
+    })
+    .collect();
+    let server = mock_server(correction_observation_responses(
+        refunds,
+        disputes,
+        credit_notes,
+    ))
+    .await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+    let evidence = client
+        .personal_invoice_correction_evidence(&mut session, "in_1", &personal_binding())
+        .await
+        .unwrap();
+    let StripePersonalInvoiceCorrectionEvidence::Associated(associated) = &evidence else {
+        panic!("expected all supported correction states to be associated");
+    };
+    assert_eq!(associated.refunds().len(), 5);
+    assert_eq!(associated.disputes().len(), 8);
+    assert_eq!(associated.credit_notes().len(), 6);
+
+    let StripePersonalInvoiceAccessDecision::RetainPaidTerm(term) =
+        evaluate_personal_invoice_access(&evidence)
+    else {
+        panic!("expected all supported correction states to retain the paid term");
+    };
+    assert_eq!(term.period_start(), 1_700_000_000);
+    assert_eq!(term.period_end(), 1_702_592_000);
+}
+
+#[tokio::test]
+async fn unresolved_correction_evidence_stays_out_of_access_policy() {
+    let missing_parent = with_fields(
+        refund("re_orphan", json!("succeeded")),
+        &[("payment_intent", Some(Value::Null))],
+    );
+    let unknown_status = refund("re_unknown", json!("provider_future_state"));
+    let missing_dispute_parent = with_fields(
+        dispute("du_orphan", "needs_response"),
+        &[("payment_intent", Some(Value::Null))],
+    );
+    let unknown_note = credit_note("cn_unknown", "future_status", "future_type");
+    let server = mock_server(correction_observation_responses(
+        vec![unknown_status, missing_parent],
+        vec![missing_dispute_parent],
+        vec![unknown_note],
+    ))
+    .await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+    let evidence = client
+        .personal_invoice_correction_evidence(&mut session, "in_1", &personal_binding())
+        .await
+        .unwrap();
+
+    let StripePersonalInvoiceAccessDecision::NeedsEvidence(unresolved) =
+        evaluate_personal_invoice_access(&evidence)
+    else {
+        panic!("expected unresolved evidence to remain unresolved");
+    };
+    assert_eq!(
+        unresolved.reasons(),
+        &[
+            StripeCorrectionUnresolved::CreditNoteUnknownStatus {
+                credit_note_id: "cn_unknown".into(),
+                status: "future_status".into(),
+            },
+            StripeCorrectionUnresolved::CreditNoteUnknownType {
+                credit_note_id: "cn_unknown".into(),
+                note_type: "future_type".into(),
+            },
+            StripeCorrectionUnresolved::DisputeMissingPaymentIntent {
+                dispute_id: "du_orphan".into(),
+            },
+            StripeCorrectionUnresolved::RefundMissingPaymentIntent {
+                refund_id: "re_orphan".into(),
+            },
+            StripeCorrectionUnresolved::RefundUnknownStatus {
+                refund_id: "re_unknown".into(),
+                status: "provider_future_state".into(),
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn correction_currency_contradictions_stop_before_access_policy() {
+    for (refunds, disputes, credit_notes) in [
+        (
+            vec![with_fields(
+                refund("re_wrong_currency", json!("succeeded")),
+                &[("currency", Some(json!("usd")))],
+            )],
+            Vec::new(),
+            Vec::new(),
+        ),
+        (
+            Vec::new(),
+            vec![with_fields(
+                dispute("du_wrong_currency", "lost"),
+                &[("currency", Some(json!("usd")))],
+            )],
+            Vec::new(),
+        ),
+        (
+            Vec::new(),
+            Vec::new(),
+            vec![with_fields(
+                credit_note("cn_wrong_currency", "issued", "post_payment"),
+                &[("currency", Some(json!("usd")))],
+            )],
+        ),
+    ] {
+        let server = mock_server(correction_observation_responses(
+            refunds,
+            disputes,
+            credit_notes,
+        ))
+        .await;
+        let client =
+            StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits())
+                .unwrap();
+        let mut session = client.session();
+        assert!(matches!(
+            client
+                .personal_invoice_correction_evidence(&mut session, "in_1", &personal_binding())
+                .await,
+            Err(StripeReadError::ContextMismatch)
+        ));
+    }
+}
+
+#[tokio::test]
 async fn correction_evidence_is_stable_when_provider_pages_change_order() {
     let first = mock_server(correction_observation_responses(
         vec![
