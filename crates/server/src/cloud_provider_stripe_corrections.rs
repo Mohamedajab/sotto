@@ -111,6 +111,71 @@ pub fn evaluate_personal_invoice_access(
 ) -> StripePersonalInvoiceAccessDecision {
     match evidence {
         StripePersonalInvoiceCorrectionEvidence::Associated(associated) => {
+            let mut unresolved = Vec::new();
+            for refund in associated.refunds() {
+                match refund.status() {
+                    StripeRefundStatus::Pending
+                    | StripeRefundStatus::RequiresAction
+                    | StripeRefundStatus::Succeeded
+                    | StripeRefundStatus::Failed
+                    | StripeRefundStatus::Canceled => {}
+                    StripeRefundStatus::Unknown(status) => {
+                        unresolved.push(StripeCorrectionUnresolved::RefundUnknownStatus {
+                            refund_id: refund.id().to_owned(),
+                            status: status.clone(),
+                        });
+                    }
+                }
+            }
+            for dispute in associated.disputes() {
+                match dispute.status() {
+                    StripeDisputeStatus::WarningNeedsResponse
+                    | StripeDisputeStatus::WarningUnderReview
+                    | StripeDisputeStatus::WarningClosed
+                    | StripeDisputeStatus::NeedsResponse
+                    | StripeDisputeStatus::UnderReview
+                    | StripeDisputeStatus::Won
+                    | StripeDisputeStatus::Lost
+                    | StripeDisputeStatus::Prevented => {}
+                    StripeDisputeStatus::Unknown(status) => {
+                        unresolved.push(StripeCorrectionUnresolved::DisputeUnknownStatus {
+                            dispute_id: dispute.id().to_owned(),
+                            status: status.clone(),
+                        });
+                    }
+                }
+            }
+            for credit_note in associated.credit_notes() {
+                match credit_note.status() {
+                    StripeCreditNoteStatus::Issued | StripeCreditNoteStatus::Void => {}
+                    StripeCreditNoteStatus::Unknown(status) => {
+                        unresolved.push(StripeCorrectionUnresolved::CreditNoteUnknownStatus {
+                            credit_note_id: credit_note.id().to_owned(),
+                            status: status.clone(),
+                        });
+                    }
+                }
+                match credit_note.note_type() {
+                    StripeCreditNoteType::PrePayment
+                    | StripeCreditNoteType::PostPayment
+                    | StripeCreditNoteType::Mixed => {}
+                    StripeCreditNoteType::Unknown(note_type) => {
+                        unresolved.push(StripeCorrectionUnresolved::CreditNoteUnknownType {
+                            credit_note_id: credit_note.id().to_owned(),
+                            note_type: note_type.clone(),
+                        });
+                    }
+                }
+            }
+            if !unresolved.is_empty() {
+                unresolved.sort_by(|left, right| left.sort_key().cmp(&right.sort_key()));
+                return StripePersonalInvoiceAccessDecision::NeedsEvidence(
+                    StripeUnresolvedCorrections {
+                        invoice_id: associated.observation().invoice_id().to_owned(),
+                        reasons: unresolved,
+                    },
+                );
+            }
             StripePersonalInvoiceAccessDecision::RetainPaidTerm(StripeRetainedPaidTerm {
                 observation: associated.observation.clone(),
             })
@@ -490,4 +555,105 @@ pub(crate) fn assemble(
 
 fn is_live(environment: ProviderEnvironment) -> bool {
     matches!(environment, ProviderEnvironment::Live)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn observation() -> StripePersonalInvoiceObservation {
+        StripePersonalInvoiceObservation::for_test()
+    }
+
+    fn associated(
+        refunds: Vec<StripeVerifiedRefund>,
+        disputes: Vec<StripeVerifiedDispute>,
+        credit_notes: Vec<StripeVerifiedCreditNote>,
+    ) -> StripePersonalInvoiceCorrectionEvidence {
+        StripePersonalInvoiceCorrectionEvidence::Associated(Box::new(
+            StripeAssociatedCorrectionEvidence {
+                observation: observation(),
+                refunds,
+                disputes,
+                credit_notes,
+            },
+        ))
+    }
+
+    #[test]
+    fn policy_table_keeps_known_terms_and_rejects_unknown_associated_states() {
+        let cases = vec![
+            (
+                "known",
+                associated(Vec::new(), Vec::new(), Vec::new()),
+                false,
+            ),
+            (
+                "unknown refund",
+                associated(
+                    vec![StripeVerifiedRefund {
+                        id: "re_unknown".into(),
+                        payment_intent_id: "pi_test".into(),
+                        charge_id: None,
+                        amount: 299,
+                        currency: "gbp".into(),
+                        created: 1,
+                        status: StripeRefundStatus::Unknown("future".into()),
+                    }],
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                true,
+            ),
+            (
+                "unknown dispute",
+                associated(
+                    Vec::new(),
+                    vec![StripeVerifiedDispute {
+                        id: "du_unknown".into(),
+                        payment_intent_id: "pi_test".into(),
+                        charge_id: "ch_test".into(),
+                        amount: 299,
+                        currency: "gbp".into(),
+                        created: 1,
+                        status: StripeDisputeStatus::Unknown("future".into()),
+                    }],
+                    Vec::new(),
+                ),
+                true,
+            ),
+            (
+                "unknown credit note fields",
+                associated(
+                    Vec::new(),
+                    Vec::new(),
+                    vec![StripeVerifiedCreditNote {
+                        id: "cn_unknown".into(),
+                        invoice_id: "in_test".into(),
+                        customer_id: "cus_test".into(),
+                        amount: 299,
+                        pre_payment_amount: 0,
+                        post_payment_amount: 299,
+                        currency: "gbp".into(),
+                        created: 1,
+                        status: StripeCreditNoteStatus::Unknown("future_status".into()),
+                        note_type: StripeCreditNoteType::Unknown("future_type".into()),
+                    }],
+                ),
+                true,
+            ),
+        ];
+
+        for (name, evidence, needs_evidence) in cases {
+            let decision = evaluate_personal_invoice_access(&evidence);
+            assert_eq!(
+                matches!(
+                    decision,
+                    StripePersonalInvoiceAccessDecision::NeedsEvidence(_)
+                ),
+                needs_evidence,
+                "{name}"
+            );
+        }
+    }
 }
