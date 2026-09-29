@@ -506,6 +506,13 @@ impl StripeReadClient {
         invoice: StripeInvoiceResource,
         binding: &StripeAllocationBinding,
     ) -> Result<StripePersonalInvoiceObservation, StripeReadError> {
+        if invoice.parent_type.as_deref() != Some("subscription_details")
+            || invoice.subscription_id.is_none()
+        {
+            return Err(StripeReadError::Observation(
+                StripeContractError::ContextMismatch,
+            ));
+        }
         if invoice.status.as_deref() != Some("paid") {
             return Err(StripeReadError::Observation(
                 StripeContractError::UnpaidInvoice,
