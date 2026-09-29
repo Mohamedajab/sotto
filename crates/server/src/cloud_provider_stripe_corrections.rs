@@ -561,99 +561,41 @@ fn is_live(environment: ProviderEnvironment) -> bool {
 mod tests {
     use super::*;
 
-    fn observation() -> StripePersonalInvoiceObservation {
-        StripePersonalInvoiceObservation::for_test()
-    }
-
-    fn associated(
-        refunds: Vec<StripeVerifiedRefund>,
-        disputes: Vec<StripeVerifiedDispute>,
-        credit_notes: Vec<StripeVerifiedCreditNote>,
-    ) -> StripePersonalInvoiceCorrectionEvidence {
-        StripePersonalInvoiceCorrectionEvidence::Associated(Box::new(
-            StripeAssociatedCorrectionEvidence {
-                observation: observation(),
-                refunds,
-                disputes,
-                credit_notes,
-            },
-        ))
-    }
-
     #[test]
-    fn policy_table_keeps_known_terms_and_rejects_unknown_associated_states() {
+    fn policy_table_preserves_unresolved_reasons_without_promoting_them() {
         let cases = vec![
             (
-                "known",
-                associated(Vec::new(), Vec::new(), Vec::new()),
-                false,
+                "missing refund status",
+                vec![StripeCorrectionUnresolved::RefundMissingStatus {
+                    refund_id: "re_missing".into(),
+                }],
             ),
             (
-                "unknown refund",
-                associated(
-                    vec![StripeVerifiedRefund {
-                        id: "re_unknown".into(),
-                        payment_intent_id: "pi_test".into(),
-                        charge_id: None,
-                        amount: 299,
-                        currency: "gbp".into(),
-                        created: 1,
-                        status: StripeRefundStatus::Unknown("future".into()),
-                    }],
-                    Vec::new(),
-                    Vec::new(),
-                ),
-                true,
-            ),
-            (
-                "unknown dispute",
-                associated(
-                    Vec::new(),
-                    vec![StripeVerifiedDispute {
-                        id: "du_unknown".into(),
-                        payment_intent_id: "pi_test".into(),
-                        charge_id: "ch_test".into(),
-                        amount: 299,
-                        currency: "gbp".into(),
-                        created: 1,
-                        status: StripeDisputeStatus::Unknown("future".into()),
-                    }],
-                    Vec::new(),
-                ),
-                true,
-            ),
-            (
-                "unknown credit note fields",
-                associated(
-                    Vec::new(),
-                    Vec::new(),
-                    vec![StripeVerifiedCreditNote {
-                        id: "cn_unknown".into(),
-                        invoice_id: "in_test".into(),
-                        customer_id: "cus_test".into(),
-                        amount: 299,
-                        pre_payment_amount: 0,
-                        post_payment_amount: 299,
-                        currency: "gbp".into(),
-                        created: 1,
-                        status: StripeCreditNoteStatus::Unknown("future_status".into()),
-                        note_type: StripeCreditNoteType::Unknown("future_type".into()),
-                    }],
-                ),
-                true,
+                "multiple reasons",
+                vec![
+                    StripeCorrectionUnresolved::CreditNoteUnknownStatus {
+                        credit_note_id: "cn_unknown".into(),
+                        status: "future_status".into(),
+                    },
+                    StripeCorrectionUnresolved::CreditNoteUnknownType {
+                        credit_note_id: "cn_unknown".into(),
+                        note_type: "future_type".into(),
+                    },
+                ],
             ),
         ];
 
-        for (name, evidence, needs_evidence) in cases {
+        for (name, reasons) in cases {
+            let evidence =
+                StripePersonalInvoiceCorrectionEvidence::Unresolved(StripeUnresolvedCorrections {
+                    invoice_id: "in_test".into(),
+                    reasons: reasons.clone(),
+                });
             let decision = evaluate_personal_invoice_access(&evidence);
-            assert_eq!(
-                matches!(
-                    decision,
-                    StripePersonalInvoiceAccessDecision::NeedsEvidence(_)
-                ),
-                needs_evidence,
-                "{name}"
-            );
+            let StripePersonalInvoiceAccessDecision::NeedsEvidence(unresolved) = decision else {
+                panic!("{name} was promoted to an access decision");
+            };
+            assert_eq!(unresolved.reasons(), reasons.as_slice(), "{name}");
         }
     }
 }

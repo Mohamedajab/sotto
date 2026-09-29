@@ -127,24 +127,6 @@ pub struct StripePersonalInvoiceObservation {
 }
 
 impl StripePersonalInvoiceObservation {
-    #[cfg(test)]
-    pub(crate) fn for_test() -> Self {
-        Self {
-            invoice_id: "in_test".into(),
-            customer_id: "cus_test".into(),
-            subscription_id: "sub_test".into(),
-            provider_item_id: "si_test".into(),
-            allocation_reference: "alloc_test".into(),
-            payment_intent_id: "pi_test".into(),
-            currency: "gbp".into(),
-            amount_paid: 299,
-            interval: StripeInterval::Month,
-            period_start: 1_000,
-            period_end: 2_000,
-            evidence_reference: "stripe:invoice:in_test:line:il_test".into(),
-        }
-    }
-
     pub fn invoice_id(&self) -> &str {
         &self.invoice_id
     }
