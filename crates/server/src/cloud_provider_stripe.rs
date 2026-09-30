@@ -465,13 +465,7 @@ pub fn decode_paid_invoice(
 ) -> Result<StripeCoverageEvidence, StripeContractError> {
     let payload =
         std::str::from_utf8(raw_payload).map_err(|_| StripeContractError::MalformedPayload)?;
-    verify_signature_detailed(webhook_secret, signature_header, payload, now).map_err(|error| {
-        match error {
-            SignatureVerificationError::Malformed => StripeContractError::MalformedSignature,
-            SignatureVerificationError::Stale => StripeContractError::StaleSignature,
-            SignatureVerificationError::Invalid => StripeContractError::InvalidSignature,
-        }
-    })?;
+    verify_webhook_signature(webhook_secret, signature_header, payload, now)?;
 
     let event: RawStripeEvent =
         serde_json::from_slice(raw_payload).map_err(|_| StripeContractError::MalformedPayload)?;
