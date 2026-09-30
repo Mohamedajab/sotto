@@ -251,6 +251,7 @@ impl StripeReadClient {
             deadline: Instant::now() + self.limits.session_timeout,
             attempts: 0,
             bytes: 0,
+            pages: 0,
             records: 0,
             account_verified: false,
             identity: Arc::clone(&self.identity),
@@ -835,11 +836,8 @@ impl StripeReadClient {
         let mut output = Vec::new();
         let mut ids = HashSet::new();
         let mut cursor: Option<String> = None;
-        let mut pages = 0usize;
         loop {
-            if pages == self.limits.max_pages {
-                return Err(StripeReadError::PageBoundExceeded);
-            }
+            session.add_page(self.limits.max_pages)?;
             let mut query = base_query.clone();
             query.push(("limit".to_owned(), "100".to_owned()));
             if let Some(cursor) = cursor.as_deref() {
@@ -875,7 +873,6 @@ impl StripeReadClient {
             }
             let last_id = parsed.last().map(|(id, _)| id.clone());
             output.extend(parsed.into_iter().map(|(_, value)| value));
-            pages += 1;
             if !has_more {
                 return Ok(output);
             }
@@ -1007,6 +1004,7 @@ pub struct StripeReadSession {
     deadline: Instant,
     attempts: usize,
     bytes: usize,
+    pages: usize,
     records: usize,
     account_verified: bool,
     identity: Arc<()>,
@@ -1018,6 +1016,7 @@ impl fmt::Debug for StripeReadSession {
             .debug_struct("StripeReadSession")
             .field("attempts", &self.attempts)
             .field("bytes", &self.bytes)
+            .field("pages", &self.pages)
             .field("records", &self.records)
             .field("account_verified", &self.account_verified)
             .finish()
@@ -1050,6 +1049,17 @@ impl StripeReadSession {
             .ok_or(StripeReadError::SessionBytesExceeded)?;
         if self.bytes > limit {
             return Err(StripeReadError::SessionBytesExceeded);
+        }
+        Ok(())
+    }
+
+    fn add_page(&mut self, limit: usize) -> Result<(), StripeReadError> {
+        self.pages = self
+            .pages
+            .checked_add(1)
+            .ok_or(StripeReadError::PageBoundExceeded)?;
+        if self.pages > limit {
+            return Err(StripeReadError::PageBoundExceeded);
         }
         Ok(())
     }
