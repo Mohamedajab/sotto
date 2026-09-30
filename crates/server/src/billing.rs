@@ -1356,7 +1356,11 @@ pub(crate) fn verify_signature_detailed(
     let Some(t) = timestamp else {
         return Err(SignatureVerificationError::Malformed);
     };
-    if (now - t).abs() > SIGNATURE_TOLERANCE_SECS || candidates.is_empty() {
+    let stale = now
+        .checked_sub(t)
+        .and_then(|delta| delta.checked_abs())
+        .is_none_or(|age| age > SIGNATURE_TOLERANCE_SECS);
+    if stale || candidates.is_empty() {
         return Err(if candidates.is_empty() {
             SignatureVerificationError::Malformed
         } else {

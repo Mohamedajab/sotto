@@ -75,7 +75,7 @@ impl StripeCoverageConfig {
             .map_err(StripeContractError::ProviderContext)
     }
 
-    fn validate(&self) -> Result<(), StripeContractError> {
+    pub(crate) fn validate(&self) -> Result<(), StripeContractError> {
         for (value, name) in [
             (&self.account_id, "Stripe account"),
             (&self.monthly_price_id, "monthly Stripe price"),
@@ -410,6 +410,26 @@ pub enum StripeContractError {
     OwnershipMismatch,
     #[error("Stripe coverage currently supports personal allocations only")]
     UnsupportedPayerKind,
+    #[error("Stripe renewal failure evidence is unsupported: {0}")]
+    UnsupportedRenewal(&'static str),
+}
+
+pub(crate) fn verify_webhook_signature(
+    webhook_secret: &str,
+    signature_header: &str,
+    payload: &str,
+    now: i64,
+) -> Result<(), StripeContractError> {
+    if webhook_secret.trim().is_empty() {
+        return Err(StripeContractError::InvalidConfig("Stripe webhook secret"));
+    }
+    verify_signature_detailed(webhook_secret, signature_header, payload, now).map_err(|error| {
+        match error {
+            SignatureVerificationError::Malformed => StripeContractError::MalformedSignature,
+            SignatureVerificationError::Stale => StripeContractError::StaleSignature,
+            SignatureVerificationError::Invalid => StripeContractError::InvalidSignature,
+        }
+    })
 }
 
 #[derive(Debug, Deserialize)]
