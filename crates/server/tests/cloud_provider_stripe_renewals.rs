@@ -359,6 +359,25 @@ async fn incomplete_or_prorated_lines_never_link() {
             StripeRenewalFailureNeedsEvidence::MissingProrationProof
         )
     );
+
+    let mut missing_invoice_reference = signed_failure();
+    missing_invoice_reference["data"]["object"]["lines"]["data"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("invoice");
+    let (raw, signature) = signed(&missing_invoice_reference, NOW);
+    assert!(matches!(
+        decode_personal_renewal_failure(
+            &raw,
+            &signature,
+            SECRET,
+            NOW,
+            &config(),
+            &binding(),
+            &history,
+        ),
+        Err(StripeContractError::MissingField("invoice"))
+    ));
 }
 
 #[tokio::test]

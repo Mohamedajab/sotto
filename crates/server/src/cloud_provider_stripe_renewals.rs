@@ -345,10 +345,9 @@ pub fn decode_personal_renewal_failure(
     }
     let line = &line_values[0];
     let invoice_line_id = required_ref(line, "id")?;
-    if let Some(line_invoice_id) = optional_ref(line, "invoice")? {
-        if line_invoice_id != invoice_id {
-            return Err(StripeContractError::OwnershipMismatch);
-        }
+    let line_invoice_id = required_ref(line, "invoice")?;
+    if line_invoice_id != invoice_id {
+        return Err(StripeContractError::OwnershipMismatch);
     }
     if required_bool(line, "livemode")? != is_live(config.environment) {
         return Err(StripeContractError::ContextMismatch);
