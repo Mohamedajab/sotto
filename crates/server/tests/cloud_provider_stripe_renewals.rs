@@ -532,6 +532,31 @@ async fn current_client_with_parts(
     sotto_server::cloud_provider_stripe_http::StripeReadSession,
     MockServer,
 ) {
+    current_client_with_parts_and_limits(
+        invoice,
+        second_invoice,
+        first_line,
+        second_line,
+        first_subscription,
+        second_subscription,
+        limits(),
+    )
+    .await
+}
+
+async fn current_client_with_parts_and_limits(
+    invoice: Value,
+    second_invoice: Value,
+    first_line: Value,
+    second_line: Value,
+    first_subscription: Value,
+    second_subscription: Value,
+    read_limits: StripeReadLimits,
+) -> (
+    StripeReadClient,
+    sotto_server::cloud_provider_stripe_http::StripeReadSession,
+    MockServer,
+) {
     let mut responses = HashMap::new();
     responses.insert(
         "/v1/account".into(),
@@ -571,7 +596,7 @@ async fn current_client_with_parts(
         "sk_test_renewal",
         &config(),
         server.origin.clone(),
-        limits(),
+        read_limits,
     )
     .unwrap();
     let session = client.session();
@@ -1092,4 +1117,65 @@ async fn open_to_paid_header_transition_returns_changed_fields_without_retrying(
             .count(),
         2
     );
+}
+
+#[tokio::test]
+async fn current_line_contract_rejects_proration_quantity_period_and_price_changes() {
+    let failure = linked_failure().await;
+    let mut cases = Vec::new();
+    let mut prorated = current_line();
+    prorated["parent"]["subscription_item_details"]["proration"] = json!(true);
+    cases.push(prorated);
+    let mut wrong_quantity = current_line();
+    wrong_quantity["quantity"] = json!(2);
+    cases.push(wrong_quantity);
+    let mut wrong_period = current_line();
+    wrong_period["period"]["start"] = json!(2100);
+    cases.push(wrong_period);
+    let mut wrong_price = current_line();
+    wrong_price["pricing"]["price_details"]["price"] = json!("price_other");
+    cases.push(wrong_price);
+    for line in cases {
+        let (client, mut session, _server) = current_client_with_parts(
+            current_invoice("paid"),
+            current_invoice("paid"),
+            line,
+            current_line(),
+            current_subscription(false),
+            current_subscription(false),
+        )
+        .await;
+        let result = client
+            .personal_renewal_observation(&mut session, &binding(), &failure)
+            .await;
+        assert!(matches!(
+            result,
+            Err(StripeReadError::Observation(
+                StripeContractError::ContextMismatch
+            )) | Err(StripeReadError::MalformedResponse("line.price"))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn current_observation_consumes_one_shared_request_budget() {
+    let failure = linked_failure().await;
+    let mut read_limits = limits();
+    read_limits.max_requests = 9;
+    let (client, mut session, _server) = current_client_with_parts_and_limits(
+        current_invoice("paid"),
+        current_invoice("paid"),
+        current_line(),
+        current_line(),
+        current_subscription(false),
+        current_subscription(false),
+        read_limits,
+    )
+    .await;
+    assert!(matches!(
+        client
+            .personal_renewal_observation(&mut session, &binding(), &failure)
+            .await,
+        Err(StripeReadError::RequestBoundExceeded)
+    ));
 }
