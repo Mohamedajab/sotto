@@ -762,6 +762,8 @@ impl StripeReadClient {
         });
         Ok(StripePersonalInvoiceHistoryResult::Observed(
             StripePersonalInvoiceHistory {
+                account_id: self.account_id.clone(),
+                environment: self.environment,
                 subscription_id: binding.subscription_id().to_owned(),
                 customer_id: binding.customer_id().to_owned(),
                 entries,
@@ -1134,12 +1136,22 @@ pub enum StripePersonalInvoiceHistoryEntry {
 /// Every invoice returned by Stripe was accounted for under one shared read session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StripePersonalInvoiceHistory {
+    account_id: String,
+    environment: ProviderEnvironment,
     subscription_id: String,
     customer_id: String,
     entries: Vec<StripePersonalInvoiceHistoryEntry>,
 }
 
 impl StripePersonalInvoiceHistory {
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    pub const fn environment(&self) -> ProviderEnvironment {
+        self.environment
+    }
+
     pub fn subscription_id(&self) -> &str {
         &self.subscription_id
     }
