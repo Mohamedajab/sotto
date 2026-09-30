@@ -744,23 +744,33 @@ async fn current_invoice_requires_an_automatic_subscription_cycle() {
 async fn current_invoice_requires_named_billing_fields() {
     let failure = linked_failure().await;
     for field in ["billing_reason", "collection_method"] {
-        let mut invoice = current_invoice("paid");
-        invoice.as_object_mut().unwrap().remove(field);
-        let (client, mut session, _server) = current_client_with_parts(
-            invoice,
-            current_invoice("paid"),
-            current_line(),
-            current_line(),
-            current_subscription(false),
-            current_subscription(false),
-        )
-        .await;
-        assert!(matches!(
-            client
-                .personal_renewal_observation(&mut session, &binding(), &failure)
-                .await,
-            Err(StripeReadError::MalformedResponse(actual)) if actual == format!("invoice.{field}")
-        ));
+        for (remove, replacement) in [
+            (true, None),
+            (false, Some(json!(null))),
+            (false, Some(json!(42))),
+        ] {
+            let mut invoice = current_invoice("paid");
+            if remove {
+                invoice.as_object_mut().unwrap().remove(field);
+            } else {
+                invoice[field] = replacement.unwrap();
+            }
+            let (client, mut session, _server) = current_client_with_parts(
+                invoice,
+                current_invoice("paid"),
+                current_line(),
+                current_line(),
+                current_subscription(false),
+                current_subscription(false),
+            )
+            .await;
+            assert!(matches!(
+                client
+                    .personal_renewal_observation(&mut session, &binding(), &failure)
+                    .await,
+                Err(StripeReadError::MalformedResponse(actual)) if actual == format!("invoice.{field}")
+            ));
+        }
     }
 }
 
@@ -882,6 +892,39 @@ async fn billing_and_cancellation_changes_name_the_provider_fields() {
 }
 
 #[tokio::test]
+async fn cancellation_fields_require_presence_and_valid_values() {
+    let failure = linked_failure().await;
+    let cases = [
+        ("cancel_at", json!(null), true),
+        ("cancel_at_period_end", json!(0), false),
+        ("canceled_at", json!(-1), false),
+    ];
+    for (field, value, remove) in cases {
+        let mut subscription = current_subscription(false);
+        if remove {
+            subscription.as_object_mut().unwrap().remove(field);
+        } else {
+            subscription[field] = value;
+        }
+        let (client, mut session, _server) = current_client_with_parts(
+            current_invoice("paid"),
+            current_invoice("paid"),
+            current_line(),
+            current_line(),
+            subscription,
+            current_subscription(false),
+        )
+        .await;
+        assert!(matches!(
+            client
+                .personal_renewal_observation(&mut session, &binding(), &failure)
+                .await,
+            Err(StripeReadError::MalformedResponse(actual)) if actual == format!("subscription.{field}")
+        ));
+    }
+}
+
+#[tokio::test]
 async fn collection_method_change_is_reported_by_name() {
     let failure = linked_failure().await;
     let mut changed_invoice = current_invoice("paid");
@@ -979,4 +1022,74 @@ async fn closed_invoice_rejects_remaining_balance_above_due() {
             StripeRenewalNeedsEvidence::UnsupportedSettlement
         )
     ));
+}
+
+#[tokio::test]
+async fn foreign_binding_and_session_are_rejected_before_resource_reads() {
+    let failure = linked_failure().await;
+    let (client, mut session, server) = current_client("paid", None).await;
+    let foreign = StripeAllocationBinding::new(
+        "alloc_other",
+        "cus_other",
+        "sub_other",
+        "si_other",
+        PayerKind::Personal,
+    )
+    .unwrap();
+    assert!(matches!(
+        client
+            .personal_renewal_observation(&mut session, &foreign, &failure)
+            .await,
+        Err(StripeReadError::ContextMismatch)
+    ));
+    assert!(server.requests().is_empty());
+
+    let (other_client, other_session, other_server) = current_client("paid", None).await;
+    let mut foreign_session = other_session;
+    assert!(matches!(
+        client
+            .personal_renewal_observation(&mut foreign_session, &binding(), &failure)
+            .await,
+        Err(StripeReadError::SessionClientMismatch)
+    ));
+    assert!(server.requests().is_empty());
+    assert!(other_server.requests().is_empty());
+    drop(other_client);
+}
+
+#[tokio::test]
+async fn open_to_paid_header_transition_returns_changed_fields_without_retrying() {
+    let failure = linked_failure().await;
+    let mut paid = current_invoice("paid");
+    paid["amount_remaining"] = json!(0);
+    let (client, mut session, server) = current_client_with_parts(
+        current_invoice("open"),
+        paid,
+        current_line(),
+        current_line(),
+        current_subscription(false),
+        current_subscription(false),
+    )
+    .await;
+    let result = client
+        .personal_renewal_observation(&mut session, &binding(), &failure)
+        .await
+        .unwrap();
+    assert!(matches!(
+        result,
+        StripeRenewalObservationResult::NeedsEvidence(
+            StripeRenewalNeedsEvidence::ChangedDuringRead {
+                resource: "invoice",
+                ref fields,
+            }
+        ) if fields == &["status", "amount_paid", "amount_remaining"]
+    ));
+    assert_eq!(
+        server
+            .requests()
+            .iter()
+            .filter(|request| request.as_str() == "GET /v1/invoices/in_failed")
+            .count(),
+        2
+    );
 }

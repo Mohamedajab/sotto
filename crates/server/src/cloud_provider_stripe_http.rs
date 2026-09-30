@@ -1466,13 +1466,16 @@ fn invoice_headers_match(left: &StripeInvoiceResource, right: &StripeInvoiceReso
 fn cancellation_facts(
     subscription: &StripeSubscriptionResource,
 ) -> Result<StripeRenewalCancellationFacts, StripeReadError> {
-    if !subscription.cancel_at_present
-        || !subscription.canceled_at_present
-        || !subscription.ended_at_present
-    {
+    if !subscription.cancel_at_present {
+        return Err(StripeReadError::MalformedResponse("subscription.cancel_at"));
+    }
+    if !subscription.canceled_at_present {
         return Err(StripeReadError::MalformedResponse(
-            "subscription.cancellation_fields",
+            "subscription.canceled_at",
         ));
+    }
+    if !subscription.ended_at_present {
+        return Err(StripeReadError::MalformedResponse("subscription.ended_at"));
     }
     let cancel_at_period_end =
         subscription
