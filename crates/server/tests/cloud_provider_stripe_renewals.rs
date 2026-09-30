@@ -996,7 +996,9 @@ async fn contradictory_legacy_line_ownership_is_rejected() {
         client
             .personal_renewal_observation(&mut session, &binding(), &failure)
             .await,
-        Err(StripeReadError::ContextMismatch)
+        Err(StripeReadError::Observation(
+            StripeContractError::ContextMismatch
+        ))
     ));
 }
 

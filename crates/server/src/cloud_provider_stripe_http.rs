@@ -2198,17 +2198,6 @@ fn parse_invoice_line(value: &Value) -> Result<StripeInvoiceLineResource, Stripe
         })
         .transpose()?
         .flatten();
-    if legacy_subscription_id
-        .as_deref()
-        .zip(subscription_id.as_deref())
-        .is_some_and(|(legacy, nested)| legacy != nested)
-        || legacy_subscription_item_id
-            .as_deref()
-            .zip(subscription_item_id.as_deref())
-            .is_some_and(|(legacy, nested)| legacy != nested)
-    {
-        return Err(StripeReadError::ContextMismatch);
-    }
     Ok(StripeInvoiceLineResource {
         id: required_id(value, "invoice line.id")?,
         quantity: optional_i64(value.get("quantity"), "line.quantity")?,
