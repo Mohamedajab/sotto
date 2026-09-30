@@ -838,6 +838,18 @@ impl StripeReadClient {
         let cancellation = cancellation_facts(&first_subscription)?;
         let first_invoice = self.invoice(session, failure.invoice_id()).await?;
         validate_current_invoice(&first_invoice, binding)?;
+        if let Err(error) = validate_current_invoice_cycle(&first_invoice) {
+            match error {
+                CurrentInvoiceCycleError::Malformed(field) => {
+                    return Err(StripeReadError::MalformedResponse(field));
+                }
+                CurrentInvoiceCycleError::Unsupported { field, value } => {
+                    return Ok(StripeRenewalObservationResult::NeedsEvidence(
+                        StripeRenewalNeedsEvidence::UnsupportedInvoiceField { field, value },
+                    ));
+                }
+            }
+        }
         let lines = self.invoice_lines(session, &first_invoice.id).await?;
         validate_current_line(&lines, failure, binding, &self.coverage, self.environment)?;
 
@@ -1270,6 +1282,8 @@ pub struct StripeInvoiceResource {
     pub subscription_id: Option<String>,
     pub legacy_subscription_id: Option<String>,
     pub parent_type: Option<String>,
+    pub billing_reason: Option<String>,
+    pub collection_method: Option<String>,
     pub status: Option<String>,
     pub currency: Option<String>,
     pub amount_paid: Option<i64>,
@@ -1279,6 +1293,8 @@ pub struct StripeInvoiceResource {
     pub amount_paid_off_stripe: Option<i64>,
     pub allocation_reference: Option<String>,
     pub livemode: Option<bool>,
+    billing_reason_present: bool,
+    collection_method_present: bool,
 }
 
 /// A non-paid invoice retained by personal history collection without becoming coverage.
@@ -1431,7 +1447,20 @@ fn history_entry_invoice_id(entry: &StripePersonalInvoiceHistoryEntry) -> &str {
 }
 
 fn invoice_headers_match(left: &StripeInvoiceResource, right: &StripeInvoiceResource) -> bool {
-    left == right
+    left.id == right.id
+        && left.customer_id == right.customer_id
+        && left.subscription_id == right.subscription_id
+        && left.legacy_subscription_id == right.legacy_subscription_id
+        && left.parent_type == right.parent_type
+        && left.status == right.status
+        && left.currency == right.currency
+        && left.amount_paid == right.amount_paid
+        && left.amount_due == right.amount_due
+        && left.amount_remaining == right.amount_remaining
+        && left.amount_overpaid == right.amount_overpaid
+        && left.amount_paid_off_stripe == right.amount_paid_off_stripe
+        && left.allocation_reference == right.allocation_reference
+        && left.livemode == right.livemode
 }
 
 fn cancellation_facts(
@@ -1487,6 +1516,45 @@ fn validate_current_invoice(
     Ok(())
 }
 
+enum CurrentInvoiceCycleError {
+    Malformed(&'static str),
+    Unsupported { field: &'static str, value: String },
+}
+
+fn validate_current_invoice_cycle(
+    invoice: &StripeInvoiceResource,
+) -> Result<(), CurrentInvoiceCycleError> {
+    if !invoice.billing_reason_present || invoice.billing_reason.is_none() {
+        return Err(CurrentInvoiceCycleError::Malformed(
+            "invoice.billing_reason",
+        ));
+    }
+    match invoice.billing_reason.as_deref() {
+        Some("subscription_cycle") => {}
+        Some(value) => {
+            return Err(CurrentInvoiceCycleError::Unsupported {
+                field: "billing_reason",
+                value: value.to_owned(),
+            });
+        }
+        None => unreachable!(),
+    }
+    if !invoice.collection_method_present || invoice.collection_method.is_none() {
+        return Err(CurrentInvoiceCycleError::Malformed(
+            "invoice.collection_method",
+        ));
+    }
+    if let Some(value) = invoice.collection_method.as_deref() {
+        if value != "charge_automatically" {
+            return Err(CurrentInvoiceCycleError::Unsupported {
+                field: "collection_method",
+                value: value.to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn validate_current_line(
     lines: &[StripeInvoiceLineResource],
     failure: &StripeRenewalFailureEvidence,
@@ -1511,6 +1579,14 @@ fn validate_current_line(
         || line.pricing_type.as_deref() != Some("price_details")
         || line.livemode != Some(matches!(environment, ProviderEnvironment::Live))
         || line.proration != Some(false)
+        || line
+            .legacy_subscription_id
+            .as_deref()
+            .is_some_and(|id| id != binding.subscription_id())
+        || line
+            .legacy_subscription_item_id
+            .as_deref()
+            .is_some_and(|id| id != binding.provider_item_id())
     {
         return Err(StripeReadError::Observation(
             StripeContractError::ContextMismatch,
@@ -1578,6 +1654,8 @@ fn invoice_diff_fields(
     compare!(subscription_id);
     compare!(legacy_subscription_id);
     compare!(parent_type);
+    compare!(billing_reason);
+    compare!(collection_method);
     compare!(status);
     compare!(currency);
     compare!(amount_paid);
@@ -1587,6 +1665,16 @@ fn invoice_diff_fields(
     compare!(amount_paid_off_stripe);
     compare!(allocation_reference);
     compare!(livemode);
+    if left.billing_reason_present != right.billing_reason_present
+        && left.billing_reason == right.billing_reason
+    {
+        fields.push("billing_reason");
+    }
+    if left.collection_method_present != right.collection_method_present
+        && left.collection_method == right.collection_method
+    {
+        fields.push("collection_method");
+    }
     fields
 }
 
@@ -1610,6 +1698,17 @@ fn subscription_diff_fields(
     compare!(cancel_at);
     compare!(canceled_at);
     compare!(ended_at);
+    if left.cancel_at_present != right.cancel_at_present && left.cancel_at == right.cancel_at {
+        fields.push("cancel_at");
+    }
+    if left.canceled_at_present != right.canceled_at_present
+        && left.canceled_at == right.canceled_at
+    {
+        fields.push("canceled_at");
+    }
+    if left.ended_at_present != right.ended_at_present && left.ended_at == right.ended_at {
+        fields.push("ended_at");
+    }
     fields
 }
 
@@ -1619,6 +1718,8 @@ pub struct StripeInvoiceLineResource {
     pub quantity: Option<i64>,
     pub subscription_id: Option<String>,
     pub subscription_item_id: Option<String>,
+    pub legacy_subscription_id: Option<String>,
+    pub legacy_subscription_item_id: Option<String>,
     pub price_id: Option<String>,
     pub parent_type: Option<String>,
     pub pricing_type: Option<String>,
@@ -1732,6 +1833,10 @@ impl StripeRenewalObservation {
 pub enum StripeRenewalNeedsEvidence {
     UnsupportedStatus(String),
     UnsupportedSubscriptionStatus(String),
+    UnsupportedInvoiceField {
+        field: &'static str,
+        value: String,
+    },
     ChangedDuringRead {
         resource: &'static str,
         fields: Vec<&'static str>,
@@ -1748,6 +1853,9 @@ impl fmt::Display for StripeRenewalNeedsEvidence {
             }
             Self::UnsupportedSubscriptionStatus(status) => {
                 write!(formatter, "unsupported subscription status {status}")
+            }
+            Self::UnsupportedInvoiceField { field, value } => {
+                write!(formatter, "unsupported invoice {field} {value}")
             }
             Self::ChangedDuringRead { resource, fields } => {
                 write!(formatter, "{resource} changed during read: {fields:?}")
@@ -2021,6 +2129,11 @@ fn parse_invoice(value: &Value) -> Result<StripeInvoiceResource, StripeReadError
         subscription_id: parent_subscription_id,
         legacy_subscription_id,
         parent_type,
+        billing_reason: optional_string(value.get("billing_reason"), "invoice.billing_reason")?,
+        collection_method: optional_string(
+            value.get("collection_method"),
+            "invoice.collection_method",
+        )?,
         status: optional_string(value.get("status"), "invoice.status")?,
         currency: optional_string(value.get("currency"), "invoice.currency")?,
         amount_paid: optional_i64(value.get("amount_paid"), "invoice.amount_paid")?,
@@ -2033,6 +2146,8 @@ fn parse_invoice(value: &Value) -> Result<StripeInvoiceResource, StripeReadError
         )?,
         allocation_reference: optional_allocation_reference(value.get("metadata"))?,
         livemode: optional_bool(value.get("livemode"), "invoice.livemode")?,
+        billing_reason_present: value.get("billing_reason").is_some(),
+        collection_method_present: value.get("collection_method").is_some(),
     })
 }
 
@@ -2064,19 +2179,40 @@ fn parse_invoice_line(value: &Value) -> Result<StripeInvoiceLineResource, Stripe
         .and_then(|pricing| pricing.get("price_details"))
         .and_then(Value::as_object);
     let period = optional_object(value.get("period"), "line.period")?;
+    let legacy_subscription_id =
+        optional_validated_ref(value.get("subscription"), "line.subscription_legacy")?;
+    let legacy_subscription_item_id = optional_validated_ref(
+        value.get("subscription_item"),
+        "line.subscription_item_legacy",
+    )?;
+    let subscription_id = details
+        .map(|details| optional_validated_ref(details.get("subscription"), "line.subscription"))
+        .transpose()?
+        .flatten();
+    let subscription_item_id = details
+        .map(|details| {
+            optional_validated_ref(details.get("subscription_item"), "line.subscription_item")
+        })
+        .transpose()?
+        .flatten();
+    if legacy_subscription_id
+        .as_deref()
+        .zip(subscription_id.as_deref())
+        .is_some_and(|(legacy, nested)| legacy != nested)
+        || legacy_subscription_item_id
+            .as_deref()
+            .zip(subscription_item_id.as_deref())
+            .is_some_and(|(legacy, nested)| legacy != nested)
+    {
+        return Err(StripeReadError::ContextMismatch);
+    }
     Ok(StripeInvoiceLineResource {
         id: required_id(value, "invoice line.id")?,
         quantity: optional_i64(value.get("quantity"), "line.quantity")?,
-        subscription_id: details
-            .map(|details| optional_validated_ref(details.get("subscription"), "line.subscription"))
-            .transpose()?
-            .flatten(),
-        subscription_item_id: details
-            .map(|details| {
-                optional_validated_ref(details.get("subscription_item"), "line.subscription_item")
-            })
-            .transpose()?
-            .flatten(),
+        subscription_id,
+        subscription_item_id,
+        legacy_subscription_id,
+        legacy_subscription_item_id,
         price_id: price_details
             .map(|details| optional_validated_ref(details.get("price"), "line.price"))
             .transpose()?
