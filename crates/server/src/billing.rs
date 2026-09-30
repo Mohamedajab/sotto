@@ -1518,6 +1518,13 @@ mod tests {
     }
 
     #[test]
+    fn extreme_timestamp_difference_fails_without_overflow() {
+        let timestamp = i64::MIN;
+        let header = format!("t={timestamp},v1={}", sign("whsec_x", timestamp, "{}"));
+        assert!(!verify_signature("whsec_x", &header, "{}", 0));
+    }
+
+    #[test]
     fn any_valid_v1_among_several_passes() {
         let good = sign("whsec_x", 1000, "{}");
         let header = format!("t=1000,v1={},v1={good}", "ab".repeat(32));
