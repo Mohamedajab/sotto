@@ -1505,10 +1505,16 @@ async fn personal_invoice_history_preserves_annual_paid_terms() {
 
 #[tokio::test]
 async fn personal_invoice_history_is_invariant_to_paid_page_partitioning() {
+    let mut history_limits = limits();
+    history_limits.max_pages = 16;
     let first_server = mock_server(paid_history_responses(true)).await;
-    let first_client =
-        StripeReadClient::for_test(API_KEY, &config(), first_server.origin.clone(), limits())
-            .unwrap();
+    let first_client = StripeReadClient::for_test(
+        API_KEY,
+        &config(),
+        first_server.origin.clone(),
+        history_limits,
+    )
+    .unwrap();
     let mut first_session = first_client.session();
     let StripePersonalInvoiceHistoryResult::Observed(first) = first_client
         .personal_invoice_history(&mut first_session, &personal_binding())
@@ -1519,9 +1525,13 @@ async fn personal_invoice_history_is_invariant_to_paid_page_partitioning() {
     };
 
     let second_server = mock_server(paid_history_responses(false)).await;
-    let second_client =
-        StripeReadClient::for_test(API_KEY, &config(), second_server.origin.clone(), limits())
-            .unwrap();
+    let second_client = StripeReadClient::for_test(
+        API_KEY,
+        &config(),
+        second_server.origin.clone(),
+        history_limits,
+    )
+    .unwrap();
     let mut second_session = second_client.session();
     let StripePersonalInvoiceHistoryResult::Observed(second) = second_client
         .personal_invoice_history(&mut second_session, &personal_binding())
@@ -1856,6 +1866,43 @@ async fn invoice_history_carries_record_budget_from_pages_into_a_later_invoice()
         .unwrap()
         .iter()
         .any(|call| call.path_and_query.starts_with("/v1/invoices/in_2/lines?")));
+}
+
+#[tokio::test]
+async fn invoice_history_carries_page_budget_across_nested_collections() {
+    let mut responses = HashMap::new();
+    responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
+    responses.insert(
+        "/v1/subscriptions/sub_1".into(),
+        vec![MockResponse::json(json!({
+            "id":"sub_1","customer":"cus_1","status":"active","livemode":false
+        }))],
+    );
+    responses.insert(
+        "/v1/invoices".into(),
+        vec![MockResponse::json(list(vec![paid_invoice()], false))],
+    );
+    responses.insert(
+        "/v1/invoices/in_1".into(),
+        vec![MockResponse::json(paid_invoice())],
+    );
+    responses.insert(
+        "/v1/invoices/in_1/lines".into(),
+        vec![MockResponse::json(list(vec![personal_line("il_1")], false))],
+    );
+    let server = mock_server(responses).await;
+    let mut bounded = limits();
+    bounded.max_pages = 2;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), bounded).unwrap();
+    let mut session = client.session();
+
+    assert!(matches!(
+        client
+            .personal_invoice_history(&mut session, &personal_binding())
+            .await,
+        Err(StripeReadError::PageBoundExceeded)
+    ));
 }
 
 #[tokio::test]
