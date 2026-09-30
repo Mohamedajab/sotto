@@ -12,6 +12,31 @@ The references used were [retrieve an invoice](https://docs.stripe.com/api/invoi
 [retrieve invoice line items](https://docs.stripe.com/api/invoice-line-item/retrieve), and [list
 invoice payments](https://docs.stripe.com/api/invoice-payment/list).
 
+## Personal current renewal observation
+
+The current observation reads the failed invoice's subscription, invoice and complete line list in
+one bounded `StripeReadSession`, then rereads the invoice and subscription before returning an
+observation. These are synthetic loopback fixtures; no connected Stripe response has been captured
+at the repository's pinned version. The operation is evidence only and has no runtime caller.
+
+| Resource | Required current fields | Provenance and rejection rule |
+| --- | --- | --- |
+| `GET /v1/subscriptions/:id` | `id`, `customer`, `status`, `livemode`, `cancel_at_period_end`, `cancel_at`, `canceled_at`, `ended_at` | The ID, customer and mode must match the binding. Status must be recognised. The boolean and all three nullable cancellation fields must be present; JSON `null` is valid, omission and wrong type are malformed. Non-null timestamps must be nonnegative. A final-read presence change is reported with the provider field name. |
+| `GET /v1/invoices/:id` | `id`, `customer`, `parent.type`, `parent.subscription_details.subscription`, `billing_reason`, `collection_method`, `status`, `currency`, all settlement amounts, `livemode`, `metadata.sotto_allocation_reference` | The current invoice must be an automatic `subscription_cycle` invoice in GBP with the nested subscription and trusted allocation claim. Missing or null billing fields are named shape errors; wrong values become `NeedsEvidence` with the field and value. The fields participate in final-read change diagnostics. |
+| `GET /v1/invoices/:id/lines` | `id`, `invoice`, `quantity`, `livemode`, nested subscription and subscription item, nested `proration`, pricing type and configured price, `period.start`, `period.end` | Exactly one complete non-prorated subscription-item line with quantity one is supported. Optional legacy top-level `subscription` and `subscription_item` references may be present only when they agree with the nested references; they never fill missing nested fields. The validated line collection is reused for paid correction evidence. |
+
+Paid invoices require `amount_remaining=0`; open invoices require a positive due amount and
+`amount_remaining=amount_due` with no paid, overpaid or off-Stripe amount. Void and uncollectible
+invoices accept nonnegative remaining balances only when `amount_remaining <= amount_due` and all
+other settlement amounts are zero. Unknown statuses and unsupported subscription states remain
+`NeedsEvidence`.
+
+The session's request, page, record, byte and deadline bounds cover the initial reads, correction
+detail enumeration and final rereads together. The final rereads are independent GETs rather than
+an atomic provider snapshot: a payment or cancellation transition returns `ChangedDuringRead`
+with no successful subset, and a later invocation may observe a different state. This operation
+does not publish coverage, assign a failed-renewal ID, or mutate storage.
+
 | Resource | Required fields used | Provenance and rejection rule |
 | --- | --- | --- |
 | `GET /v1/account` | `id`, `livemode` | Must equal the configured operator account and environment before resource reads continue. |
