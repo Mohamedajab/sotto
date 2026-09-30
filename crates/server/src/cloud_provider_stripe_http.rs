@@ -843,11 +843,17 @@ impl StripeReadClient {
 
         let state = match first_invoice.status.as_deref() {
             Some("paid") => {
+                if first_invoice.amount_remaining != Some(0) {
+                    return Ok(StripeRenewalObservationResult::NeedsEvidence(
+                        StripeRenewalNeedsEvidence::UnsupportedSettlement,
+                    ));
+                }
                 let evidence = self
-                    .personal_invoice_correction_evidence_from_invoice(
+                    .personal_invoice_correction_evidence_from_invoice_and_lines(
                         session,
                         first_invoice.clone(),
                         binding,
+                        lines,
                     )
                     .await?;
                 let term = match evaluate_personal_invoice_access(&evidence) {
