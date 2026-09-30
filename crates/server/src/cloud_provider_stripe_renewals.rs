@@ -165,6 +165,17 @@ pub fn decode_personal_renewal_failure(
     if binding.payer_kind() != crate::cloud_provider::PayerKind::Personal {
         return Err(StripeContractError::UnsupportedPayerKind);
     }
+    for entry in history.entries() {
+        if let StripePersonalInvoiceHistoryEntry::Paid(term) = entry {
+            if term.allocation_reference() != binding.allocation_reference()
+                || term.customer_id() != binding.customer_id()
+                || term.subscription_id() != binding.subscription_id()
+                || term.provider_item_id() != binding.provider_item_id()
+            {
+                return Err(StripeContractError::OwnershipMismatch);
+            }
+        }
+    }
 
     let payload =
         std::str::from_utf8(raw_payload).map_err(|_| StripeContractError::MalformedPayload)?;
@@ -382,16 +393,14 @@ pub fn decode_personal_renewal_failure(
             return Err(StripeContractError::OwnershipMismatch);
         }
     }
-    match line_details.get("proration").and_then(Value::as_bool) {
-        Some(false) => {}
-        Some(true) => {
-            return Err(StripeContractError::UnsupportedRenewal("proration"));
-        }
-        None => {
-            return Ok(StripeRenewalFailureResult::NeedsEvidence(
-                StripeRenewalFailureNeedsEvidence::MissingProrationProof,
-            ));
-        }
+    let proration_proof = match line_details.get("proration") {
+        None => None,
+        Some(value) => Some(value.as_bool().ok_or(StripeContractError::InvalidField(
+            "lines.data[0].parent.subscription_item_details.proration",
+        ))?),
+    };
+    if proration_proof == Some(true) {
+        return Err(StripeContractError::UnsupportedRenewal("proration"));
     }
     let pricing = line
         .get("pricing")
@@ -429,6 +438,11 @@ pub fn decode_personal_renewal_failure(
     if renewal_period_end <= renewal_period_start {
         return Err(StripeContractError::InvalidField(
             "lines.data[0].period.end",
+        ));
+    }
+    if proration_proof.is_none() {
+        return Ok(StripeRenewalFailureResult::NeedsEvidence(
+            StripeRenewalFailureNeedsEvidence::MissingProrationProof,
         ));
     }
 
