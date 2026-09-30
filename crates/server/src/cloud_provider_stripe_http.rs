@@ -1543,7 +1543,7 @@ fn closed_invoice_amounts_valid(invoice: &StripeInvoiceResource) -> bool {
             invoice.amount_paid_off_stripe
         ),
         (Some(due), Some(remaining), Some(0), Some(0), Some(0))
-            if due >= 0 && remaining >= 0
+            if due >= 0 && remaining >= 0 && remaining <= due
     )
 }
 
