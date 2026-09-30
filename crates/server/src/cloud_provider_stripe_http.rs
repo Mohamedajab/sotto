@@ -17,13 +17,14 @@ use crate::billing::STRIPE_API_VERSION;
 use crate::cloud_provider::ProviderEnvironment;
 use crate::cloud_provider_stripe::{
     decode_invoice_payment, validate_personal_invoice_observation, StripeAllocationBinding,
-    StripeContractError, StripeCoverageConfig, StripePersonalInvoiceFacts,
+    StripeContractError, StripeCoverageConfig, StripeInterval, StripePersonalInvoiceFacts,
     StripePersonalInvoiceObservation, STRIPE_ALLOCATION_METADATA_KEY,
 };
 use crate::cloud_provider_stripe_corrections::{
     evaluate_personal_invoice_access, StripePersonalInvoiceAccessDecision,
     StripePersonalInvoiceCorrectionEvidence, StripeRetainedPaidTerm, StripeUnresolvedCorrections,
 };
+use crate::cloud_provider_stripe_renewals::StripeRenewalFailureEvidence;
 
 const STRIPE_ORIGIN: &str = "https://api.stripe.com/";
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -789,7 +790,121 @@ impl StripeReadClient {
             .await
     }
 
-    async fn personal_invoice_correction_evidence_from_invoice(
+    /// Observe the current state of a historically failed personal renewal under one bounded
+    /// session. This is evidence only: it never assigns recovery or writes coverage.
+    #[doc(hidden)]
+    pub async fn personal_renewal_observation(
+        &self,
+        session: &mut StripeReadSession,
+        binding: &StripeAllocationBinding,
+        failure: &StripeRenewalFailureEvidence,
+    ) -> Result<StripeRenewalObservationResult, StripeReadError> {
+        if failure.provider_account_id() != self.account_id
+            || failure.environment() != self.environment
+            || failure.allocation_reference() != binding.allocation_reference()
+            || failure.customer_id() != binding.customer_id()
+            || failure.subscription_id() != binding.subscription_id()
+            || failure.provider_item_id() != binding.provider_item_id()
+            || binding.payer_kind() != crate::cloud_provider::PayerKind::Personal
+        {
+            return Err(StripeReadError::ContextMismatch);
+        }
+        let first_subscription = self
+            .subscription(session, binding.subscription_id(), binding.customer_id())
+            .await?;
+        if first_subscription.status.is_none() {
+            return Ok(StripeRenewalObservationResult::NeedsEvidence(
+                StripeRenewalNeedsEvidence::IncompleteCurrentShape("subscription.status"),
+            ));
+        }
+        let cancellation = cancellation_facts(&first_subscription)?;
+        let first_invoice = self.invoice(session, failure.invoice_id()).await?;
+        validate_current_invoice(&first_invoice, binding)?;
+        let lines = self.invoice_lines(session, &first_invoice.id).await?;
+        validate_current_line(&lines, failure, binding, &self.coverage, self.environment)?;
+
+        let state = match first_invoice.status.as_deref() {
+            Some("paid") => {
+                let evidence = self
+                    .personal_invoice_correction_evidence_from_invoice(
+                        session,
+                        first_invoice.clone(),
+                        binding,
+                    )
+                    .await?;
+                let term = match evaluate_personal_invoice_access(&evidence) {
+                    StripePersonalInvoiceAccessDecision::RetainPaidTerm(term) => term,
+                    StripePersonalInvoiceAccessDecision::NeedsEvidence(_) => {
+                        return Ok(StripeRenewalObservationResult::NeedsEvidence(
+                            StripeRenewalNeedsEvidence::UnsupportedSettlement,
+                        ));
+                    }
+                };
+                StripeRenewalCurrentState::Paid {
+                    evidence: Box::new(evidence),
+                    term: Box::new(term),
+                }
+            }
+            Some("open") => {
+                if !open_invoice_amounts_valid(&first_invoice) {
+                    return Ok(StripeRenewalObservationResult::NeedsEvidence(
+                        StripeRenewalNeedsEvidence::UnsupportedSettlement,
+                    ));
+                }
+                StripeRenewalCurrentState::Open
+            }
+            Some("void") | Some("uncollectible") => {
+                if !closed_invoice_amounts_valid(&first_invoice) {
+                    return Ok(StripeRenewalObservationResult::NeedsEvidence(
+                        StripeRenewalNeedsEvidence::UnsupportedSettlement,
+                    ));
+                }
+                StripeRenewalCurrentState::ClosedUnpaid {
+                    status: first_invoice.status.clone().unwrap_or_default(),
+                }
+            }
+            Some(status) => {
+                return Ok(StripeRenewalObservationResult::NeedsEvidence(
+                    StripeRenewalNeedsEvidence::UnsupportedStatus(status.to_owned()),
+                ));
+            }
+            None => {
+                return Ok(StripeRenewalObservationResult::NeedsEvidence(
+                    StripeRenewalNeedsEvidence::IncompleteCurrentShape("invoice.status"),
+                ));
+            }
+        };
+        let second_invoice = self.invoice(session, failure.invoice_id()).await?;
+        let second_subscription = self
+            .subscription(session, binding.subscription_id(), binding.customer_id())
+            .await?;
+        if first_invoice != second_invoice {
+            return Ok(StripeRenewalObservationResult::NeedsEvidence(
+                StripeRenewalNeedsEvidence::ChangedDuringRead {
+                    resource: "invoice",
+                    fields: vec!["resource"],
+                },
+            ));
+        }
+        if first_subscription != second_subscription {
+            return Ok(StripeRenewalObservationResult::NeedsEvidence(
+                StripeRenewalNeedsEvidence::ChangedDuringRead {
+                    resource: "subscription",
+                    fields: vec!["resource"],
+                },
+            ));
+        }
+        Ok(StripeRenewalObservationResult::Observed(Box::new(
+            StripeRenewalObservation {
+                renewal_id: failure.renewal_id().to_owned(),
+                invoice_id: failure.invoice_id().to_owned(),
+                state,
+                cancellation,
+            },
+        )))
+    }
+
+    pub(crate) async fn personal_invoice_correction_evidence_from_invoice(
         &self,
         session: &mut StripeReadSession,
         invoice: StripeInvoiceResource,
@@ -1090,6 +1205,13 @@ pub struct StripeSubscriptionResource {
     pub customer_id: Option<String>,
     pub status: Option<String>,
     pub livemode: Option<bool>,
+    pub cancel_at_period_end: Option<bool>,
+    pub cancel_at: Option<i64>,
+    pub canceled_at: Option<i64>,
+    pub ended_at: Option<i64>,
+    cancel_at_present: bool,
+    canceled_at_present: bool,
+    ended_at_present: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1103,6 +1225,7 @@ pub struct StripeInvoiceResource {
     pub currency: Option<String>,
     pub amount_paid: Option<i64>,
     pub amount_due: Option<i64>,
+    pub amount_remaining: Option<i64>,
     pub amount_overpaid: Option<i64>,
     pub amount_paid_off_stripe: Option<i64>,
     pub allocation_reference: Option<String>,
@@ -1262,6 +1385,115 @@ fn invoice_headers_match(left: &StripeInvoiceResource, right: &StripeInvoiceReso
     left == right
 }
 
+fn cancellation_facts(
+    subscription: &StripeSubscriptionResource,
+) -> Result<StripeRenewalCancellationFacts, StripeReadError> {
+    if !subscription.cancel_at_present
+        || !subscription.canceled_at_present
+        || !subscription.ended_at_present
+    {
+        return Err(StripeReadError::MalformedResponse(
+            "subscription.cancellation_fields",
+        ));
+    }
+    let cancel_at_period_end =
+        subscription
+            .cancel_at_period_end
+            .ok_or(StripeReadError::MalformedResponse(
+                "subscription.cancel_at_period_end",
+            ))?;
+    for (value, field) in [
+        (subscription.cancel_at, "subscription.cancel_at"),
+        (subscription.canceled_at, "subscription.canceled_at"),
+        (subscription.ended_at, "subscription.ended_at"),
+    ] {
+        if value.is_some_and(|timestamp| timestamp < 0) {
+            return Err(StripeReadError::MalformedResponse(field));
+        }
+    }
+    Ok(StripeRenewalCancellationFacts {
+        status: subscription.status.clone(),
+        cancel_at_period_end,
+        cancel_at: subscription.cancel_at,
+        canceled_at: subscription.canceled_at,
+        ended_at: subscription.ended_at,
+    })
+}
+
+fn validate_current_invoice(
+    invoice: &StripeInvoiceResource,
+    binding: &StripeAllocationBinding,
+) -> Result<(), StripeReadError> {
+    if invoice.customer_id.as_deref() != Some(binding.customer_id())
+        || invoice.subscription_id.as_deref() != Some(binding.subscription_id())
+        || invoice.parent_type.as_deref() != Some("subscription_details")
+        || invoice.allocation_reference.as_deref() != Some(binding.allocation_reference())
+        || !invoice
+            .currency
+            .as_deref()
+            .is_some_and(|currency| currency.eq_ignore_ascii_case("gbp"))
+    {
+        return Err(StripeReadError::ContextMismatch);
+    }
+    Ok(())
+}
+
+fn validate_current_line(
+    lines: &[StripeInvoiceLineResource],
+    failure: &StripeRenewalFailureEvidence,
+    binding: &StripeAllocationBinding,
+    config: &StripeCoverageConfig,
+    environment: ProviderEnvironment,
+) -> Result<(), StripeReadError> {
+    if lines.len() != 1 {
+        return Err(StripeReadError::Observation(
+            StripeContractError::UnsupportedQuantity,
+        ));
+    }
+    let line = &lines[0];
+    if line.id != failure.invoice_line_id()
+        || line.invoice_id.as_deref() != Some(failure.invoice_id())
+        || line.quantity != Some(1)
+        || line.subscription_id.as_deref() != Some(binding.subscription_id())
+        || line.subscription_item_id.as_deref() != Some(binding.provider_item_id())
+        || line.period_start != Some(failure.renewal_period_start())
+        || line.period_end != Some(failure.renewal_period_end())
+        || line.parent_type.as_deref() != Some("subscription_item_details")
+        || line.pricing_type.as_deref() != Some("price_details")
+        || line.livemode != Some(matches!(environment, ProviderEnvironment::Live))
+    {
+        return Err(StripeReadError::Observation(
+            StripeContractError::ContextMismatch,
+        ));
+    }
+    let expected_price = match failure.interval() {
+        StripeInterval::Month => &config.monthly_price_id,
+        StripeInterval::Year => &config.annual_price_id,
+    };
+    if line.price_id.as_deref() != Some(expected_price.as_str()) {
+        return Err(StripeReadError::MalformedResponse("line.price"));
+    }
+    Ok(())
+}
+
+fn open_invoice_amounts_valid(invoice: &StripeInvoiceResource) -> bool {
+    matches!(
+        (invoice.amount_due, invoice.amount_remaining, invoice.amount_paid, invoice.amount_overpaid, invoice.amount_paid_off_stripe),
+        (Some(due), Some(remaining), Some(0), Some(0), Some(0)) if due > 0 && remaining == due
+    )
+}
+
+fn closed_invoice_amounts_valid(invoice: &StripeInvoiceResource) -> bool {
+    matches!(
+        (
+            invoice.amount_paid,
+            invoice.amount_overpaid,
+            invoice.amount_paid_off_stripe
+        ),
+        (Some(0), Some(0), Some(0))
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StripeInvoiceLineResource {
     pub id: String,
@@ -1274,6 +1506,104 @@ pub struct StripeInvoiceLineResource {
     pub livemode: Option<bool>,
     pub period_start: Option<i64>,
     pub period_end: Option<i64>,
+    pub invoice_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StripeRenewalCancellationFacts {
+    status: Option<String>,
+    cancel_at_period_end: bool,
+    cancel_at: Option<i64>,
+    canceled_at: Option<i64>,
+    ended_at: Option<i64>,
+}
+
+impl StripeRenewalCancellationFacts {
+    pub fn status(&self) -> Option<&str> {
+        self.status.as_deref()
+    }
+
+    pub const fn cancel_at_period_end(&self) -> bool {
+        self.cancel_at_period_end
+    }
+    pub const fn cancel_at(&self) -> Option<i64> {
+        self.cancel_at
+    }
+    pub const fn canceled_at(&self) -> Option<i64> {
+        self.canceled_at
+    }
+    pub const fn ended_at(&self) -> Option<i64> {
+        self.ended_at
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StripeRenewalCurrentState {
+    Paid {
+        evidence: Box<StripePersonalInvoiceCorrectionEvidence>,
+        term: Box<StripeRetainedPaidTerm>,
+    },
+    Open,
+    ClosedUnpaid {
+        status: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StripeRenewalObservation {
+    renewal_id: String,
+    invoice_id: String,
+    state: StripeRenewalCurrentState,
+    cancellation: StripeRenewalCancellationFacts,
+}
+
+impl StripeRenewalObservation {
+    pub fn renewal_id(&self) -> &str {
+        &self.renewal_id
+    }
+    pub fn invoice_id(&self) -> &str {
+        &self.invoice_id
+    }
+    pub fn state(&self) -> &StripeRenewalCurrentState {
+        &self.state
+    }
+    pub fn cancellation(&self) -> &StripeRenewalCancellationFacts {
+        &self.cancellation
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StripeRenewalNeedsEvidence {
+    UnsupportedStatus(String),
+    ChangedDuringRead {
+        resource: &'static str,
+        fields: Vec<&'static str>,
+    },
+    UnsupportedSettlement,
+    IncompleteCurrentShape(&'static str),
+}
+
+impl fmt::Display for StripeRenewalNeedsEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedStatus(status) => {
+                write!(formatter, "unsupported invoice status {status}")
+            }
+            Self::ChangedDuringRead { resource, fields } => {
+                write!(formatter, "{resource} changed during read: {fields:?}")
+            }
+            Self::UnsupportedSettlement => formatter.write_str("current settlement is unsupported"),
+            Self::IncompleteCurrentShape(field) => {
+                write!(formatter, "required current field is unavailable: {field}")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StripeRenewalObservationResult {
+    Observed(Box<StripeRenewalObservation>),
+    NeedsEvidence(StripeRenewalNeedsEvidence),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1484,6 +1814,16 @@ fn parse_subscription(value: &Value) -> Result<StripeSubscriptionResource, Strip
         customer_id: optional_validated_ref(value.get("customer"), "subscription.customer")?,
         status: optional_string(value.get("status"), "subscription.status")?,
         livemode: optional_bool(value.get("livemode"), "subscription.livemode")?,
+        cancel_at_period_end: optional_bool(
+            value.get("cancel_at_period_end"),
+            "subscription.cancel_at_period_end",
+        )?,
+        cancel_at: optional_i64(value.get("cancel_at"), "subscription.cancel_at")?,
+        canceled_at: optional_i64(value.get("canceled_at"), "subscription.canceled_at")?,
+        ended_at: optional_i64(value.get("ended_at"), "subscription.ended_at")?,
+        cancel_at_present: value.get("cancel_at").is_some(),
+        canceled_at_present: value.get("canceled_at").is_some(),
+        ended_at_present: value.get("ended_at").is_some(),
     })
 }
 
@@ -1525,6 +1865,7 @@ fn parse_invoice(value: &Value) -> Result<StripeInvoiceResource, StripeReadError
         currency: optional_string(value.get("currency"), "invoice.currency")?,
         amount_paid: optional_i64(value.get("amount_paid"), "invoice.amount_paid")?,
         amount_due: optional_i64(value.get("amount_due"), "invoice.amount_due")?,
+        amount_remaining: optional_i64(value.get("amount_remaining"), "invoice.amount_remaining")?,
         amount_overpaid: optional_i64(value.get("amount_overpaid"), "invoice.amount_overpaid")?,
         amount_paid_off_stripe: optional_i64(
             value.get("amount_paid_off_stripe"),
@@ -1597,6 +1938,7 @@ fn parse_invoice_line(value: &Value) -> Result<StripeInvoiceLineResource, Stripe
             .map(|period| optional_i64(period.get("end"), "line.period.end"))
             .transpose()?
             .flatten(),
+        invoice_id: optional_validated_ref(value.get("invoice"), "line.invoice")?,
     })
 }
 
