@@ -281,8 +281,11 @@ pub fn decode_personal_renewal_failure(
             return Err(StripeContractError::InvalidField(field));
         }
     }
-    if amount_due == 0 || amount_remaining == 0 {
+    if amount_due == 0 {
         return Err(StripeContractError::InvalidField("amount_due"));
+    }
+    if amount_remaining == 0 {
+        return Err(StripeContractError::InvalidField("amount_remaining"));
     }
     if amount_paid != 0 || amount_overpaid != 0 || amount_paid_off_stripe != 0 {
         return Err(StripeContractError::UnsupportedSettlement(

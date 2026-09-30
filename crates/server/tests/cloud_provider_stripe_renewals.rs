@@ -274,6 +274,20 @@ async fn bad_signature_is_reported_before_malformed_json() {
         &history,
     );
     assert!(matches!(result, Err(StripeContractError::InvalidSignature)));
+
+    let (raw, signature) = signed(&signed_failure(), NOW);
+    assert!(matches!(
+        decode_personal_renewal_failure(
+            &raw,
+            &signature,
+            "   ",
+            NOW,
+            &config(),
+            &binding(),
+            &history,
+        ),
+        Err(StripeContractError::InvalidConfig("Stripe webhook secret"))
+    ));
 }
 
 #[tokio::test]
@@ -319,6 +333,22 @@ async fn retries_keep_one_renewal_identity_but_preserve_event_ids() {
 #[tokio::test]
 async fn incomplete_or_prorated_lines_never_link() {
     let history = history().await;
+
+    let mut zero_remaining = signed_failure();
+    zero_remaining["data"]["object"]["amount_remaining"] = json!(0);
+    let (raw, signature) = signed(&zero_remaining, NOW);
+    assert!(matches!(
+        decode_personal_renewal_failure(
+            &raw,
+            &signature,
+            SECRET,
+            NOW,
+            &config(),
+            &binding(),
+            &history,
+        ),
+        Err(StripeContractError::InvalidField("amount_remaining"))
+    ));
 
     let mut truncated = signed_failure();
     truncated["data"]["object"]["lines"]["has_more"] = json!(true);
