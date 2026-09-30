@@ -521,6 +521,17 @@ impl StripeReadClient {
             ));
         }
         let lines = self.invoice_lines(session, &invoice.id).await?;
+        self.personal_invoice_observation_from_invoice_and_lines(session, invoice, binding, lines)
+            .await
+    }
+
+    async fn personal_invoice_observation_from_invoice_and_lines(
+        &self,
+        session: &mut StripeReadSession,
+        invoice: StripeInvoiceResource,
+        binding: &StripeAllocationBinding,
+        lines: Vec<StripeInvoiceLineResource>,
+    ) -> Result<StripePersonalInvoiceObservation, StripeReadError> {
         if lines.len() != 1 {
             return Err(StripeReadError::Observation(
                 StripeContractError::UnsupportedQuantity,
@@ -930,6 +941,20 @@ impl StripeReadClient {
     ) -> Result<StripePersonalInvoiceCorrectionEvidence, StripeReadError> {
         let observation = self
             .personal_invoice_observation_from_invoice(session, invoice, binding)
+            .await?;
+        self.personal_invoice_correction_evidence_from_observation(session, observation)
+            .await
+    }
+
+    async fn personal_invoice_correction_evidence_from_invoice_and_lines(
+        &self,
+        session: &mut StripeReadSession,
+        invoice: StripeInvoiceResource,
+        binding: &StripeAllocationBinding,
+        lines: Vec<StripeInvoiceLineResource>,
+    ) -> Result<StripePersonalInvoiceCorrectionEvidence, StripeReadError> {
+        let observation = self
+            .personal_invoice_observation_from_invoice_and_lines(session, invoice, binding, lines)
             .await?;
         self.personal_invoice_correction_evidence_from_observation(session, observation)
             .await
