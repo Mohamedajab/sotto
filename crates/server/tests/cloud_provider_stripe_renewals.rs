@@ -138,7 +138,7 @@ fn paid_line() -> Value {
     json!({
         "id":"il_paid","quantity":1,"livemode":false,
         "parent":{"type":"subscription_item_details","subscription_item_details":{
-            "subscription":"sub_renewal","subscription_item":"si_renewal"
+            "subscription":"sub_renewal","subscription_item":"si_renewal","proration":false
         }},
         "pricing":{"type":"price_details","price_details":{"price":"price_month"}},
         "period":{"start":1000,"end":2000}
@@ -468,7 +468,7 @@ fn current_line() -> Value {
     json!({
         "id":"il_failed","invoice":"in_failed","quantity":1,"livemode":false,
         "parent":{"type":"subscription_item_details","subscription_item_details":{
-            "subscription":"sub_renewal","subscription_item":"si_renewal"
+            "subscription":"sub_renewal","subscription_item":"si_renewal","proration":false
         }},
         "pricing":{"type":"price_details","price_details":{"price":"price_month"}},
         "period":{"start":2000,"end":3000}
@@ -545,6 +545,11 @@ async fn current_paid_invoice_supersedes_historical_failure_and_preserves_cancel
         panic!("expected observation")
     };
     assert_eq!(observation.invoice_id(), "in_failed");
+    assert_eq!(observation.event_id(), "evt_failure_1");
+    assert_eq!(observation.provider_account_id(), "acct_test_renewal");
+    assert_eq!(observation.allocation_reference(), "alloc_renewal");
+    assert_eq!(observation.period_start(), 2000);
+    assert_eq!(observation.period_end(), 3000);
     assert!(matches!(
         observation.state(),
         StripeRenewalCurrentState::Paid { .. }
@@ -598,6 +603,11 @@ async fn invoice_change_between_reads_returns_no_partial_observation() {
         .unwrap();
     assert!(matches!(
         result,
-        StripeRenewalObservationResult::NeedsEvidence(_)
+        StripeRenewalObservationResult::NeedsEvidence(
+            sotto_server::cloud_provider_stripe_http::StripeRenewalNeedsEvidence::ChangedDuringRead {
+                resource: "invoice",
+                ref fields,
+            }
+        ) if fields == &["allocation_reference"]
     ));
 }

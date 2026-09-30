@@ -817,6 +817,13 @@ impl StripeReadClient {
                 StripeRenewalNeedsEvidence::IncompleteCurrentShape("subscription.status"),
             ));
         }
+        if !supported_subscription_status(first_subscription.status.as_deref().unwrap()) {
+            return Ok(StripeRenewalObservationResult::NeedsEvidence(
+                StripeRenewalNeedsEvidence::UnsupportedSubscriptionStatus(
+                    first_subscription.status.clone().unwrap_or_default(),
+                ),
+            ));
+        }
         let cancellation = cancellation_facts(&first_subscription)?;
         let first_invoice = self.invoice(session, failure.invoice_id()).await?;
         validate_current_invoice(&first_invoice, binding)?;
@@ -879,18 +886,20 @@ impl StripeReadClient {
             .subscription(session, binding.subscription_id(), binding.customer_id())
             .await?;
         if first_invoice != second_invoice {
+            let fields = invoice_diff_fields(&first_invoice, &second_invoice);
             return Ok(StripeRenewalObservationResult::NeedsEvidence(
                 StripeRenewalNeedsEvidence::ChangedDuringRead {
                     resource: "invoice",
-                    fields: vec!["resource"],
+                    fields,
                 },
             ));
         }
         if first_subscription != second_subscription {
+            let fields = subscription_diff_fields(&first_subscription, &second_subscription);
             return Ok(StripeRenewalObservationResult::NeedsEvidence(
                 StripeRenewalNeedsEvidence::ChangedDuringRead {
                     resource: "subscription",
-                    fields: vec!["resource"],
+                    fields,
                 },
             ));
         }
@@ -898,6 +907,15 @@ impl StripeReadClient {
             StripeRenewalObservation {
                 renewal_id: failure.renewal_id().to_owned(),
                 invoice_id: failure.invoice_id().to_owned(),
+                event_id: failure.event_id().to_owned(),
+                provider_account_id: failure.provider_account_id().to_owned(),
+                environment: failure.environment(),
+                allocation_reference: failure.allocation_reference().to_owned(),
+                customer_id: failure.customer_id().to_owned(),
+                subscription_id: failure.subscription_id().to_owned(),
+                provider_item_id: failure.provider_item_id().to_owned(),
+                period_start: failure.renewal_period_start(),
+                period_end: failure.renewal_period_end(),
                 state,
                 cancellation,
             },
@@ -1461,6 +1479,7 @@ fn validate_current_line(
         || line.parent_type.as_deref() != Some("subscription_item_details")
         || line.pricing_type.as_deref() != Some("price_details")
         || line.livemode != Some(matches!(environment, ProviderEnvironment::Live))
+        || line.proration != Some(false)
     {
         return Err(StripeReadError::Observation(
             StripeContractError::ContextMismatch,
@@ -1486,12 +1505,81 @@ fn open_invoice_amounts_valid(invoice: &StripeInvoiceResource) -> bool {
 fn closed_invoice_amounts_valid(invoice: &StripeInvoiceResource) -> bool {
     matches!(
         (
+            invoice.amount_due,
+            invoice.amount_remaining,
             invoice.amount_paid,
             invoice.amount_overpaid,
             invoice.amount_paid_off_stripe
         ),
-        (Some(0), Some(0), Some(0))
+        (Some(due), Some(remaining), Some(0), Some(0), Some(0))
+            if due >= 0 && remaining >= 0
     )
+}
+
+fn supported_subscription_status(status: &str) -> bool {
+    matches!(
+        status,
+        "active"
+            | "trialing"
+            | "past_due"
+            | "canceled"
+            | "unpaid"
+            | "incomplete"
+            | "incomplete_expired"
+            | "paused"
+    )
+}
+
+fn invoice_diff_fields(
+    left: &StripeInvoiceResource,
+    right: &StripeInvoiceResource,
+) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    macro_rules! compare {
+        ($field:ident) => {
+            if left.$field != right.$field {
+                fields.push(stringify!($field));
+            }
+        };
+    }
+    compare!(id);
+    compare!(customer_id);
+    compare!(subscription_id);
+    compare!(legacy_subscription_id);
+    compare!(parent_type);
+    compare!(status);
+    compare!(currency);
+    compare!(amount_paid);
+    compare!(amount_due);
+    compare!(amount_remaining);
+    compare!(amount_overpaid);
+    compare!(amount_paid_off_stripe);
+    compare!(allocation_reference);
+    compare!(livemode);
+    fields
+}
+
+fn subscription_diff_fields(
+    left: &StripeSubscriptionResource,
+    right: &StripeSubscriptionResource,
+) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    macro_rules! compare {
+        ($field:ident) => {
+            if left.$field != right.$field {
+                fields.push(stringify!($field));
+            }
+        };
+    }
+    compare!(id);
+    compare!(customer_id);
+    compare!(status);
+    compare!(livemode);
+    compare!(cancel_at_period_end);
+    compare!(cancel_at);
+    compare!(canceled_at);
+    compare!(ended_at);
+    fields
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1507,6 +1595,7 @@ pub struct StripeInvoiceLineResource {
     pub period_start: Option<i64>,
     pub period_end: Option<i64>,
     pub invoice_id: Option<String>,
+    pub proration: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1553,6 +1642,15 @@ pub enum StripeRenewalCurrentState {
 pub struct StripeRenewalObservation {
     renewal_id: String,
     invoice_id: String,
+    event_id: String,
+    provider_account_id: String,
+    environment: ProviderEnvironment,
+    allocation_reference: String,
+    customer_id: String,
+    subscription_id: String,
+    provider_item_id: String,
+    period_start: i64,
+    period_end: i64,
     state: StripeRenewalCurrentState,
     cancellation: StripeRenewalCancellationFacts,
 }
@@ -1563,6 +1661,33 @@ impl StripeRenewalObservation {
     }
     pub fn invoice_id(&self) -> &str {
         &self.invoice_id
+    }
+    pub fn event_id(&self) -> &str {
+        &self.event_id
+    }
+    pub fn provider_account_id(&self) -> &str {
+        &self.provider_account_id
+    }
+    pub const fn environment(&self) -> ProviderEnvironment {
+        self.environment
+    }
+    pub fn allocation_reference(&self) -> &str {
+        &self.allocation_reference
+    }
+    pub fn customer_id(&self) -> &str {
+        &self.customer_id
+    }
+    pub fn subscription_id(&self) -> &str {
+        &self.subscription_id
+    }
+    pub fn provider_item_id(&self) -> &str {
+        &self.provider_item_id
+    }
+    pub const fn period_start(&self) -> i64 {
+        self.period_start
+    }
+    pub const fn period_end(&self) -> i64 {
+        self.period_end
     }
     pub fn state(&self) -> &StripeRenewalCurrentState {
         &self.state
@@ -1575,6 +1700,7 @@ impl StripeRenewalObservation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StripeRenewalNeedsEvidence {
     UnsupportedStatus(String),
+    UnsupportedSubscriptionStatus(String),
     ChangedDuringRead {
         resource: &'static str,
         fields: Vec<&'static str>,
@@ -1588,6 +1714,9 @@ impl fmt::Display for StripeRenewalNeedsEvidence {
         match self {
             Self::UnsupportedStatus(status) => {
                 write!(formatter, "unsupported invoice status {status}")
+            }
+            Self::UnsupportedSubscriptionStatus(status) => {
+                write!(formatter, "unsupported subscription status {status}")
             }
             Self::ChangedDuringRead { resource, fields } => {
                 write!(formatter, "{resource} changed during read: {fields:?}")
@@ -1939,6 +2068,10 @@ fn parse_invoice_line(value: &Value) -> Result<StripeInvoiceLineResource, Stripe
             .transpose()?
             .flatten(),
         invoice_id: optional_validated_ref(value.get("invoice"), "line.invoice")?,
+        proration: details
+            .map(|details| optional_bool(details.get("proration"), "line.proration"))
+            .transpose()?
+            .flatten(),
     })
 }
 
