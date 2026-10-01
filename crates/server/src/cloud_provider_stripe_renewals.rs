@@ -126,10 +126,6 @@ impl StripeRenewalFailureEvidence {
     }
 
     /// Derive the generic provider event identity without retaining the signed payload.
-    #[expect(
-        dead_code,
-        reason = "the renewal store consumes this seam in the next slice"
-    )]
     pub(crate) fn verified_event(&self) -> Result<VerifiedProviderEvent, ProviderAdapterError> {
         let canonical = canonical_event_encoding(self);
         VerifiedProviderEvent::from_payload(
@@ -147,10 +143,7 @@ impl StripeRenewalFailureEvidence {
     /// Database rows are attestations of a prior signed acceptance, not a new signature
     /// verification. This narrow crate-private path still validates every identity and the
     /// versioned reference before exposing the value to the rest of the adapter.
-    #[expect(
-        dead_code,
-        reason = "the renewal store consumes this seam in the next slice"
-    )]
+    #[allow(dead_code)]
     pub(crate) fn from_stored(
         stored: StoredStripeRenewalFailure,
     ) -> Result<Self, ProviderAdapterError> {
@@ -253,10 +246,7 @@ pub(crate) const RENEWAL_EVIDENCE_VERSION: i16 = 1;
 
 /// Persistence-shaped data accepted only by the validated reconstruction path above.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[expect(
-    dead_code,
-    reason = "the renewal store supplies this data in the next slice"
-)]
+#[allow(dead_code)]
 pub(crate) struct StoredStripeRenewalFailure {
     pub version: i16,
     pub evidence_reference: String,
