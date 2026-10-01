@@ -159,15 +159,15 @@ pub async fn load_personal_renewal_failures(
           AND association.provider_environment = failure.provider_environment \
           AND association.event_id = failure.event_id \
          JOIN cloud_provider_allocations AS allocation \
-           ON allocation.allocation_id = failure.allocation_id \
+           ON allocation.allocation_id = association.allocation_id \
          JOIN cloud_provider_payers AS payer ON payer.payer_id = allocation.payer_id \
-         JOIN cloud_coverage_sources AS source ON source.source_id = failure.coverage_source_id \
-         WHERE failure.provider_namespace = $1 \
-           AND failure.provider_account_id = $2 \
-           AND failure.provider_environment = $3 \
-           AND failure.beneficiary_id = $4 \
-           AND failure.allocation_id = $5 \
-           AND failure.coverage_source_id = $6 \
+         JOIN cloud_coverage_sources AS source ON source.source_id = association.coverage_source_id \
+         WHERE association.provider_namespace = $1 \
+           AND association.provider_account_id = $2 \
+           AND association.provider_environment = $3 \
+           AND association.beneficiary_id = $4 \
+           AND association.allocation_id = $5 \
+           AND association.coverage_source_id = $6 \
          ORDER BY failure.event_id ASC \
          LIMIT $7",
     )
@@ -277,6 +277,12 @@ fn stored_evidence(
             == allocation.external_allocation_reference
         && row.try_get::<String, _>("source_ownership_reference")?
             == allocation.ownership_evidence_reference;
+    let failure_matches = row.try_get::<String, _>("provider_namespace")? == context.namespace
+        && row.try_get::<String, _>("provider_account_id")? == context.account_id
+        && row.try_get::<String, _>("provider_environment")? == context.environment.as_str()
+        && row.try_get::<String, _>("beneficiary_id")? == allocation.beneficiary_id
+        && row.try_get::<String, _>("allocation_id")? == allocation.allocation_id
+        && row.try_get::<String, _>("coverage_source_id")? == allocation.source_id;
     if evidence.provider_account_id() != context.account_id
         || evidence.environment() != context.environment
         || evidence.allocation_reference() != allocation.external_allocation_reference
@@ -287,6 +293,7 @@ fn stored_evidence(
         || !allocation_matches
         || !payer_matches
         || !source_matches
+        || !failure_matches
     {
         return Err(StripeRenewalFailureLoadError::Corrupt(
             "stored Stripe renewal owner or association does not match".into(),
