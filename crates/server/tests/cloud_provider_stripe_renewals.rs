@@ -515,33 +515,36 @@ async fn verified_retry_events_merge_without_changing_candidate_identity() {
     else {
         panic!("expected retry observation");
     };
-    let first = compose_personal_coverage(
+    let merged = compose_personal_coverage(
         &config(),
         &binding(),
         &history,
-        &[(*first_failure, *first_observation)],
+        &[
+            ((*first_failure).clone(), (*first_observation).clone()),
+            ((*retry_failure).clone(), (*retry_observation).clone()),
+        ],
     )
     .unwrap();
-    let retry = compose_personal_coverage(
+    let single = compose_personal_coverage(
         &config(),
         &binding(),
         &history,
-        &[(*retry_failure, *retry_observation)],
+        &[((*first_failure).clone(), (*first_observation).clone())],
     )
     .unwrap();
     let (
-        StripeCoverageCompositionResult::Candidate(first),
-        StripeCoverageCompositionResult::Candidate(retry),
-    ) = (first, retry)
+        StripeCoverageCompositionResult::Candidate(merged),
+        StripeCoverageCompositionResult::Candidate(single),
+    ) = (merged, single)
     else {
         panic!("expected candidates");
     };
-    assert_eq!(first.semantic_reference(), retry.semantic_reference());
-    assert_ne!(
-        first.renewals()[0].event_ids(),
-        retry.renewals()[0].event_ids()
+    assert_eq!(merged.semantic_reference(), single.semantic_reference());
+    assert_eq!(
+        merged.renewals()[0].event_ids(),
+        &["evt_failure_1", "evt_failure_retry"]
     );
-    assert_eq!(first.renewals()[0].predecessor_invoice_id(), "in_paid");
+    assert_eq!(merged.renewals()[0].predecessor_invoice_id(), "in_paid");
 }
 
 #[tokio::test]
