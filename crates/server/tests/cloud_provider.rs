@@ -722,6 +722,35 @@ async fn accepted_provider_invalidation_fences_an_inflight_collection() {
     retry_complete.commit().await.unwrap();
     assert_eq!(applied.outcome, ApplyDisposition::Applied);
 
+    sqlx::query(
+        "UPDATE cloud_provider_event_receipts \
+         SET allocation_id = 'invalidation-rebind-other', coverage_source_id = 'invalidation-rebind-other' \
+         WHERE event_id = $1",
+    )
+    .bind(&event_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let mut applied_rebind = pool.begin().await.unwrap();
+    let rebind_result =
+        accept_provider_invalidation(&mut applied_rebind, &context, &event, &allocation).await;
+    assert!(matches!(
+        rebind_result,
+        Err(sotto_server::cloud_provider::ProviderAdapterError::AllocationConflict)
+    ));
+    applied_rebind.rollback().await.unwrap();
+    sqlx::query(
+        "UPDATE cloud_provider_event_receipts \
+         SET allocation_id = $2, coverage_source_id = $3 \
+         WHERE event_id = $1",
+    )
+    .bind(&event_id)
+    .bind(&allocation_id)
+    .bind(&source_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
     let after_event_id = format!("invalidation-after-{suffix}");
     let after_event = VerifiedProviderEvent::from_payload(
         &after_event_id,

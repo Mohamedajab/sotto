@@ -508,7 +508,7 @@ pub async fn accept_provider_invalidation(
 
     let receipt = sqlx::query(
         "SELECT event_type, provider_created_at, subscription_id, allocation_reference, \
-                normalized_payload_hash, status \
+                normalized_payload_hash, status, allocation_id, coverage_source_id \
          FROM cloud_provider_event_receipts \
          WHERE provider_namespace = $1 AND provider_account_id = $2 \
            AND provider_environment = $3 AND event_id = $4 FOR UPDATE",
@@ -524,6 +524,18 @@ pub async fn accept_provider_invalidation(
     let status: String = receipt.try_get("status")?;
     if status == "rejected" {
         return Err(ProviderAdapterError::EventRejected);
+    }
+    if status == "applied"
+        && (receipt
+            .try_get::<Option<String>, _>("allocation_id")?
+            .as_deref()
+            != Some(allocation.allocation_id.as_str())
+            || receipt
+                .try_get::<Option<String>, _>("coverage_source_id")?
+                .as_deref()
+                != Some(allocation.source_id.as_str()))
+    {
+        return Err(ProviderAdapterError::AllocationConflict);
     }
 
     let source = sqlx::query(
