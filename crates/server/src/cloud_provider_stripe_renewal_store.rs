@@ -25,6 +25,10 @@ pub enum StripeRenewalFailureDisposition {
 }
 
 /// The durable identity returned after a renewal failure is accepted or replayed.
+///
+/// `accepted_generation` is a local invalidation fence generation, not a paid term, entitlement
+/// revision, or provider ordering claim. A successful acceptance still requires the caller to
+/// commit its transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StripeRenewalFailureAcceptance {
     pub event_id: String,
@@ -83,6 +87,8 @@ pub enum StripeRenewalFailureLoadError {
     TooManyRows { limit: usize },
     #[error("renewal failure history exceeded the evidence byte bound of {limit}")]
     BoundExceeded { limit: usize },
+    /// The stored row or its joined owner/association failed validation. No partial list is
+    /// returned, and this path never repairs the database.
     #[error("renewal failure storage is corrupt: {0}")]
     Corrupt(String),
     #[error("database error: {0}")]
