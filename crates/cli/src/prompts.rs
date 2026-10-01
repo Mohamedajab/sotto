@@ -72,7 +72,9 @@ pub fn select_secret_key(app: &App, config: &Config, theme: &Theme) -> Result<Op
 
     match Select::new(&message, names).prompt() {
         Ok(choice) => Ok(Some(choice)),
-        Err(inquire::InquireError::OperationCanceled) => Ok(None),
+        Err(
+            inquire::InquireError::OperationCanceled | inquire::InquireError::OperationInterrupted,
+        ) => Ok(None),
         Err(e) => Err(Error::Input(format!("selection failed: {e}"))),
     }
 }
@@ -104,7 +106,9 @@ pub fn select_environment(
 
     match Select::new(&message, environments).prompt() {
         Ok(choice) => Ok(Some(choice)),
-        Err(inquire::InquireError::OperationCanceled) => Ok(None),
+        Err(
+            inquire::InquireError::OperationCanceled | inquire::InquireError::OperationInterrupted,
+        ) => Ok(None),
         Err(e) => Err(Error::Input(format!("selection failed: {e}"))),
     }
 }
@@ -123,7 +127,9 @@ pub fn confirm_removal(name: &str, theme: &Theme) -> Result<bool> {
 
     match Confirm::new(&prompt).with_default(false).prompt() {
         Ok(confirmed) => Ok(confirmed),
-        Err(inquire::InquireError::OperationCanceled) => Ok(false),
+        Err(
+            inquire::InquireError::OperationCanceled | inquire::InquireError::OperationInterrupted,
+        ) => Ok(false),
         Err(e) => Err(Error::Input(format!("prompt failed: {e}"))),
     }
 }
@@ -247,7 +253,9 @@ pub fn prompt_share_views(theme: &Theme) -> Result<Option<i32>> {
             Some(views) => Ok(Some(views)),
             None => prompt_custom_views(theme),
         },
-        Err(inquire::InquireError::OperationCanceled) => Ok(None),
+        Err(
+            inquire::InquireError::OperationCanceled | inquire::InquireError::OperationInterrupted,
+        ) => Ok(None),
         Err(e) => Err(Error::Input(format!("view limit selection failed: {e}"))),
     }
 }
@@ -266,7 +274,9 @@ pub fn prompt_custom_views(theme: &Theme) -> Result<Option<i32>> {
         .prompt()
     {
         Ok(val) => Ok(Some(val)),
-        Err(inquire::InquireError::OperationCanceled) => Ok(None),
+        Err(
+            inquire::InquireError::OperationCanceled | inquire::InquireError::OperationInterrupted,
+        ) => Ok(None),
         Err(e) => Err(Error::Input(format!(
             "custom view limit prompt failed: {e}"
         ))),
@@ -300,7 +310,9 @@ pub fn prompt_share_lifetime(theme: &Theme) -> Result<Option<Option<i64>>> {
                 None => Ok(None),
             },
         },
-        Err(inquire::InquireError::OperationCanceled) => Ok(None),
+        Err(
+            inquire::InquireError::OperationCanceled | inquire::InquireError::OperationInterrupted,
+        ) => Ok(None),
         Err(e) => Err(Error::Input(format!("lifetime selection failed: {e}"))),
     }
 }
@@ -322,7 +334,9 @@ pub fn prompt_custom_lifetime(theme: &Theme) -> Result<Option<i64>> {
         .prompt()
     {
         Ok(val) => Ok(Some(val)),
-        Err(inquire::InquireError::OperationCanceled) => Ok(None),
+        Err(
+            inquire::InquireError::OperationCanceled | inquire::InquireError::OperationInterrupted,
+        ) => Ok(None),
         Err(e) => Err(Error::Input(format!("custom lifetime prompt failed: {e}"))),
     }
 }

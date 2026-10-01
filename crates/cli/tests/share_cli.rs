@@ -261,6 +261,7 @@ mod pty_tests {
     fn no_echo_no_opost(slave: &OwnedFd) {
         let mut termios = tcgetattr(slave).expect("tcgetattr");
         termios.local_flags.remove(LocalFlags::ECHO);
+        termios.local_flags.remove(LocalFlags::ISIG);
         termios.output_flags.remove(OutputFlags::OPOST);
         tcsetattr(slave, SetArg::TCSANOW, &termios).expect("tcsetattr");
     }
@@ -586,6 +587,36 @@ mod pty_tests {
         // Send Escape to cancel at the first prompt (secret selection)
         let run = run_on_pty_with_input(&mut cmd, b"\x1b");
         assert!(run.status.success(), "cancelling prompt should exit with 0");
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            stderr.contains("aborted"),
+            "expected aborted message: {stderr}"
+        );
+    }
+
+    #[test]
+    fn interactive_share_cancels_with_ctrl_c_on_pty() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let Some(data_dir) = setup_test_project_with_secret(scratch.path()) else {
+            return;
+        };
+
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_sotto"));
+        cmd.current_dir(scratch.path())
+            .arg("share")
+            .env("SOTTO_DATA_DIR", &data_dir)
+            .env("SOTTO_PASSWORD", "test-master-password")
+            .env("TERM", "xterm-256color")
+            .env_remove("SOTTO_TOKEN")
+            .env_remove("SOTTO_THEME")
+            .env_remove("CI");
+
+        // Send 0x03 (Ctrl-C) to cancel at the first prompt
+        let run = run_on_pty_with_input(&mut cmd, b"\x03");
+        assert!(
+            run.status.success(),
+            "Ctrl-C cancellation should exit with 0"
+        );
         let stderr = String::from_utf8_lossy(&run.stderr);
         assert!(
             stderr.contains("aborted"),
