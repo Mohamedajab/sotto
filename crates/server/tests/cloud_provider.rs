@@ -18,7 +18,13 @@ use sotto_server::cloud_provider::{
 use sotto_server::db;
 use sqlx::postgres::PgConnectOptions;
 use sqlx::PgPool;
+use tokio::sync::oneshot;
+use tokio::time::{timeout, Duration};
 use uuid::Uuid;
+
+mod support;
+
+use support::coverage_concurrency::{receive_pid, transaction_pid, wait_for_specific_block};
 
 async fn pool_or_skip() -> Option<PgPool> {
     if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
@@ -755,40 +761,47 @@ async fn accepted_provider_invalidation_fences_an_inflight_collection() {
         .await
         .unwrap();
     record_race.commit().await.unwrap();
-    let accept_race = |pool: PgPool| {
-        let context = context.clone();
-        let event = race_event.clone();
-        let allocation = allocation.clone();
-        async move {
-            let mut tx = pool.begin().await.unwrap();
-            let outcome =
-                accept_provider_invalidation(&mut tx, &context, &event, &allocation).await;
-            tx.commit().await.unwrap();
-            outcome
-        }
-    };
-    let (race_left, race_right) =
-        tokio::join!(accept_race(pool.clone()), accept_race(pool.clone()));
-    assert!(matches!(
-        &race_left,
-        Ok(InvalidationDisposition::Accepted { generation: 3 })
-            | Ok(InvalidationDisposition::AlreadyAccepted { generation: 3 })
-    ));
-    assert!(matches!(
-        &race_right,
-        Ok(InvalidationDisposition::Accepted { generation: 3 })
-            | Ok(InvalidationDisposition::AlreadyAccepted { generation: 3 })
-    ));
-    assert!(matches!(
-        (&race_left, &race_right),
-        (
-            Ok(InvalidationDisposition::Accepted { generation: 3 }),
-            Ok(InvalidationDisposition::AlreadyAccepted { generation: 3 })
-        ) | (
-            Ok(InvalidationDisposition::AlreadyAccepted { generation: 3 }),
-            Ok(InvalidationDisposition::Accepted { generation: 3 })
+    let mut holder = pool.begin().await.unwrap();
+    let holder_pid = transaction_pid(&mut holder).await;
+    assert_eq!(
+        accept_provider_invalidation(&mut holder, &context, &race_event, &allocation)
+            .await
+            .unwrap(),
+        InvalidationDisposition::Accepted { generation: 3 }
+    );
+
+    let (pid_sender, pid_receiver) = oneshot::channel();
+    let waiter_pool = pool.clone();
+    let waiter_context = context.clone();
+    let waiter_event = race_event.clone();
+    let waiter_allocation = allocation.clone();
+    let waiter = tokio::spawn(async move {
+        let mut tx = waiter_pool.begin().await.unwrap();
+        let pid = transaction_pid(&mut tx).await;
+        pid_sender.send(pid).unwrap();
+        let result = accept_provider_invalidation(
+            &mut tx,
+            &waiter_context,
+            &waiter_event,
+            &waiter_allocation,
         )
-    ));
+        .await;
+        tx.commit().await.unwrap();
+        result
+    });
+    let waiter_pid = receive_pid(pid_receiver, "invalidation waiter").await;
+    wait_for_specific_block(&pool, waiter_pid, holder_pid).await;
+    holder.commit().await.unwrap();
+
+    let waiter_result = timeout(Duration::from_secs(5), waiter)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        waiter_result,
+        InvalidationDisposition::AlreadyAccepted { generation: 3 }
+    );
 
     let projection_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM cloud_coverage_collection_attempts \
