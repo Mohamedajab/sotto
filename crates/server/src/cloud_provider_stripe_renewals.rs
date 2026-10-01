@@ -116,6 +116,7 @@ impl StripeRenewalFailureEvidence {
     }
 
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn test_new(
         renewal_id: &str,
         event_id: &str,

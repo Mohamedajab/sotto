@@ -176,6 +176,7 @@ impl StripePersonalInvoiceObservation {
     }
 
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn test_new(
         invoice_id: &str,
         customer_id: &str,

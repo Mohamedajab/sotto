@@ -1786,6 +1786,7 @@ impl StripeRenewalCancellationFacts {
     }
 
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn test_new(
         status: Option<&str>,
         cancel_at_period_end: bool,
@@ -1874,6 +1875,7 @@ impl StripeRenewalObservation {
     }
 
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn test_new(
         renewal_id: &str,
         invoice_id: &str,

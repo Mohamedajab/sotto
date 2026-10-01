@@ -608,6 +608,10 @@ fn field_opt_i64(bytes: &mut Vec<u8>, value: Option<i64>) {
     }
 }
 
+fn field_bool(bytes: &mut Vec<u8>, value: bool) {
+    bytes.push(u8::from(value));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1050,8 +1054,4 @@ mod tests {
             ))
         ));
     }
-}
-
-fn field_bool(bytes: &mut Vec<u8>, value: bool) {
-    bytes.push(u8::from(value));
 }
