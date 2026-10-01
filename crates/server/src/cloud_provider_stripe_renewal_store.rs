@@ -348,7 +348,8 @@ pub async fn accept_personal_renewal_failure(
           coverage_source_id, predecessor_period_start, predecessor_period_end, \
           renewal_period_start, renewal_period_end, event_created_at, interval, accepted_generation) \
          VALUES ('stripe', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
-                 $16, $17, $18, $19, $20, $21, $22, $23, $24)",
+                 $16, $17, $18, $19, $20, $21, $22, $23, $24) \
+         ON CONFLICT DO NOTHING",
     )
     .bind(evidence.provider_account_id())
     .bind(evidence.environment().as_str())
