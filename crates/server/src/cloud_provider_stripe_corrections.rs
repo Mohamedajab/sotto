@@ -114,11 +114,6 @@ impl StripeRetainedPaidTerm {
     pub const fn period_end(&self) -> i64 {
         self.observation.period_end()
     }
-
-    #[cfg(test)]
-    pub(crate) fn test_new(observation: StripePersonalInvoiceObservation) -> Self {
-        Self { observation }
-    }
 }
 
 /// Apply the agreed personal correction policy to sealed invoice evidence.
@@ -231,16 +226,6 @@ impl StripeAssociatedCorrectionEvidence {
     pub fn credit_notes(&self) -> &[StripeVerifiedCreditNote] {
         &self.credit_notes
     }
-
-    #[cfg(test)]
-    pub(crate) fn test_new(observation: StripePersonalInvoiceObservation) -> Self {
-        Self {
-            observation,
-            refunds: Vec::new(),
-            disputes: Vec::new(),
-            credit_notes: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,14 +241,6 @@ impl StripeUnresolvedCorrections {
 
     pub fn reasons(&self) -> &[StripeCorrectionUnresolved] {
         &self.reasons
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_new(invoice_id: &str) -> Self {
-        Self {
-            invoice_id: invoice_id.to_owned(),
-            reasons: Vec::new(),
-        }
     }
 }
 

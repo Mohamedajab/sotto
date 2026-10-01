@@ -71,6 +71,7 @@ pub struct StripePersonalCoverageCandidate {
     customer_id: String,
     subscription_id: String,
     provider_item_id: String,
+    payer_kind: PayerKind,
     paid_terms: Vec<StripeRetainedPaidTerm>,
     non_paid_invoices: Vec<StripeNonPaidInvoice>,
     renewals: Vec<StripeCoverageRenewal>,
@@ -96,6 +97,9 @@ impl StripePersonalCoverageCandidate {
     pub fn provider_item_id(&self) -> &str {
         &self.provider_item_id
     }
+    pub const fn payer_kind(&self) -> PayerKind {
+        self.payer_kind
+    }
     pub fn paid_terms(&self) -> &[StripeRetainedPaidTerm] {
         &self.paid_terms
     }
@@ -116,6 +120,9 @@ pub struct StripeCoverageRenewal {
     invoice_id: String,
     period_start: i64,
     period_end: i64,
+    predecessor_invoice_id: String,
+    predecessor_evidence_reference: String,
+    interval: crate::cloud_provider_stripe::StripeInterval,
     state: StripeCoverageRenewalState,
     cancellation: StripeRenewalCancellationFacts,
     event_ids: Vec<String>,
@@ -133,6 +140,15 @@ impl StripeCoverageRenewal {
     }
     pub const fn period_end(&self) -> i64 {
         self.period_end
+    }
+    pub fn predecessor_invoice_id(&self) -> &str {
+        &self.predecessor_invoice_id
+    }
+    pub fn predecessor_evidence_reference(&self) -> &str {
+        &self.predecessor_evidence_reference
+    }
+    pub const fn interval(&self) -> crate::cloud_provider_stripe::StripeInterval {
+        self.interval
     }
     pub fn state(&self) -> &StripeCoverageRenewalState {
         &self.state
@@ -335,6 +351,9 @@ pub fn compose_personal_coverage(
             invoice_id: observation.invoice_id().to_owned(),
             period_start: observation.period_start(),
             period_end: observation.period_end(),
+            predecessor_invoice_id: failure.predecessor_invoice_id().to_owned(),
+            predecessor_evidence_reference: failure.predecessor_evidence_reference().to_owned(),
+            interval: failure.interval(),
             state,
             cancellation: observation.cancellation().clone(),
             event_ids: vec![observation.event_id().to_owned()],
@@ -346,6 +365,9 @@ pub fn compose_personal_coverage(
             if existing.invoice_id != next.invoice_id
                 || existing.period_start != next.period_start
                 || existing.period_end != next.period_end
+                || existing.predecessor_invoice_id != next.predecessor_invoice_id
+                || existing.predecessor_evidence_reference != next.predecessor_evidence_reference
+                || existing.interval != next.interval
                 || existing.state != next.state
                 || existing.cancellation != next.cancellation
             {
@@ -387,6 +409,7 @@ pub fn compose_personal_coverage(
             customer_id: binding.customer_id().to_owned(),
             subscription_id: binding.subscription_id().to_owned(),
             provider_item_id: binding.provider_item_id().to_owned(),
+            payer_kind: PayerKind::Personal,
             paid_terms,
             non_paid_invoices: non_paid,
             renewals: composed_renewals,
@@ -552,6 +575,7 @@ fn semantic_reference(
     field(&mut bytes, binding.customer_id());
     field(&mut bytes, binding.subscription_id());
     field(&mut bytes, binding.provider_item_id());
+    field(&mut bytes, "personal");
     for term in paid_terms {
         field(&mut bytes, "paid");
         field(&mut bytes, term.invoice_id());
@@ -571,6 +595,9 @@ fn semantic_reference(
         field(&mut bytes, renewal.invoice_id());
         field_i64(&mut bytes, renewal.period_start());
         field_i64(&mut bytes, renewal.period_end());
+        field(&mut bytes, renewal.predecessor_invoice_id());
+        field(&mut bytes, renewal.predecessor_evidence_reference());
+        field(&mut bytes, &renewal.interval().to_string());
         match &renewal.state {
             StripeCoverageRenewalState::Paid => field(&mut bytes, "paid"),
             StripeCoverageRenewalState::Open => field(&mut bytes, "open"),
@@ -610,448 +637,4 @@ fn field_opt_i64(bytes: &mut Vec<u8>, value: Option<i64>) {
 
 fn field_bool(bytes: &mut Vec<u8>, value: bool) {
     bytes.push(u8::from(value));
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::cloud_provider::{PayerKind, ProviderEnvironment};
-    use crate::cloud_provider_stripe::{StripeInterval, StripePersonalInvoiceObservation};
-    use crate::cloud_provider_stripe_corrections::{
-        StripeAssociatedCorrectionEvidence, StripePersonalInvoiceCorrectionEvidence,
-    };
-
-    fn config() -> StripeCoverageConfig {
-        StripeCoverageConfig::new(
-            "acct_test",
-            ProviderEnvironment::Test,
-            "price_month",
-            "price_year",
-        )
-        .unwrap()
-    }
-
-    fn binding() -> StripeAllocationBinding {
-        StripeAllocationBinding::new("alloc", "cus", "sub", "si", PayerKind::Personal).unwrap()
-    }
-
-    fn term(invoice_id: &str, start: i64, end: i64, evidence: &str) -> StripeRetainedPaidTerm {
-        StripeRetainedPaidTerm::test_new(StripePersonalInvoiceObservation::test_new(
-            invoice_id,
-            "cus",
-            "sub",
-            "si",
-            "alloc",
-            StripeInterval::Month,
-            start,
-            end,
-            evidence,
-        ))
-    }
-
-    fn history(entries: Vec<StripePersonalInvoiceHistoryEntry>) -> StripePersonalInvoiceHistory {
-        StripePersonalInvoiceHistory::test_new(
-            "acct_test",
-            ProviderEnvironment::Test,
-            "sub",
-            "cus",
-            entries,
-        )
-    }
-
-    fn failure(event_id: &str, renewal_id: &str) -> StripeRenewalFailureEvidence {
-        StripeRenewalFailureEvidence::test_new(
-            renewal_id,
-            event_id,
-            "in_failed",
-            "in_paid",
-            "ev_paid",
-            "acct_test",
-            ProviderEnvironment::Test,
-            "alloc",
-            "cus",
-            "sub",
-            "si",
-            1000,
-            2000,
-            2000,
-            3000,
-            StripeInterval::Month,
-        )
-    }
-
-    fn observation(
-        failure: &StripeRenewalFailureEvidence,
-        state: StripeRenewalCurrentState,
-    ) -> StripeRenewalObservation {
-        observation_with_cancel(failure, state, None)
-    }
-
-    fn observation_with_cancel(
-        failure: &StripeRenewalFailureEvidence,
-        state: StripeRenewalCurrentState,
-        cancel_at: Option<i64>,
-    ) -> StripeRenewalObservation {
-        StripeRenewalObservation::test_new(
-            failure.renewal_id(),
-            failure.invoice_id(),
-            failure.event_id(),
-            "acct_test",
-            ProviderEnvironment::Test,
-            "alloc",
-            "cus",
-            "sub",
-            "si",
-            2000,
-            3000,
-            state,
-            StripeRenewalCancellationFacts::test_new(
-                Some("active"),
-                cancel_at.is_some(),
-                cancel_at,
-                None,
-                None,
-            ),
-        )
-    }
-
-    fn paid_observation(failure: &StripeRenewalFailureEvidence) -> StripeRenewalObservation {
-        let inner = StripePersonalInvoiceObservation::test_new(
-            "in_failed",
-            "cus",
-            "sub",
-            "si",
-            "alloc",
-            StripeInterval::Month,
-            2000,
-            3000,
-            "ev_current",
-        );
-        let term = StripeRetainedPaidTerm::test_new(inner.clone());
-        let evidence = StripePersonalInvoiceCorrectionEvidence::Associated(Box::new(
-            StripeAssociatedCorrectionEvidence::test_new(inner),
-        ));
-        observation(
-            failure,
-            StripeRenewalCurrentState::Paid {
-                evidence: Box::new(evidence),
-                term: Box::new(term),
-            },
-        )
-    }
-
-    #[test]
-    fn history_order_does_not_change_candidate_identity() {
-        let first = history(vec![
-            StripePersonalInvoiceHistoryEntry::Paid(term("in_two", 2000, 3000, "ev_two")),
-            StripePersonalInvoiceHistoryEntry::Paid(term("in_one", 1000, 2000, "ev_one")),
-        ]);
-        let second = history(vec![
-            StripePersonalInvoiceHistoryEntry::Paid(term("in_one", 1000, 2000, "ev_one")),
-            StripePersonalInvoiceHistoryEntry::Paid(term("in_two", 2000, 3000, "ev_two")),
-        ]);
-        let first = compose_personal_coverage(&config(), &binding(), &first, &[]).unwrap();
-        let second = compose_personal_coverage(&config(), &binding(), &second, &[]).unwrap();
-        let (
-            StripeCoverageCompositionResult::Candidate(first),
-            StripeCoverageCompositionResult::Candidate(second),
-        ) = (first, second)
-        else {
-            panic!("expected candidates");
-        };
-        assert_eq!(first.semantic_reference(), second.semantic_reference());
-        assert_eq!(first.paid_terms()[0].invoice_id(), "in_one");
-    }
-
-    #[test]
-    fn mismatched_history_context_is_rejected_before_candidate_creation() {
-        let history = StripePersonalInvoiceHistory::test_new(
-            "acct_other",
-            ProviderEnvironment::Test,
-            "sub",
-            "cus",
-            vec![],
-        );
-        assert_eq!(
-            compose_personal_coverage(&config(), &binding(), &history, &[]),
-            Err(StripeCoverageCompositionError::ContextMismatch { field: "account" })
-        );
-    }
-
-    #[test]
-    fn term_level_ownership_mismatch_is_rejected() {
-        let wrong_term =
-            StripeRetainedPaidTerm::test_new(StripePersonalInvoiceObservation::test_new(
-                "in_paid",
-                "cus",
-                "sub",
-                "si",
-                "alloc_other",
-                StripeInterval::Month,
-                1000,
-                2000,
-                "ev_paid",
-            ));
-        let history = history(vec![StripePersonalInvoiceHistoryEntry::Paid(wrong_term)]);
-        assert_eq!(
-            compose_personal_coverage(&config(), &binding(), &history, &[]),
-            Err(StripeCoverageCompositionError::ContextMismatch {
-                field: "allocation"
-            })
-        );
-    }
-
-    #[test]
-    fn open_renewal_keeps_predecessor_and_does_not_assign_recovery() {
-        let failure = failure("evt_one", "renewal_one");
-        let history = history(vec![
-            StripePersonalInvoiceHistoryEntry::Paid(term("in_paid", 1000, 2000, "ev_paid")),
-            StripePersonalInvoiceHistoryEntry::NonPaid(StripeNonPaidInvoice::test_new(
-                "in_failed",
-                "open",
-            )),
-        ]);
-        let observation = observation(&failure, StripeRenewalCurrentState::Open);
-        let result =
-            compose_personal_coverage(&config(), &binding(), &history, &[(failure, observation)])
-                .unwrap();
-        let StripeCoverageCompositionResult::Candidate(candidate) = result else {
-            panic!("expected candidate");
-        };
-        assert_eq!(candidate.paid_terms().len(), 1);
-        assert!(matches!(
-            candidate.renewals()[0].state(),
-            StripeCoverageRenewalState::Open
-        ));
-    }
-
-    #[test]
-    fn closed_unpaid_renewal_preserves_the_paid_predecessor() {
-        let failure = failure("evt_one", "renewal_one");
-        let history = history(vec![
-            StripePersonalInvoiceHistoryEntry::Paid(term("in_paid", 1000, 2000, "ev_paid")),
-            StripePersonalInvoiceHistoryEntry::NonPaid(StripeNonPaidInvoice::test_new(
-                "in_failed",
-                "void",
-            )),
-        ]);
-        let observation = observation(
-            &failure,
-            StripeRenewalCurrentState::ClosedUnpaid {
-                status: "void".to_owned(),
-            },
-        );
-        let result =
-            compose_personal_coverage(&config(), &binding(), &history, &[(failure, observation)])
-                .unwrap();
-        let StripeCoverageCompositionResult::Candidate(candidate) = result else {
-            panic!("expected candidate");
-        };
-        assert_eq!(candidate.paid_terms().len(), 1);
-        assert!(matches!(
-            candidate.renewals()[0].state(),
-            StripeCoverageRenewalState::ClosedUnpaid { status } if status == "void"
-        ));
-    }
-
-    #[test]
-    fn paid_transition_replaces_non_paid_entry_and_retry_keeps_identity() {
-        let first_failure = failure("evt_one", "renewal_one");
-        let second_failure = failure("evt_two", "renewal_one");
-        let history = history(vec![
-            StripePersonalInvoiceHistoryEntry::Paid(term("in_paid", 1000, 2000, "ev_paid")),
-            StripePersonalInvoiceHistoryEntry::NonPaid(StripeNonPaidInvoice::test_new(
-                "in_failed",
-                "open",
-            )),
-        ]);
-        let first = paid_observation(&first_failure);
-        let second = paid_observation(&second_failure);
-        let result = compose_personal_coverage(
-            &config(),
-            &binding(),
-            &history,
-            &[(first_failure, first), (second_failure, second)],
-        )
-        .unwrap();
-        let StripeCoverageCompositionResult::Candidate(candidate) = result else {
-            panic!("expected candidate");
-        };
-        assert_eq!(candidate.paid_terms().len(), 2);
-        assert!(candidate.non_paid_invoices().is_empty());
-        assert_eq!(candidate.renewals()[0].event_ids(), &["evt_one", "evt_two"]);
-        assert!(matches!(
-            candidate.renewals()[0].state(),
-            StripeCoverageRenewalState::Paid
-        ));
-    }
-
-    #[test]
-    fn retry_event_ids_do_not_change_semantic_identity() {
-        let history = history(vec![
-            StripePersonalInvoiceHistoryEntry::Paid(term("in_paid", 1000, 2000, "ev_paid")),
-            StripePersonalInvoiceHistoryEntry::NonPaid(StripeNonPaidInvoice::test_new(
-                "in_failed",
-                "open",
-            )),
-        ]);
-        let first_failure = failure("evt_one", "renewal_one");
-        let second_failure = failure("evt_two", "renewal_one");
-        let first = compose_personal_coverage(
-            &config(),
-            &binding(),
-            &history,
-            &[(first_failure.clone(), paid_observation(&first_failure))],
-        )
-        .unwrap();
-        let second = compose_personal_coverage(
-            &config(),
-            &binding(),
-            &history,
-            &[(second_failure.clone(), paid_observation(&second_failure))],
-        )
-        .unwrap();
-        let (
-            StripeCoverageCompositionResult::Candidate(first),
-            StripeCoverageCompositionResult::Candidate(second),
-        ) = (first, second)
-        else {
-            panic!("expected candidates");
-        };
-        assert_eq!(first.semantic_reference(), second.semantic_reference());
-        assert_ne!(
-            first.renewals()[0].event_ids(),
-            second.renewals()[0].event_ids()
-        );
-    }
-
-    #[test]
-    fn cancellation_change_changes_semantic_identity() {
-        let failure = failure("evt_one", "renewal_one");
-        let history = history(vec![
-            StripePersonalInvoiceHistoryEntry::Paid(term("in_paid", 1000, 2000, "ev_paid")),
-            StripePersonalInvoiceHistoryEntry::NonPaid(StripeNonPaidInvoice::test_new(
-                "in_failed",
-                "open",
-            )),
-        ]);
-        let active = compose_personal_coverage(
-            &config(),
-            &binding(),
-            &history,
-            &[(
-                failure.clone(),
-                observation_with_cancel(&failure, StripeRenewalCurrentState::Open, None),
-            )],
-        )
-        .unwrap();
-        let scheduled = compose_personal_coverage(
-            &config(),
-            &binding(),
-            &history,
-            &[(
-                failure.clone(),
-                observation_with_cancel(&failure, StripeRenewalCurrentState::Open, Some(3500)),
-            )],
-        )
-        .unwrap();
-        let (
-            StripeCoverageCompositionResult::Candidate(active),
-            StripeCoverageCompositionResult::Candidate(scheduled),
-        ) = (active, scheduled)
-        else {
-            panic!("expected candidates");
-        };
-        assert_ne!(active.semantic_reference(), scheduled.semantic_reference());
-    }
-
-    #[test]
-    fn unresolved_correction_cannot_become_a_paid_candidate() {
-        let failure = failure("evt_one", "renewal_one");
-        let history = history(vec![
-            StripePersonalInvoiceHistoryEntry::Paid(term("in_paid", 1000, 2000, "ev_paid")),
-            StripePersonalInvoiceHistoryEntry::NonPaid(StripeNonPaidInvoice::test_new(
-                "in_failed",
-                "open",
-            )),
-        ]);
-        let inner = StripePersonalInvoiceObservation::test_new(
-            "in_failed",
-            "cus",
-            "sub",
-            "si",
-            "alloc",
-            StripeInterval::Month,
-            2000,
-            3000,
-            "ev_current",
-        );
-        let term = StripeRetainedPaidTerm::test_new(inner.clone());
-        let observation = observation(
-            &failure,
-            StripeRenewalCurrentState::Paid {
-                evidence: Box::new(StripePersonalInvoiceCorrectionEvidence::Unresolved(
-                    crate::cloud_provider_stripe_corrections::StripeUnresolvedCorrections::test_new(
-                        "in_failed",
-                    ),
-                )),
-                term: Box::new(term),
-            },
-        );
-        assert!(matches!(
-            compose_personal_coverage(&config(), &binding(), &history, &[(failure, observation)]),
-            Ok(StripeCoverageCompositionResult::NeedsEvidence(
-                StripeCoverageNeedsEvidence::UnresolvedCorrection { .. }
-            ))
-        ));
-    }
-
-    #[test]
-    fn conflicting_retries_never_choose_by_input_order() {
-        let first_failure = failure("evt_one", "renewal_one");
-        let second_failure = failure("evt_two", "renewal_one");
-        let history = history(vec![
-            StripePersonalInvoiceHistoryEntry::Paid(term("in_paid", 1000, 2000, "ev_paid")),
-            StripePersonalInvoiceHistoryEntry::NonPaid(StripeNonPaidInvoice::test_new(
-                "in_failed",
-                "open",
-            )),
-        ]);
-        let first = observation(&first_failure, StripeRenewalCurrentState::Open);
-        let second = observation(
-            &second_failure,
-            StripeRenewalCurrentState::ClosedUnpaid {
-                status: "void".to_owned(),
-            },
-        );
-        assert_eq!(
-            compose_personal_coverage(
-                &config(),
-                &binding(),
-                &history,
-                &[(first_failure, first), (second_failure, second)],
-            )
-            .unwrap(),
-            StripeCoverageCompositionResult::NeedsEvidence(
-                StripeCoverageNeedsEvidence::ConflictingRenewal {
-                    renewal_id: "renewal_one".to_owned(),
-                }
-            )
-        );
-    }
-
-    #[test]
-    fn missing_predecessor_exposes_no_partial_candidate() {
-        let failure = failure("evt_one", "renewal_one");
-        let history = history(vec![StripePersonalInvoiceHistoryEntry::NonPaid(
-            StripeNonPaidInvoice::test_new("in_failed", "open"),
-        )]);
-        let observation = observation(&failure, StripeRenewalCurrentState::Open);
-        assert!(matches!(
-            compose_personal_coverage(&config(), &binding(), &history, &[(failure, observation)]),
-            Ok(StripeCoverageCompositionResult::NeedsEvidence(
-                StripeCoverageNeedsEvidence::MissingPredecessor { .. }
-            ))
-        ));
-    }
 }

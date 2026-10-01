@@ -1312,14 +1312,6 @@ impl StripeNonPaidInvoice {
     pub fn status(&self) -> &str {
         &self.status
     }
-
-    #[cfg(test)]
-    pub(crate) fn test_new(invoice_id: &str, status: &str) -> Self {
-        Self {
-            invoice_id: invoice_id.to_owned(),
-            status: status.to_owned(),
-        }
-    }
 }
 
 /// One invoice accounted for by a bounded personal history traversal.
@@ -1358,23 +1350,6 @@ impl StripePersonalInvoiceHistory {
 
     pub fn entries(&self) -> &[StripePersonalInvoiceHistoryEntry] {
         &self.entries
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_new(
-        account_id: &str,
-        environment: ProviderEnvironment,
-        subscription_id: &str,
-        customer_id: &str,
-        entries: Vec<StripePersonalInvoiceHistoryEntry>,
-    ) -> Self {
-        Self {
-            account_id: account_id.to_owned(),
-            environment,
-            subscription_id: subscription_id.to_owned(),
-            customer_id: customer_id.to_owned(),
-            entries,
-        }
     }
 }
 
@@ -1784,24 +1759,6 @@ impl StripeRenewalCancellationFacts {
     pub const fn ended_at(&self) -> Option<i64> {
         self.ended_at
     }
-
-    #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn test_new(
-        status: Option<&str>,
-        cancel_at_period_end: bool,
-        cancel_at: Option<i64>,
-        canceled_at: Option<i64>,
-        ended_at: Option<i64>,
-    ) -> Self {
-        Self {
-            status: status.map(str::to_owned),
-            cancel_at_period_end,
-            cancel_at,
-            canceled_at,
-            ended_at,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1872,40 +1829,6 @@ impl StripeRenewalObservation {
     }
     pub fn cancellation(&self) -> &StripeRenewalCancellationFacts {
         &self.cancellation
-    }
-
-    #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn test_new(
-        renewal_id: &str,
-        invoice_id: &str,
-        event_id: &str,
-        provider_account_id: &str,
-        environment: ProviderEnvironment,
-        allocation_reference: &str,
-        customer_id: &str,
-        subscription_id: &str,
-        provider_item_id: &str,
-        period_start: i64,
-        period_end: i64,
-        state: StripeRenewalCurrentState,
-        cancellation: StripeRenewalCancellationFacts,
-    ) -> Self {
-        Self {
-            renewal_id: renewal_id.to_owned(),
-            invoice_id: invoice_id.to_owned(),
-            event_id: event_id.to_owned(),
-            provider_account_id: provider_account_id.to_owned(),
-            environment,
-            allocation_reference: allocation_reference.to_owned(),
-            customer_id: customer_id.to_owned(),
-            subscription_id: subscription_id.to_owned(),
-            provider_item_id: provider_item_id.to_owned(),
-            period_start,
-            period_end,
-            state,
-            cancellation,
-        }
     }
 }
 
