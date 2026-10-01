@@ -642,9 +642,7 @@ async fn accepted_provider_invalidation_fences_an_inflight_collection() {
     .await;
     assert!(matches!(
         result,
-        Err(sotto_server::cloud_provider::ProviderAdapterError::Reconciliation(
-            sotto_server::cloud_coverage_reconciliation::ReconciliationError::CollectionConflict
-        ))
+        Err(sotto_server::cloud_provider::ProviderAdapterError::CollectionSuperseded)
     ));
     complete.rollback().await.unwrap();
 
