@@ -1090,6 +1090,29 @@ async fn signed_failure_round_trips_through_the_durable_store_and_bounds_history
         .await,
         Err(StripeRenewalFailureLoadError::BoundExceeded { limit: 1 })
     ));
+    let current_history = history_with_current_invoice(paid_line()).await;
+    let (current_client, mut current_session, _current_server) = current_client("open", None).await;
+    let StripeRenewalObservationResult::Observed(current_observation) = current_client
+        .personal_renewal_observation(&mut current_session, &binding(), &loaded[0])
+        .await
+        .unwrap()
+    else {
+        panic!("expected reloaded evidence to produce a current observation");
+    };
+    let composed = compose_personal_coverage(
+        &config(),
+        &binding(),
+        &current_history,
+        &[(loaded[0].clone(), (*current_observation).clone())],
+    )
+    .unwrap();
+    let StripeCoverageCompositionResult::Candidate(candidate) = composed else {
+        panic!("expected reloaded evidence to compose a candidate");
+    };
+    assert!(matches!(
+        candidate.renewals()[0].state(),
+        StripeCoverageRenewalState::Open
+    ));
     sqlx::query(
         "UPDATE cloud_provider_stripe_renewal_failures \
          SET evidence_reference = 'tampered-renewal-reference' WHERE event_id = $1",
