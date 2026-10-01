@@ -321,9 +321,15 @@ async fn snapshot(pool: &PgPool, query: &str) -> Vec<Value> {
 
 async fn coverage_snapshot(pool: &PgPool) -> Vec<Vec<Value>> {
     let queries = [
-        "SELECT to_jsonb(t) AS value FROM (SELECT beneficiary_id, source_set_generation, collection_epoch, current_attempt_id FROM cloud_coverage_coordinators ORDER BY beneficiary_id) t",
+        "SELECT to_jsonb(t) AS value FROM (SELECT beneficiary_id, source_set_generation, \
+         collection_epoch, current_attempt_id FROM cloud_coverage_coordinators \
+         ORDER BY beneficiary_id) t",
         "SELECT to_jsonb(t) AS value FROM (SELECT * FROM cloud_coverage_sources ORDER BY source_id) t",
-        "SELECT to_jsonb(t) AS value FROM (SELECT attempt_id, beneficiary_id, collection_epoch, source_set_generation, expected_projection_revision, source_bindings, status, aggregate_evidence_reference, canonical_result, projection_revision, created_at, completed_at FROM cloud_coverage_collection_attempts ORDER BY beneficiary_id, attempt_id) t",
+        "SELECT to_jsonb(t) AS value FROM (SELECT attempt_id, beneficiary_id, collection_epoch, \
+         source_set_generation, expected_projection_revision, source_bindings, status, \
+         aggregate_evidence_reference, canonical_result, projection_revision, created_at, \
+         completed_at FROM cloud_coverage_collection_attempts \
+         ORDER BY beneficiary_id, attempt_id) t",
         "SELECT to_jsonb(t) AS value FROM (SELECT * FROM cloud_coverage_revisions ORDER BY beneficiary_id, revision) t",
         "SELECT to_jsonb(t) AS value FROM (SELECT * FROM cloud_coverage_revision_facts ORDER BY beneficiary_id, revision, coverage_id) t",
         "SELECT to_jsonb(t) AS value FROM (SELECT * FROM cloud_coverage_heads ORDER BY beneficiary_id) t",
@@ -359,12 +365,12 @@ async fn populated_0024_upgrade_preserves_coverage_and_scopes_attempt_identity()
     assert_eq!(coverage_snapshot(&database.pool).await, before);
 
     let mut tx = database.pool.begin().await.expect("begin pending load");
-    let pending = begin_collection(&mut tx, &first, "legacy-pending-a")
-        .await
-        .expect("load legacy pending attempt");
-    tx.commit().await.expect("commit pending load");
-    assert_eq!(pending.status, CollectionStatus::Pending);
-    assert_eq!(pending.provider_invalidation_generation, None);
+    let pending = begin_collection(&mut tx, &first, "legacy-pending-a").await;
+    tx.rollback().await.expect("rollback legacy pending load");
+    assert!(matches!(
+        pending,
+        Err(ReconciliationError::CollectionConflict)
+    ));
 
     let observation = SourceObservation::Complete {
         source_id: first_binding.source_id.clone(),
@@ -377,24 +383,6 @@ async fn populated_0024_upgrade_preserves_coverage_and_scopes_attempt_identity()
             failed_renewal_id: None,
         }],
     };
-    let mut tx = database
-        .pool
-        .begin()
-        .await
-        .expect("begin legacy pending finish");
-    let result = finish_collection(
-        &mut tx,
-        &pending,
-        "new-aggregate-evidence",
-        std::slice::from_ref(&observation),
-    )
-    .await;
-    tx.rollback().await.expect("rollback legacy pending finish");
-    assert!(matches!(
-        result,
-        Err(ReconciliationError::CollectionConflict)
-    ));
-
     let mut tx = database
         .pool
         .begin()

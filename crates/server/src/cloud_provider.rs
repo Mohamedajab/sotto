@@ -524,6 +524,25 @@ pub async fn accept_provider_invalidation(
         return Err(ProviderAdapterError::EventRejected);
     }
 
+    let source = sqlx::query(
+        "SELECT beneficiary_id, provider_namespace, external_allocation_reference, \
+                ownership_evidence_reference \
+         FROM cloud_coverage_sources WHERE source_id = $1",
+    )
+    .bind(&allocation.source_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(ProviderAdapterError::ProviderContextMismatch)?;
+    let source_matches = source.try_get::<String, _>("beneficiary_id")?
+        == allocation.beneficiary_id
+        && source.try_get::<String, _>("provider_namespace")? == context.namespace
+        && source.try_get::<String, _>("external_allocation_reference")?
+            == allocation.external_allocation_reference
+        && source.try_get::<String, _>("ownership_evidence_reference")?
+            == allocation.ownership_evidence_reference;
+    if !source_matches {
+        return Err(ProviderAdapterError::ProviderContextMismatch);
+    }
     ensure_payer(tx, context, allocation).await?;
     ensure_allocation(tx, context, allocation).await?;
     validate_provider_bindings(tx, context, &[source_binding(context, allocation)]).await?;

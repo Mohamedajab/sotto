@@ -414,6 +414,11 @@ pub async fn begin_collection(
     {
         let ticket = collection_ticket_from_row(&existing)?;
         validate_stored_attempt(tx, &ticket, &existing).await?;
+        if ticket.status == CollectionStatus::Pending
+            && ticket.provider_invalidation_generation.is_none()
+        {
+            return Err(ReconciliationError::CollectionConflict);
+        }
         return Ok(ticket);
     }
 
