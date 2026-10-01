@@ -257,6 +257,14 @@ impl StripeUnresolvedCorrections {
     pub fn reasons(&self) -> &[StripeCorrectionUnresolved] {
         &self.reasons
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_new(invoice_id: &str) -> Self {
+        Self {
+            invoice_id: invoice_id.to_owned(),
+            reasons: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

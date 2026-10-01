@@ -11,7 +11,9 @@ use thiserror::Error;
 
 use crate::cloud_provider::PayerKind;
 use crate::cloud_provider_stripe::{StripeAllocationBinding, StripeCoverageConfig};
-use crate::cloud_provider_stripe_corrections::StripeRetainedPaidTerm;
+use crate::cloud_provider_stripe_corrections::{
+    StripePersonalInvoiceCorrectionEvidence, StripeRetainedPaidTerm,
+};
 use crate::cloud_provider_stripe_http::{
     StripeNonPaidInvoice, StripePersonalInvoiceHistory, StripePersonalInvoiceHistoryEntry,
     StripeRenewalCancellationFacts, StripeRenewalCurrentState, StripeRenewalObservation,
@@ -46,6 +48,9 @@ pub enum StripeCoverageNeedsEvidence {
         renewal_id: String,
     },
     ContradictoryState {
+        invoice_id: String,
+    },
+    UnresolvedCorrection {
         invoice_id: String,
     },
 }
@@ -254,11 +259,32 @@ pub fn compose_personal_coverage(
         };
 
         let state = match observation.state() {
-            StripeRenewalCurrentState::Paid { term, .. } => {
+            StripeRenewalCurrentState::Paid { evidence, term } => {
                 check_term_context(binding, term)?;
                 if term.invoice_id() != observation.invoice_id()
                     || term.period_start() != observation.period_start()
                     || term.period_end() != observation.period_end()
+                {
+                    return Ok(needs(StripeCoverageNeedsEvidence::ContradictoryState {
+                        invoice_id: observation.invoice_id().to_owned(),
+                    }));
+                }
+                let associated = match evidence.as_ref() {
+                    StripePersonalInvoiceCorrectionEvidence::Associated(associated) => associated,
+                    StripePersonalInvoiceCorrectionEvidence::Unresolved(_) => {
+                        return Ok(needs(StripeCoverageNeedsEvidence::UnresolvedCorrection {
+                            invoice_id: observation.invoice_id().to_owned(),
+                        }));
+                    }
+                };
+                let correction_observation = associated.observation();
+                if correction_observation.invoice_id() != term.invoice_id()
+                    || correction_observation.allocation_reference() != term.allocation_reference()
+                    || correction_observation.customer_id() != term.customer_id()
+                    || correction_observation.subscription_id() != term.subscription_id()
+                    || correction_observation.provider_item_id() != term.provider_item_id()
+                    || correction_observation.period_start() != term.period_start()
+                    || correction_observation.period_end() != term.period_end()
                 {
                     return Ok(needs(StripeCoverageNeedsEvidence::ContradictoryState {
                         invoice_id: observation.invoice_id().to_owned(),
@@ -652,6 +678,14 @@ mod tests {
         failure: &StripeRenewalFailureEvidence,
         state: StripeRenewalCurrentState,
     ) -> StripeRenewalObservation {
+        observation_with_cancel(failure, state, None)
+    }
+
+    fn observation_with_cancel(
+        failure: &StripeRenewalFailureEvidence,
+        state: StripeRenewalCurrentState,
+        cancel_at: Option<i64>,
+    ) -> StripeRenewalObservation {
         StripeRenewalObservation::test_new(
             failure.renewal_id(),
             failure.invoice_id(),
@@ -665,7 +699,13 @@ mod tests {
             2000,
             3000,
             state,
-            StripeRenewalCancellationFacts::test_new(Some("active"), false, None, None, None),
+            StripeRenewalCancellationFacts::test_new(
+                Some("active"),
+                cancel_at.is_some(),
+                cancel_at,
+                None,
+                None,
+            ),
         )
     }
 
@@ -785,6 +825,126 @@ mod tests {
         assert!(matches!(
             candidate.renewals()[0].state(),
             StripeCoverageRenewalState::Paid
+        ));
+    }
+
+    #[test]
+    fn retry_event_ids_do_not_change_semantic_identity() {
+        let history = history(vec![
+            StripePersonalInvoiceHistoryEntry::Paid(term("in_paid", 1000, 2000, "ev_paid")),
+            StripePersonalInvoiceHistoryEntry::NonPaid(StripeNonPaidInvoice::test_new(
+                "in_failed",
+                "open",
+            )),
+        ]);
+        let first_failure = failure("evt_one", "renewal_one");
+        let second_failure = failure("evt_two", "renewal_one");
+        let first = compose_personal_coverage(
+            &config(),
+            &binding(),
+            &history,
+            &[(first_failure.clone(), paid_observation(&first_failure))],
+        )
+        .unwrap();
+        let second = compose_personal_coverage(
+            &config(),
+            &binding(),
+            &history,
+            &[(second_failure.clone(), paid_observation(&second_failure))],
+        )
+        .unwrap();
+        let (
+            StripeCoverageCompositionResult::Candidate(first),
+            StripeCoverageCompositionResult::Candidate(second),
+        ) = (first, second)
+        else {
+            panic!("expected candidates");
+        };
+        assert_eq!(first.semantic_reference(), second.semantic_reference());
+        assert_ne!(
+            first.renewals()[0].event_ids(),
+            second.renewals()[0].event_ids()
+        );
+    }
+
+    #[test]
+    fn cancellation_change_changes_semantic_identity() {
+        let failure = failure("evt_one", "renewal_one");
+        let history = history(vec![
+            StripePersonalInvoiceHistoryEntry::Paid(term("in_paid", 1000, 2000, "ev_paid")),
+            StripePersonalInvoiceHistoryEntry::NonPaid(StripeNonPaidInvoice::test_new(
+                "in_failed",
+                "open",
+            )),
+        ]);
+        let active = compose_personal_coverage(
+            &config(),
+            &binding(),
+            &history,
+            &[(
+                failure.clone(),
+                observation_with_cancel(&failure, StripeRenewalCurrentState::Open, None),
+            )],
+        )
+        .unwrap();
+        let scheduled = compose_personal_coverage(
+            &config(),
+            &binding(),
+            &history,
+            &[(
+                failure.clone(),
+                observation_with_cancel(&failure, StripeRenewalCurrentState::Open, Some(3500)),
+            )],
+        )
+        .unwrap();
+        let (
+            StripeCoverageCompositionResult::Candidate(active),
+            StripeCoverageCompositionResult::Candidate(scheduled),
+        ) = (active, scheduled)
+        else {
+            panic!("expected candidates");
+        };
+        assert_ne!(active.semantic_reference(), scheduled.semantic_reference());
+    }
+
+    #[test]
+    fn unresolved_correction_cannot_become_a_paid_candidate() {
+        let failure = failure("evt_one", "renewal_one");
+        let history = history(vec![
+            StripePersonalInvoiceHistoryEntry::Paid(term("in_paid", 1000, 2000, "ev_paid")),
+            StripePersonalInvoiceHistoryEntry::NonPaid(StripeNonPaidInvoice::test_new(
+                "in_failed",
+                "open",
+            )),
+        ]);
+        let inner = StripePersonalInvoiceObservation::test_new(
+            "in_failed",
+            "cus",
+            "sub",
+            "si",
+            "alloc",
+            StripeInterval::Month,
+            2000,
+            3000,
+            "ev_current",
+        );
+        let term = StripeRetainedPaidTerm::test_new(inner.clone());
+        let observation = observation(
+            &failure,
+            StripeRenewalCurrentState::Paid {
+                evidence: Box::new(StripePersonalInvoiceCorrectionEvidence::Unresolved(
+                    crate::cloud_provider_stripe_corrections::StripeUnresolvedCorrections::test_new(
+                        "in_failed",
+                    ),
+                )),
+                term: Box::new(term),
+            },
+        );
+        assert!(matches!(
+            compose_personal_coverage(&config(), &binding(), &history, &[(failure, observation)]),
+            Ok(StripeCoverageCompositionResult::NeedsEvidence(
+                StripeCoverageNeedsEvidence::UnresolvedCorrection { .. }
+            ))
         ));
     }
 
