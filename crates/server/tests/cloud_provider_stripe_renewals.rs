@@ -38,7 +38,7 @@ use sotto_server::db;
 use sqlx::postgres::PgConnectOptions;
 use sqlx::PgPool;
 use tokio::net::TcpListener;
-use tokio::sync::Notify;
+use tokio::sync::{Barrier, Notify};
 use url::Url;
 
 const SECRET: &str = "whsec_renewal_test";
@@ -1056,13 +1056,65 @@ async fn signed_failure_round_trips_through_the_durable_store_and_bounds_history
     replay.commit().await.unwrap();
 
     let second = linked_failure_for_event(&second_id).await;
-    let mut accept_second = pool.begin().await.unwrap();
-    let second_accepted =
-        accept_personal_renewal_failure(&mut accept_second, &context, &allocation, &second)
-            .await
-            .unwrap();
-    assert_eq!(second_accepted.accepted_generation, 2);
-    accept_second.commit().await.unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let first_pool = pool.clone();
+    let first_barrier = Arc::clone(&barrier);
+    let first_context = context.clone();
+    let first_allocation = allocation.clone();
+    let first_evidence = second.clone();
+    let first_task = tokio::spawn(async move {
+        first_barrier.wait().await;
+        let mut tx = first_pool.begin().await.unwrap();
+        let result = accept_personal_renewal_failure(
+            &mut tx,
+            &first_context,
+            &first_allocation,
+            &first_evidence,
+        )
+        .await;
+        if result.is_ok() {
+            tx.commit().await.unwrap();
+        } else {
+            tx.rollback().await.unwrap();
+        }
+        result
+    });
+    let second_pool = pool.clone();
+    let second_barrier = Arc::clone(&barrier);
+    let second_context = context.clone();
+    let second_allocation = allocation.clone();
+    let second_evidence = second.clone();
+    let second_task = tokio::spawn(async move {
+        second_barrier.wait().await;
+        let mut tx = second_pool.begin().await.unwrap();
+        let result = accept_personal_renewal_failure(
+            &mut tx,
+            &second_context,
+            &second_allocation,
+            &second_evidence,
+        )
+        .await;
+        if result.is_ok() {
+            tx.commit().await.unwrap();
+        } else {
+            tx.rollback().await.unwrap();
+        }
+        result
+    });
+    let first_result = first_task.await.unwrap().unwrap();
+    let second_result = second_task.await.unwrap().unwrap();
+    assert_eq!(first_result.accepted_generation, 2);
+    assert_eq!(second_result.accepted_generation, 2);
+    assert!(matches!(
+        [first_result.disposition, second_result.disposition],
+        [
+            StripeRenewalFailureDisposition::Accepted,
+            StripeRenewalFailureDisposition::AlreadyAccepted
+        ] | [
+            StripeRenewalFailureDisposition::AlreadyAccepted,
+            StripeRenewalFailureDisposition::Accepted
+        ]
+    ));
 
     assert!(matches!(
         load_personal_renewal_failures(
