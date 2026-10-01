@@ -1783,7 +1783,7 @@ async fn open_to_paid_header_transition_returns_changed_fields_without_retrying(
 }
 
 #[tokio::test]
-async fn stable_paid_observation_can_be_retried_with_the_same_renewal_identity() {
+async fn stable_paid_observation_matches_across_sessions() {
     let failure = linked_failure().await;
     let (client, mut first_session, server) = current_client("paid", None).await;
     server.replace_responses(
@@ -1858,10 +1858,7 @@ async fn stable_paid_observation_can_be_retried_with_the_same_renewal_identity()
     else {
         panic!("expected stable observations");
     };
-    assert_eq!(first.renewal_id(), second.renewal_id());
-    assert_eq!(first.event_id(), second.event_id());
-    assert_eq!(first.period_start(), second.period_start());
-    assert_eq!(first.period_end(), second.period_end());
+    assert_eq!(first, second);
 }
 
 #[tokio::test]
@@ -2002,16 +1999,25 @@ async fn current_line_contract_rejects_list_shape_and_missing_period_evidence() 
     }
 
     let (client, mut session, server) = current_client("paid", None).await;
+    let mut second_page_line = current_line();
+    second_page_line["id"] = json!("il_other");
     server.replace_responses(
         "/v1/invoices/in_failed/lines",
-        vec![list(vec![current_line()], true)],
+        vec![
+            list(vec![current_line()], true),
+            list(vec![second_page_line], false),
+        ],
     );
     assert!(matches!(
         client
             .personal_renewal_observation(&mut session, &binding(), &failure)
             .await,
-        Err(StripeReadError::ResourceMissing)
+        Err(StripeReadError::Observation(
+            StripeContractError::UnsupportedQuantity
+        ))
     ));
+    assert!(server.requests().iter().any(|request| request
+        .contains("/v1/invoices/in_failed/lines?limit=100&starting_after=il_failed")));
 }
 
 #[tokio::test]
