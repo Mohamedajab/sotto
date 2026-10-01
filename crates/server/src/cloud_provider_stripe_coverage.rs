@@ -773,6 +773,29 @@ mod tests {
     }
 
     #[test]
+    fn term_level_ownership_mismatch_is_rejected() {
+        let wrong_term =
+            StripeRetainedPaidTerm::test_new(StripePersonalInvoiceObservation::test_new(
+                "in_paid",
+                "cus",
+                "sub",
+                "si",
+                "alloc_other",
+                StripeInterval::Month,
+                1000,
+                2000,
+                "ev_paid",
+            ));
+        let history = history(vec![StripePersonalInvoiceHistoryEntry::Paid(wrong_term)]);
+        assert_eq!(
+            compose_personal_coverage(&config(), &binding(), &history, &[]),
+            Err(StripeCoverageCompositionError::ContextMismatch {
+                field: "allocation"
+            })
+        );
+    }
+
+    #[test]
     fn open_renewal_keeps_predecessor_and_does_not_assign_recovery() {
         let failure = failure("evt_one", "renewal_one");
         let history = history(vec![
@@ -793,6 +816,35 @@ mod tests {
         assert!(matches!(
             candidate.renewals()[0].state(),
             StripeCoverageRenewalState::Open
+        ));
+    }
+
+    #[test]
+    fn closed_unpaid_renewal_preserves_the_paid_predecessor() {
+        let failure = failure("evt_one", "renewal_one");
+        let history = history(vec![
+            StripePersonalInvoiceHistoryEntry::Paid(term("in_paid", 1000, 2000, "ev_paid")),
+            StripePersonalInvoiceHistoryEntry::NonPaid(StripeNonPaidInvoice::test_new(
+                "in_failed",
+                "void",
+            )),
+        ]);
+        let observation = observation(
+            &failure,
+            StripeRenewalCurrentState::ClosedUnpaid {
+                status: "void".to_owned(),
+            },
+        );
+        let result =
+            compose_personal_coverage(&config(), &binding(), &history, &[(failure, observation)])
+                .unwrap();
+        let StripeCoverageCompositionResult::Candidate(candidate) = result else {
+            panic!("expected candidate");
+        };
+        assert_eq!(candidate.paid_terms().len(), 1);
+        assert!(matches!(
+            candidate.renewals()[0].state(),
+            StripeCoverageRenewalState::ClosedUnpaid { status } if status == "void"
         ));
     }
 
