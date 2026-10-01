@@ -628,7 +628,7 @@ pub async fn accept_provider_invalidation(
         }
         error => ProviderAdapterError::Database(error),
     })?;
-    sqlx::query(
+    let updated = sqlx::query(
         "UPDATE cloud_coverage_coordinators SET provider_invalidation_generation = $2 \
          WHERE beneficiary_id = $1 AND provider_invalidation_generation = $3",
     )
@@ -637,6 +637,9 @@ pub async fn accept_provider_invalidation(
     .bind(generation)
     .execute(&mut **tx)
     .await?;
+    if updated.rows_affected() != 1 {
+        return Err(ProviderAdapterError::InvalidationConflict);
+    }
     Ok(InvalidationDisposition::Accepted {
         generation: next_generation,
     })
