@@ -172,9 +172,9 @@ versioned semantic reference. It does not assign `failed_renewal_id`, produce a
 | --- | --- |
 | Complete reader-to-composer path uses only verified evidence | `loopback_history_signed_failure_current_open_composes_personal_candidate` |
 | Exact predecessor resolution and no partial result | `links_failure_to_exact_paid_predecessor_and_keeps_event_identity_separate`, `missing_exact_predecessor_does_not_create_partial_evidence` |
-| Renewal retries preserve one renewal identity while retaining event provenance | `retries_keep_one_renewal_identity_but_preserve_event_ids` |
+| Renewal retries preserve one renewal identity while retaining event provenance | `retries_keep_one_renewal_identity_but_preserve_event_ids`, `verified_retry_events_merge_without_changing_candidate_identity` |
 | Annual interval and signed predecessor provenance are retained | `annual_history_and_signed_failure_keep_annual_price_provenance`, `loopback_history_signed_failure_current_open_composes_personal_candidate` |
-| Open and current paid states are observed through the bounded reader | `loopback_history_signed_failure_current_open_composes_personal_candidate`, `current_paid_invoice_supersedes_historical_failure_and_preserves_cancellation_facts` |
+| Open and current paid states are observed through the bounded reader | `loopback_history_signed_failure_current_open_composes_personal_candidate`, `verified_paid_transition_replaces_the_historical_non_paid_invoice`, `current_paid_invoice_supersedes_historical_failure_and_preserves_cancellation_facts` |
 
 The candidate is provisional evidence. Pagination is complete only relative to the bounded read,
 not an atomic remote snapshot; publication, freshness, invalidation, missed-event repair and

@@ -468,6 +468,124 @@ async fn loopback_history_signed_failure_current_open_composes_personal_candidat
 }
 
 #[tokio::test]
+async fn verified_retry_events_merge_without_changing_candidate_identity() {
+    let history = history_with_current_invoice(paid_line()).await;
+    let first_payload = signed_failure();
+    let (first_raw, first_signature) = signed(&first_payload, NOW);
+    let StripeRenewalFailureResult::Linked(first_failure) = decode_personal_renewal_failure(
+        &first_raw,
+        &first_signature,
+        SECRET,
+        NOW,
+        &config(),
+        &binding(),
+        &history,
+    )
+    .unwrap() else {
+        panic!("expected first linked failure");
+    };
+    let mut retry_payload = first_payload;
+    retry_payload["id"] = json!("evt_failure_retry");
+    let (retry_raw, retry_signature) = signed(&retry_payload, NOW);
+    let StripeRenewalFailureResult::Linked(retry_failure) = decode_personal_renewal_failure(
+        &retry_raw,
+        &retry_signature,
+        SECRET,
+        NOW,
+        &config(),
+        &binding(),
+        &history,
+    )
+    .unwrap() else {
+        panic!("expected retry linked failure");
+    };
+    let (first_client, mut first_session, _first_server) = current_client("open", None).await;
+    let (retry_client, mut retry_session, _retry_server) = current_client("open", None).await;
+    let StripeRenewalObservationResult::Observed(first_observation) = first_client
+        .personal_renewal_observation(&mut first_session, &binding(), &first_failure)
+        .await
+        .unwrap()
+    else {
+        panic!("expected first observation");
+    };
+    let StripeRenewalObservationResult::Observed(retry_observation) = retry_client
+        .personal_renewal_observation(&mut retry_session, &binding(), &retry_failure)
+        .await
+        .unwrap()
+    else {
+        panic!("expected retry observation");
+    };
+    let first = compose_personal_coverage(
+        &config(),
+        &binding(),
+        &history,
+        &[(*first_failure, *first_observation)],
+    )
+    .unwrap();
+    let retry = compose_personal_coverage(
+        &config(),
+        &binding(),
+        &history,
+        &[(*retry_failure, *retry_observation)],
+    )
+    .unwrap();
+    let (
+        StripeCoverageCompositionResult::Candidate(first),
+        StripeCoverageCompositionResult::Candidate(retry),
+    ) = (first, retry)
+    else {
+        panic!("expected candidates");
+    };
+    assert_eq!(first.semantic_reference(), retry.semantic_reference());
+    assert_ne!(
+        first.renewals()[0].event_ids(),
+        retry.renewals()[0].event_ids()
+    );
+    assert_eq!(first.renewals()[0].predecessor_invoice_id(), "in_paid");
+}
+
+#[tokio::test]
+async fn verified_paid_transition_replaces_the_historical_non_paid_invoice() {
+    let history = history_with_current_invoice(paid_line()).await;
+    let (raw, signature) = signed(&signed_failure(), NOW);
+    let StripeRenewalFailureResult::Linked(failure) = decode_personal_renewal_failure(
+        &raw,
+        &signature,
+        SECRET,
+        NOW,
+        &config(),
+        &binding(),
+        &history,
+    )
+    .unwrap() else {
+        panic!("expected linked failure");
+    };
+    let (client, mut session, _server) = current_client("paid", None).await;
+    let StripeRenewalObservationResult::Observed(observation) = client
+        .personal_renewal_observation(&mut session, &binding(), &failure)
+        .await
+        .unwrap()
+    else {
+        panic!("expected paid observation");
+    };
+    let result =
+        compose_personal_coverage(&config(), &binding(), &history, &[(*failure, *observation)])
+            .unwrap();
+    let StripeCoverageCompositionResult::Candidate(candidate) = result else {
+        panic!("expected candidate");
+    };
+    assert_eq!(candidate.paid_terms().len(), 2);
+    assert!(!candidate
+        .non_paid_invoices()
+        .iter()
+        .any(|invoice| invoice.invoice_id() == "in_failed"));
+    assert!(matches!(
+        candidate.renewals()[0].state(),
+        StripeCoverageRenewalState::Paid
+    ));
+}
+
+#[tokio::test]
 async fn links_failure_to_exact_paid_predecessor_and_keeps_event_identity_separate() {
     let history = history().await;
     let (raw, signature) = signed(&signed_failure(), NOW);
