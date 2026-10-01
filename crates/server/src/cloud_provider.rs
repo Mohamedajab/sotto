@@ -3,6 +3,8 @@
 //! Provider HTTP and signature verification happen outside this module. This module accepts only
 //! normalized, verified evidence, records an idempotent receipt, and applies the evidence through
 //! the existing caller-owned reconciliation transaction. It never stores raw provider payloads.
+//! Provider invalidation acceptance is a dormant, local-only boundary: it adds no webhook,
+//! scheduler or remote discovery path and does not make a collection authoritative.
 
 use std::{collections::BTreeSet, fmt, time::Duration};
 
@@ -543,8 +545,7 @@ pub async fn accept_provider_invalidation(
     if !source_matches {
         return Err(ProviderAdapterError::ProviderContextMismatch);
     }
-    ensure_payer(tx, context, allocation).await?;
-    ensure_allocation(tx, context, allocation).await?;
+    validate_registered_allocation(tx, context, allocation).await?;
     validate_provider_bindings(tx, context, &[source_binding(context, allocation)]).await?;
 
     let coordinator = sqlx::query(
@@ -1129,6 +1130,51 @@ pub async fn replay_verified_event(
         revision,
         outcome: ApplyDisposition::AlreadyApplied,
     })
+}
+
+async fn validate_registered_allocation(
+    tx: &mut Transaction<'_, Postgres>,
+    context: &ProviderContext,
+    allocation: &VerifiedAllocation,
+) -> Result<(), ProviderAdapterError> {
+    let row = sqlx::query(
+        "SELECT allocation.payer_id, allocation.beneficiary_id, allocation.provider_namespace, \
+                allocation.provider_account_id, allocation.provider_environment, \
+                allocation.provider_subscription_id, allocation.provider_item_id, \
+                allocation.external_allocation_reference, allocation.coverage_source_id, \
+                allocation.effective_from, allocation.effective_until, allocation.state, \
+                allocation.ownership_evidence_reference, payer.provider_customer_id, \
+                payer.payer_kind \
+         FROM cloud_provider_allocations AS allocation \
+         JOIN cloud_provider_payers AS payer ON payer.payer_id = allocation.payer_id \
+         WHERE allocation.allocation_id = $1",
+    )
+    .bind(&allocation.allocation_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(ProviderAdapterError::ProviderContextMismatch)?;
+    let same = row.try_get::<String, _>("payer_id")? == allocation.payer_id
+        && row.try_get::<String, _>("beneficiary_id")? == allocation.beneficiary_id
+        && row.try_get::<String, _>("provider_namespace")? == context.namespace
+        && row.try_get::<String, _>("provider_account_id")? == context.account_id
+        && row.try_get::<String, _>("provider_environment")? == context.environment.as_str()
+        && row.try_get::<String, _>("provider_customer_id")? == allocation.provider_customer_id
+        && row.try_get::<String, _>("payer_kind")? == allocation.payer_kind.as_str()
+        && row.try_get::<String, _>("provider_subscription_id")? == allocation.subscription_id
+        && row.try_get::<String, _>("provider_item_id")? == allocation.provider_item_id
+        && row.try_get::<String, _>("external_allocation_reference")?
+            == allocation.external_allocation_reference
+        && row.try_get::<String, _>("coverage_source_id")? == allocation.source_id
+        && row.try_get::<i64, _>("effective_from")? == allocation.effective_from
+        && row.try_get::<Option<i64>, _>("effective_until")? == allocation.effective_until
+        && row.try_get::<String, _>("state")? == allocation.state.as_str()
+        && row.try_get::<String, _>("ownership_evidence_reference")?
+            == allocation.ownership_evidence_reference;
+    if same {
+        Ok(())
+    } else {
+        Err(ProviderAdapterError::ProviderContextMismatch)
+    }
 }
 
 async fn ensure_payer(

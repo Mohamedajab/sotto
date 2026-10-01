@@ -746,6 +746,33 @@ async fn accepted_provider_invalidation_fences_an_inflight_collection() {
     );
     invalidate_after.commit().await.unwrap();
 
+    let blocked_event_id = format!("invalidation-blocked-{suffix}");
+    let blocked_event = VerifiedProviderEvent::from_payload(
+        &blocked_event_id,
+        "invoice.paid",
+        1_700_000_003,
+        Some(subscription_id.clone()),
+        Some(external_reference.clone()),
+        br#"{"status":"paid","blocked":true}"#,
+    )
+    .unwrap();
+    let mut record_blocked = pool.begin().await.unwrap();
+    record_verified_event(&mut record_blocked, &context, &blocked_event)
+        .await
+        .unwrap();
+    record_blocked.commit().await.unwrap();
+    let mut prepare_blocked = pool.begin().await.unwrap();
+    let blocked_preparation = prepare_verified_event(
+        &mut prepare_blocked,
+        &context,
+        &blocked_event,
+        &allocation,
+        "invalidation-blocked-run",
+    )
+    .await
+    .unwrap();
+    prepare_blocked.commit().await.unwrap();
+
     let race_event_id = format!("invalidation-race-{suffix}");
     let race_event = VerifiedProviderEvent::from_payload(
         &race_event_id,
@@ -756,8 +783,21 @@ async fn accepted_provider_invalidation_fences_an_inflight_collection() {
         br#"{"status":"open","race":true}"#,
     )
     .unwrap();
+    let distinct_event_id = format!("invalidation-distinct-{suffix}");
+    let distinct_event = VerifiedProviderEvent::from_payload(
+        &distinct_event_id,
+        "invoice.payment_failed",
+        1_700_000_004,
+        Some(subscription_id.clone()),
+        Some(external_reference.clone()),
+        br#"{"status":"open","distinct":true}"#,
+    )
+    .unwrap();
     let mut record_race = pool.begin().await.unwrap();
     record_verified_event(&mut record_race, &context, &race_event)
+        .await
+        .unwrap();
+    record_verified_event(&mut record_race, &context, &distinct_event)
         .await
         .unwrap();
     record_race.commit().await.unwrap();
@@ -770,38 +810,102 @@ async fn accepted_provider_invalidation_fences_an_inflight_collection() {
         InvalidationDisposition::Accepted { generation: 3 }
     );
 
-    let (pid_sender, pid_receiver) = oneshot::channel();
-    let waiter_pool = pool.clone();
-    let waiter_context = context.clone();
-    let waiter_event = race_event.clone();
-    let waiter_allocation = allocation.clone();
-    let waiter = tokio::spawn(async move {
-        let mut tx = waiter_pool.begin().await.unwrap();
+    let (duplicate_pid_sender, duplicate_pid_receiver) = oneshot::channel();
+    let duplicate_pool = pool.clone();
+    let duplicate_context = context.clone();
+    let duplicate_event = race_event.clone();
+    let duplicate_allocation = allocation.clone();
+    let duplicate_waiter = tokio::spawn(async move {
+        let mut tx = duplicate_pool.begin().await.unwrap();
         let pid = transaction_pid(&mut tx).await;
-        pid_sender.send(pid).unwrap();
+        duplicate_pid_sender.send(pid).unwrap();
         let result = accept_provider_invalidation(
             &mut tx,
-            &waiter_context,
-            &waiter_event,
-            &waiter_allocation,
+            &duplicate_context,
+            &duplicate_event,
+            &duplicate_allocation,
         )
         .await;
         tx.commit().await.unwrap();
         result
     });
-    let waiter_pid = receive_pid(pid_receiver, "invalidation waiter").await;
-    wait_for_specific_block(&pool, waiter_pid, holder_pid).await;
+    let duplicate_pid = receive_pid(duplicate_pid_receiver, "invalidation duplicate waiter").await;
+    wait_for_specific_block(&pool, duplicate_pid, holder_pid).await;
+
+    let (completion_pid_sender, completion_pid_receiver) = oneshot::channel();
+    let completion_pool = pool.clone();
+    let completion_context = context.clone();
+    let completion_event = blocked_event.clone();
+    let completion_allocation = allocation.clone();
+    let completion_collection = collection.clone();
+    let completion_waiter = tokio::spawn(async move {
+        let mut tx = completion_pool.begin().await.unwrap();
+        let pid = transaction_pid(&mut tx).await;
+        completion_pid_sender.send(pid).unwrap();
+        let result = complete_verified_event(
+            &mut tx,
+            &completion_context,
+            &completion_event,
+            &completion_allocation,
+            &blocked_preparation,
+            &completion_collection,
+        )
+        .await;
+        tx.rollback().await.unwrap();
+        result
+    });
+    let completion_pid =
+        receive_pid(completion_pid_receiver, "invalidation completion waiter").await;
+    wait_for_specific_block(&pool, completion_pid, holder_pid).await;
+
+    let (distinct_pid_sender, distinct_pid_receiver) = oneshot::channel();
+    let distinct_pool = pool.clone();
+    let distinct_context = context.clone();
+    let distinct_allocation = allocation.clone();
+    let distinct_waiter = tokio::spawn(async move {
+        let mut tx = distinct_pool.begin().await.unwrap();
+        let pid = transaction_pid(&mut tx).await;
+        distinct_pid_sender.send(pid).unwrap();
+        let result = accept_provider_invalidation(
+            &mut tx,
+            &distinct_context,
+            &distinct_event,
+            &distinct_allocation,
+        )
+        .await;
+        tx.commit().await.unwrap();
+        result
+    });
+    let distinct_pid = receive_pid(distinct_pid_receiver, "invalidation distinct waiter").await;
+    wait_for_specific_block(&pool, distinct_pid, completion_pid).await;
     holder.commit().await.unwrap();
 
-    let waiter_result = timeout(Duration::from_secs(5), waiter)
+    let duplicate_result = timeout(Duration::from_secs(5), duplicate_waiter)
         .await
         .unwrap()
         .unwrap()
         .unwrap();
     assert_eq!(
-        waiter_result,
+        duplicate_result,
         InvalidationDisposition::AlreadyAccepted { generation: 3 }
     );
+    let distinct_result = timeout(Duration::from_secs(5), distinct_waiter)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        distinct_result,
+        InvalidationDisposition::Accepted { generation: 4 }
+    );
+    let completion_result = timeout(Duration::from_secs(5), completion_waiter)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        completion_result,
+        Err(sotto_server::cloud_provider::ProviderAdapterError::CollectionSuperseded)
+    ));
 
     let projection_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM cloud_coverage_collection_attempts \
@@ -813,22 +917,71 @@ async fn accepted_provider_invalidation_fences_an_inflight_collection() {
     .unwrap();
     assert_eq!(projection_count, 1);
 
-    for id in [&change_event_id, &after_event_id, &race_event_id] {
+    for id in [
+        &change_event_id,
+        &after_event_id,
+        &race_event_id,
+        &distinct_event_id,
+    ] {
         sqlx::query("DELETE FROM cloud_provider_invalidation_associations WHERE event_id = $1")
             .bind(id)
             .execute(&pool)
             .await
             .unwrap();
     }
-    for id in [&event_id, &change_event_id, &after_event_id, &race_event_id] {
+    for id in [
+        &event_id,
+        &change_event_id,
+        &after_event_id,
+        &blocked_event_id,
+        &race_event_id,
+        &distinct_event_id,
+    ] {
         sqlx::query("DELETE FROM cloud_provider_event_receipts WHERE event_id = $1")
             .bind(id)
             .execute(&pool)
             .await
             .unwrap();
     }
+    let missing_event_id = format!("invalidation-missing-allocation-{suffix}");
+    let missing_event = VerifiedProviderEvent::from_payload(
+        &missing_event_id,
+        "invoice.payment_failed",
+        1_700_000_005,
+        Some(subscription_id.clone()),
+        Some(external_reference.clone()),
+        br#"{"status":"open","missing_allocation":true}"#,
+    )
+    .unwrap();
+    let mut record_missing = pool.begin().await.unwrap();
+    record_verified_event(&mut record_missing, &context, &missing_event)
+        .await
+        .unwrap();
+    record_missing.commit().await.unwrap();
     sqlx::query("DELETE FROM cloud_provider_allocations WHERE allocation_id = $1")
         .bind(&allocation_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut missing_accept = pool.begin().await.unwrap();
+    let missing_result =
+        accept_provider_invalidation(&mut missing_accept, &context, &missing_event, &allocation)
+            .await;
+    assert!(matches!(
+        missing_result,
+        Err(sotto_server::cloud_provider::ProviderAdapterError::ProviderContextMismatch)
+    ));
+    missing_accept.rollback().await.unwrap();
+    let allocation_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_provider_allocations WHERE allocation_id = $1",
+    )
+    .bind(&allocation_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(allocation_count, 0);
+    sqlx::query("DELETE FROM cloud_provider_event_receipts WHERE event_id = $1")
+        .bind(&missing_event_id)
         .execute(&pool)
         .await
         .unwrap();
