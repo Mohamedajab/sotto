@@ -114,6 +114,47 @@ impl StripeRenewalFailureEvidence {
     pub const fn event_created_at(&self) -> i64 {
         self.event_created_at
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_new(
+        renewal_id: &str,
+        event_id: &str,
+        invoice_id: &str,
+        predecessor_invoice_id: &str,
+        predecessor_evidence_reference: &str,
+        provider_account_id: &str,
+        environment: ProviderEnvironment,
+        allocation_reference: &str,
+        customer_id: &str,
+        subscription_id: &str,
+        provider_item_id: &str,
+        predecessor_period_start: i64,
+        predecessor_period_end: i64,
+        renewal_period_start: i64,
+        renewal_period_end: i64,
+        interval: StripeInterval,
+    ) -> Self {
+        Self {
+            renewal_id: renewal_id.to_owned(),
+            event_id: event_id.to_owned(),
+            invoice_id: invoice_id.to_owned(),
+            invoice_line_id: "il_failed".to_owned(),
+            predecessor_invoice_id: predecessor_invoice_id.to_owned(),
+            predecessor_evidence_reference: predecessor_evidence_reference.to_owned(),
+            provider_account_id: provider_account_id.to_owned(),
+            environment,
+            allocation_reference: allocation_reference.to_owned(),
+            customer_id: customer_id.to_owned(),
+            subscription_id: subscription_id.to_owned(),
+            provider_item_id: provider_item_id.to_owned(),
+            predecessor_period_start,
+            predecessor_period_end,
+            renewal_period_start,
+            renewal_period_end,
+            event_created_at: 3_100,
+            interval,
+        }
+    }
 }
 
 /// A well-formed failure that cannot be linked without inventing historical evidence.

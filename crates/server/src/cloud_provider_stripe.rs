@@ -174,6 +174,34 @@ impl StripePersonalInvoiceObservation {
     pub fn evidence_reference(&self) -> &str {
         &self.evidence_reference
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_new(
+        invoice_id: &str,
+        customer_id: &str,
+        subscription_id: &str,
+        provider_item_id: &str,
+        allocation_reference: &str,
+        interval: StripeInterval,
+        period_start: i64,
+        period_end: i64,
+        evidence_reference: &str,
+    ) -> Self {
+        Self {
+            invoice_id: invoice_id.to_owned(),
+            customer_id: customer_id.to_owned(),
+            subscription_id: subscription_id.to_owned(),
+            provider_item_id: provider_item_id.to_owned(),
+            allocation_reference: allocation_reference.to_owned(),
+            payment_intent_id: "pi_test".to_owned(),
+            currency: STRIPE_CURRENCY.to_owned(),
+            amount_paid: 299,
+            interval,
+            period_start,
+            period_end,
+            evidence_reference: evidence_reference.to_owned(),
+        }
+    }
 }
 
 /// Parsed invoice facts passed to the shared personal observation validator.
