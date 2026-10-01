@@ -861,6 +861,27 @@ async fn accepted_provider_invalidation_fences_an_inflight_collection() {
     let duplicate_pid = receive_pid(duplicate_pid_receiver, "invalidation duplicate waiter").await;
     wait_for_specific_block(&pool, duplicate_pid, holder_pid).await;
 
+    let (distinct_pid_sender, distinct_pid_receiver) = oneshot::channel();
+    let distinct_pool = pool.clone();
+    let distinct_context = context.clone();
+    let distinct_allocation = allocation.clone();
+    let distinct_waiter = tokio::spawn(async move {
+        let mut tx = distinct_pool.begin().await.unwrap();
+        let pid = transaction_pid(&mut tx).await;
+        distinct_pid_sender.send(pid).unwrap();
+        let result = accept_provider_invalidation(
+            &mut tx,
+            &distinct_context,
+            &distinct_event,
+            &distinct_allocation,
+        )
+        .await;
+        tx.commit().await.unwrap();
+        result
+    });
+    let distinct_pid = receive_pid(distinct_pid_receiver, "invalidation distinct waiter").await;
+    wait_for_specific_block(&pool, distinct_pid, holder_pid).await;
+
     let (completion_pid_sender, completion_pid_receiver) = oneshot::channel();
     let completion_pool = pool.clone();
     let completion_context = context.clone();
@@ -885,28 +906,7 @@ async fn accepted_provider_invalidation_fences_an_inflight_collection() {
     });
     let completion_pid =
         receive_pid(completion_pid_receiver, "invalidation completion waiter").await;
-    wait_for_specific_block(&pool, completion_pid, holder_pid).await;
-
-    let (distinct_pid_sender, distinct_pid_receiver) = oneshot::channel();
-    let distinct_pool = pool.clone();
-    let distinct_context = context.clone();
-    let distinct_allocation = allocation.clone();
-    let distinct_waiter = tokio::spawn(async move {
-        let mut tx = distinct_pool.begin().await.unwrap();
-        let pid = transaction_pid(&mut tx).await;
-        distinct_pid_sender.send(pid).unwrap();
-        let result = accept_provider_invalidation(
-            &mut tx,
-            &distinct_context,
-            &distinct_event,
-            &distinct_allocation,
-        )
-        .await;
-        tx.commit().await.unwrap();
-        result
-    });
-    let distinct_pid = receive_pid(distinct_pid_receiver, "invalidation distinct waiter").await;
-    wait_for_specific_block(&pool, distinct_pid, completion_pid).await;
+    wait_for_specific_block(&pool, completion_pid, distinct_pid).await;
     holder.commit().await.unwrap();
 
     let duplicate_result = timeout(Duration::from_secs(5), duplicate_waiter)
