@@ -621,29 +621,36 @@ async fn populated_0024_upgrade_preserves_coverage_and_scopes_attempt_identity()
     old.run(&legacy_only.pool)
         .await
         .expect("apply legacy migrations for identity check");
-    let (legacy_first, legacy_second, _, _) = seed_legacy_database(&legacy_only.pool).await;
-    let mut tx = legacy_only
-        .pool
-        .begin()
-        .await
-        .expect("begin legacy first identity");
-    begin_collection(&mut tx, &legacy_first, "same-textual-id")
-        .await
-        .expect("legacy first identity operation");
-    tx.commit().await.expect("commit legacy first identity");
-    let mut tx = legacy_only
-        .pool
-        .begin()
-        .await
-        .expect("begin legacy second identity");
-    let duplicate = begin_collection(&mut tx, &legacy_second, "same-textual-id").await;
+    let (legacy_first, legacy_second, legacy_first_binding, legacy_second_binding) =
+        seed_legacy_database(&legacy_only.pool).await;
+    let first_json = serde_json::to_string(&[&legacy_first_binding]).expect("encode first binding");
+    sqlx::query(
+        "INSERT INTO cloud_coverage_collection_attempts \
+         (attempt_id, beneficiary_id, collection_epoch, source_set_generation, \
+          expected_projection_revision, source_bindings, status) \
+         VALUES ('same-textual-id', $1, 99, 1, 2, $2::jsonb, 'pending')",
+    )
+    .bind(&legacy_first)
+    .bind(&first_json)
+    .execute(&legacy_only.pool)
+    .await
+    .expect("legacy first identity operation");
+    let second_json =
+        serde_json::to_string(&[&legacy_second_binding]).expect("encode second binding");
+    let duplicate = sqlx::query(
+        "INSERT INTO cloud_coverage_collection_attempts \
+         (attempt_id, beneficiary_id, collection_epoch, source_set_generation, \
+          expected_projection_revision, source_bindings, status) \
+         VALUES ('same-textual-id', $1, 99, 1, 2, $2::jsonb, 'pending')",
+    )
+    .bind(&legacy_second)
+    .bind(&second_json)
+    .execute(&legacy_only.pool)
+    .await;
     assert!(
         duplicate.is_err(),
         "pre migration schema must reject a cross beneficiary textual attempt id"
     );
-    tx.rollback()
-        .await
-        .expect("rollback legacy duplicate identity");
     legacy_only.cleanup().await;
 
     let fresh = DisposableDatabase::create()
