@@ -9,10 +9,11 @@ use std::str::FromStr;
 use sotto_server::cloud_coverage::ConfirmedPaidInterval;
 use sotto_server::cloud_coverage_reconciliation::SourceObservation;
 use sotto_server::cloud_provider::{
-    complete_verified_event, prepare_verified_event, record_verified_event, reject_verified_event,
-    replay_verified_event, AllocationState, ApplyDisposition, EventDisposition, PayerKind,
-    ProviderContext, ProviderEnvironment, RejectionDisposition, VerifiedAllocation,
-    VerifiedCollection, VerifiedProviderEvent,
+    accept_provider_invalidation, complete_verified_event, prepare_verified_event,
+    record_verified_event, reject_verified_event, replay_verified_event, AllocationState,
+    ApplyDisposition, EventDisposition, InvalidationDisposition, PayerKind, ProviderContext,
+    ProviderEnvironment, RejectionDisposition, VerifiedAllocation, VerifiedCollection,
+    VerifiedProviderEvent,
 };
 use sotto_server::db;
 use sqlx::postgres::PgConnectOptions;
@@ -469,6 +470,208 @@ async fn applying_verified_event_commits_allocation_and_projection_once() {
         .unwrap();
     sqlx::query("DELETE FROM cloud_provider_allocations WHERE allocation_id = $1")
         .bind(&second_allocation_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_coverage_revision_facts WHERE beneficiary_id = $1")
+        .bind(&beneficiary_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE cloud_coverage_coordinators SET current_attempt_id = NULL WHERE beneficiary_id = $1",
+    )
+    .bind(&beneficiary_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    for table in [
+        "cloud_coverage_collection_attempts",
+        "cloud_coverage_sources",
+        "cloud_coverage_coordinators",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE beneficiary_id = $1"))
+            .bind(&beneficiary_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query(
+        "UPDATE cloud_coverage_heads SET current_revision = NULL WHERE beneficiary_id = $1",
+    )
+    .bind(&beneficiary_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    for table in ["cloud_coverage_revisions", "cloud_coverage_heads"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE beneficiary_id = $1"))
+            .bind(&beneficiary_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("DELETE FROM cloud_provider_payers WHERE payer_id = $1")
+        .bind(&payer_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(&beneficiary_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn accepted_provider_invalidation_fences_an_inflight_collection() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let context = context();
+    let suffix = Uuid::new_v4().to_string();
+    let beneficiary_id = format!("invalidation-beneficiary-{suffix}");
+    let payer_id = format!("invalidation-payer-{suffix}");
+    let allocation_id = format!("invalidation-allocation-{suffix}");
+    let source_id = format!("invalidation-source-{suffix}");
+    let event_id = format!("invalidation-event-{suffix}");
+    let change_event_id = format!("invalidation-change-{suffix}");
+    let subscription_id = format!("invalidation-subscription-{suffix}");
+    let external_reference = format!("invalidation-external-{suffix}");
+    sqlx::query(
+        "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, 'cloud-provider-test', $1)",
+    )
+    .bind(&beneficiary_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let event = VerifiedProviderEvent::from_payload(
+        &event_id,
+        "invoice.paid",
+        1_700_000_000,
+        Some(subscription_id.clone()),
+        Some(external_reference.clone()),
+        br#"{"status":"paid"}"#,
+    )
+    .unwrap();
+    let change_event = VerifiedProviderEvent::from_payload(
+        &change_event_id,
+        "invoice.payment_failed",
+        1_700_000_001,
+        Some(subscription_id.clone()),
+        Some(external_reference.clone()),
+        br#"{"status":"open"}"#,
+    )
+    .unwrap();
+    let allocation = VerifiedAllocation::new(
+        &allocation_id,
+        &payer_id,
+        format!("invalidation-customer-{suffix}"),
+        PayerKind::Personal,
+        &beneficiary_id,
+        &subscription_id,
+        "price_cloud",
+        &external_reference,
+        &source_id,
+        0,
+        None,
+        AllocationState::Active,
+        format!("invalidation-ownership-{suffix}"),
+    )
+    .unwrap();
+    let collection = VerifiedCollection {
+        aggregate_evidence_reference: format!("invalidation-aggregate-{suffix}"),
+        observations: vec![SourceObservation::Complete {
+            source_id: source_id.clone(),
+            evidence_reference: format!("invalidation-evidence-{suffix}"),
+            paid_intervals: vec![ConfirmedPaidInterval {
+                coverage_id: format!("invalidation-coverage-{suffix}"),
+                source_id: source_id.clone(),
+                starts_at: 0,
+                paid_until: 100,
+                failed_renewal_id: None,
+            }],
+        }],
+    };
+    let mut record = pool.begin().await.unwrap();
+    record_verified_event(&mut record, &context, &event)
+        .await
+        .unwrap();
+    record_verified_event(&mut record, &context, &change_event)
+        .await
+        .unwrap();
+    record.commit().await.unwrap();
+
+    let mut prepare = pool.begin().await.unwrap();
+    let preparation = prepare_verified_event(
+        &mut prepare,
+        &context,
+        &event,
+        &allocation,
+        "invalidation-run",
+    )
+    .await
+    .unwrap();
+    prepare.commit().await.unwrap();
+
+    let mut invalidate = pool.begin().await.unwrap();
+    assert_eq!(
+        accept_provider_invalidation(&mut invalidate, &context, &change_event, &allocation)
+            .await
+            .unwrap(),
+        InvalidationDisposition::Accepted { generation: 1 }
+    );
+    invalidate.commit().await.unwrap();
+    let mut retry = pool.begin().await.unwrap();
+    assert_eq!(
+        accept_provider_invalidation(&mut retry, &context, &change_event, &allocation)
+            .await
+            .unwrap(),
+        InvalidationDisposition::AlreadyAccepted { generation: 1 }
+    );
+    retry.commit().await.unwrap();
+
+    let mut complete = pool.begin().await.unwrap();
+    let result = complete_verified_event(
+        &mut complete,
+        &context,
+        &event,
+        &allocation,
+        &preparation,
+        &collection,
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(sotto_server::cloud_provider::ProviderAdapterError::Reconciliation(
+            sotto_server::cloud_coverage_reconciliation::ReconciliationError::CollectionConflict
+        ))
+    ));
+    complete.rollback().await.unwrap();
+
+    let projection_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_coverage_collection_attempts \
+         WHERE beneficiary_id = $1 AND status = 'completed'",
+    )
+    .bind(&beneficiary_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(projection_count, 0);
+
+    sqlx::query("DELETE FROM cloud_provider_invalidation_associations WHERE event_id = $1")
+        .bind(&change_event_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for id in [&event_id, &change_event_id] {
+        sqlx::query("DELETE FROM cloud_provider_event_receipts WHERE event_id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("DELETE FROM cloud_provider_allocations WHERE allocation_id = $1")
+        .bind(&allocation_id)
         .execute(&pool)
         .await
         .unwrap();
