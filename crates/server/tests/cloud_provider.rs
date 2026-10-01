@@ -613,6 +613,22 @@ async fn accepted_provider_invalidation_fences_an_inflight_collection() {
     .unwrap();
     prepare.commit().await.unwrap();
 
+    let mut wrong_allocation = allocation.clone();
+    wrong_allocation.ownership_evidence_reference = "forged-ownership".into();
+    let mut invalid_context = pool.begin().await.unwrap();
+    let invalid_result = accept_provider_invalidation(
+        &mut invalid_context,
+        &context,
+        &change_event,
+        &wrong_allocation,
+    )
+    .await;
+    assert!(matches!(
+        invalid_result,
+        Err(sotto_server::cloud_provider::ProviderAdapterError::ProviderContextMismatch)
+    ));
+    invalid_context.rollback().await.unwrap();
+
     let mut invalidate = pool.begin().await.unwrap();
     assert_eq!(
         accept_provider_invalidation(&mut invalidate, &context, &change_event, &allocation)
@@ -645,6 +661,31 @@ async fn accepted_provider_invalidation_fences_an_inflight_collection() {
         Err(sotto_server::cloud_provider::ProviderAdapterError::CollectionSuperseded)
     ));
     complete.rollback().await.unwrap();
+
+    sqlx::query(
+        "UPDATE cloud_coverage_collection_attempts SET provider_invalidation_generation = NULL \
+         WHERE beneficiary_id = $1 AND attempt_id = $2",
+    )
+    .bind(&beneficiary_id)
+    .bind("invalidation-run")
+    .execute(&pool)
+    .await
+    .unwrap();
+    let mut corrupt_complete = pool.begin().await.unwrap();
+    let corrupt_result = complete_verified_event(
+        &mut corrupt_complete,
+        &context,
+        &event,
+        &allocation,
+        &preparation,
+        &collection,
+    )
+    .await;
+    assert!(matches!(
+        corrupt_result,
+        Err(sotto_server::cloud_provider::ProviderAdapterError::CollectionSuperseded)
+    ));
+    corrupt_complete.rollback().await.unwrap();
 
     let mut retry_prepare = pool.begin().await.unwrap();
     let retry_preparation = prepare_verified_event(
@@ -699,6 +740,56 @@ async fn accepted_provider_invalidation_fences_an_inflight_collection() {
     );
     invalidate_after.commit().await.unwrap();
 
+    let race_event_id = format!("invalidation-race-{suffix}");
+    let race_event = VerifiedProviderEvent::from_payload(
+        &race_event_id,
+        "invoice.payment_failed",
+        1_700_000_003,
+        Some(subscription_id.clone()),
+        Some(external_reference.clone()),
+        br#"{"status":"open","race":true}"#,
+    )
+    .unwrap();
+    let mut record_race = pool.begin().await.unwrap();
+    record_verified_event(&mut record_race, &context, &race_event)
+        .await
+        .unwrap();
+    record_race.commit().await.unwrap();
+    let accept_race = |pool: PgPool| {
+        let context = context.clone();
+        let event = race_event.clone();
+        let allocation = allocation.clone();
+        async move {
+            let mut tx = pool.begin().await.unwrap();
+            let outcome =
+                accept_provider_invalidation(&mut tx, &context, &event, &allocation).await;
+            tx.commit().await.unwrap();
+            outcome
+        }
+    };
+    let (race_left, race_right) =
+        tokio::join!(accept_race(pool.clone()), accept_race(pool.clone()));
+    assert!(matches!(
+        &race_left,
+        Ok(InvalidationDisposition::Accepted { generation: 3 })
+            | Ok(InvalidationDisposition::AlreadyAccepted { generation: 3 })
+    ));
+    assert!(matches!(
+        &race_right,
+        Ok(InvalidationDisposition::Accepted { generation: 3 })
+            | Ok(InvalidationDisposition::AlreadyAccepted { generation: 3 })
+    ));
+    assert!(matches!(
+        (&race_left, &race_right),
+        (
+            Ok(InvalidationDisposition::Accepted { generation: 3 }),
+            Ok(InvalidationDisposition::AlreadyAccepted { generation: 3 })
+        ) | (
+            Ok(InvalidationDisposition::AlreadyAccepted { generation: 3 }),
+            Ok(InvalidationDisposition::Accepted { generation: 3 })
+        )
+    ));
+
     let projection_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM cloud_coverage_collection_attempts \
          WHERE beneficiary_id = $1 AND status = 'completed'",
@@ -709,14 +800,14 @@ async fn accepted_provider_invalidation_fences_an_inflight_collection() {
     .unwrap();
     assert_eq!(projection_count, 1);
 
-    for id in [&change_event_id, &after_event_id] {
+    for id in [&change_event_id, &after_event_id, &race_event_id] {
         sqlx::query("DELETE FROM cloud_provider_invalidation_associations WHERE event_id = $1")
             .bind(id)
             .execute(&pool)
             .await
             .unwrap();
     }
-    for id in [&event_id, &change_event_id, &after_event_id] {
+    for id in [&event_id, &change_event_id, &after_event_id, &race_event_id] {
         sqlx::query("DELETE FROM cloud_provider_event_receipts WHERE event_id = $1")
             .bind(id)
             .execute(&pool)
