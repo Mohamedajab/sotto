@@ -602,12 +602,14 @@ pub async fn accept_provider_invalidation(
         .checked_add(1)
         .filter(|value| *value > 0)
         .ok_or(ProviderAdapterError::InvalidationGenerationOverflow)?;
-    sqlx::query(
+    let inserted = sqlx::query(
         "INSERT INTO cloud_provider_invalidation_associations \
          (provider_namespace, provider_account_id, provider_environment, event_id, event_type, \
           provider_created_at, normalized_payload_hash, beneficiary_id, allocation_id, \
           coverage_source_id, accepted_generation) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+         ON CONFLICT (provider_namespace, provider_account_id, provider_environment, event_id) \
+         DO NOTHING",
     )
     .bind(&context.namespace)
     .bind(&context.account_id)
@@ -628,6 +630,34 @@ pub async fn accept_provider_invalidation(
         }
         error => ProviderAdapterError::Database(error),
     })?;
+    if inserted.rows_affected() == 0 {
+        let existing = sqlx::query(
+            "SELECT event_type, provider_created_at, normalized_payload_hash, allocation_id, \
+                    coverage_source_id, accepted_generation \
+             FROM cloud_provider_invalidation_associations \
+             WHERE provider_namespace = $1 AND provider_account_id = $2 \
+               AND provider_environment = $3 AND event_id = $4",
+        )
+        .bind(&context.namespace)
+        .bind(&context.account_id)
+        .bind(context.environment.as_str())
+        .bind(&event.event_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(ProviderAdapterError::InvalidationConflict)?;
+        let same = existing.try_get::<String, _>("event_type")? == event.event_type
+            && existing.try_get::<i64, _>("provider_created_at")? == event.provider_created_at
+            && existing.try_get::<String, _>("normalized_payload_hash")?
+                == event.normalized_payload_hash
+            && existing.try_get::<String, _>("allocation_id")? == allocation.allocation_id
+            && existing.try_get::<String, _>("coverage_source_id")? == allocation.source_id;
+        if !same {
+            return Err(ProviderAdapterError::InvalidationConflict);
+        }
+        return Ok(InvalidationDisposition::AlreadyAccepted {
+            generation: existing.try_get("accepted_generation")?,
+        });
+    }
     let updated = sqlx::query(
         "UPDATE cloud_coverage_coordinators SET provider_invalidation_generation = $2 \
          WHERE beneficiary_id = $1 AND provider_invalidation_generation = $3",
