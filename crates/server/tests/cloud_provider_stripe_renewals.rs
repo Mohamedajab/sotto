@@ -2156,7 +2156,12 @@ async fn late_pending_response_hits_the_shared_deadline_without_partial_observat
             .personal_renewal_observation(&mut session, &binding, &failure)
             .await
     });
-    server.wait_for_pending_request().await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        server.wait_for_pending_request(),
+    )
+    .await
+    .expect("pending request entered");
     let result = tokio::time::timeout(std::time::Duration::from_secs(1), task)
         .await
         .expect("bounded teardown")
