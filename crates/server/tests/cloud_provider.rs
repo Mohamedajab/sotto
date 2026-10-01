@@ -646,6 +646,59 @@ async fn accepted_provider_invalidation_fences_an_inflight_collection() {
     ));
     complete.rollback().await.unwrap();
 
+    let mut retry_prepare = pool.begin().await.unwrap();
+    let retry_preparation = prepare_verified_event(
+        &mut retry_prepare,
+        &context,
+        &event,
+        &allocation,
+        "invalidation-retry",
+    )
+    .await
+    .unwrap();
+    retry_prepare.commit().await.unwrap();
+    assert_eq!(
+        retry_preparation.ticket.provider_invalidation_generation,
+        Some(1)
+    );
+    let mut retry_complete = pool.begin().await.unwrap();
+    let applied = complete_verified_event(
+        &mut retry_complete,
+        &context,
+        &event,
+        &allocation,
+        &retry_preparation,
+        &collection,
+    )
+    .await
+    .unwrap();
+    retry_complete.commit().await.unwrap();
+    assert_eq!(applied.outcome, ApplyDisposition::Applied);
+
+    let after_event_id = format!("invalidation-after-{suffix}");
+    let after_event = VerifiedProviderEvent::from_payload(
+        &after_event_id,
+        "invoice.paid",
+        1_700_000_002,
+        Some(subscription_id.clone()),
+        Some(external_reference.clone()),
+        br#"{"status":"paid","retry":true}"#,
+    )
+    .unwrap();
+    let mut record_after = pool.begin().await.unwrap();
+    record_verified_event(&mut record_after, &context, &after_event)
+        .await
+        .unwrap();
+    record_after.commit().await.unwrap();
+    let mut invalidate_after = pool.begin().await.unwrap();
+    assert_eq!(
+        accept_provider_invalidation(&mut invalidate_after, &context, &after_event, &allocation)
+            .await
+            .unwrap(),
+        InvalidationDisposition::Accepted { generation: 2 }
+    );
+    invalidate_after.commit().await.unwrap();
+
     let projection_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM cloud_coverage_collection_attempts \
          WHERE beneficiary_id = $1 AND status = 'completed'",
@@ -654,14 +707,16 @@ async fn accepted_provider_invalidation_fences_an_inflight_collection() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(projection_count, 0);
+    assert_eq!(projection_count, 1);
 
-    sqlx::query("DELETE FROM cloud_provider_invalidation_associations WHERE event_id = $1")
-        .bind(&change_event_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-    for id in [&event_id, &change_event_id] {
+    for id in [&change_event_id, &after_event_id] {
+        sqlx::query("DELETE FROM cloud_provider_invalidation_associations WHERE event_id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    for id in [&event_id, &change_event_id, &after_event_id] {
         sqlx::query("DELETE FROM cloud_provider_event_receipts WHERE event_id = $1")
             .bind(id)
             .execute(&pool)
