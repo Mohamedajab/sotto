@@ -264,6 +264,7 @@ pub fn compose_personal_coverage(
                 if term.invoice_id() != observation.invoice_id()
                     || term.period_start() != observation.period_start()
                     || term.period_end() != observation.period_end()
+                    || term.interval() != failure.interval()
                 {
                     return Ok(needs(StripeCoverageNeedsEvidence::ContradictoryState {
                         invoice_id: observation.invoice_id().to_owned(),
@@ -283,6 +284,7 @@ pub fn compose_personal_coverage(
                     || correction_observation.customer_id() != term.customer_id()
                     || correction_observation.subscription_id() != term.subscription_id()
                     || correction_observation.provider_item_id() != term.provider_item_id()
+                    || correction_observation.interval() != term.interval()
                     || correction_observation.period_start() != term.period_start()
                     || correction_observation.period_end() != term.period_end()
                 {
