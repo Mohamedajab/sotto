@@ -24,6 +24,7 @@ pub struct Identity {
 
 /// Exchanges an OAuth authorisation code for a verified [`Identity`].
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait OAuthProvider: Send + Sync {
     async fn exchange_code(&self, code: &str) -> Result<Identity>;
 }

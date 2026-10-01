@@ -322,6 +322,7 @@ pub struct ProviderHistoryPage {
 
 /// Provider-neutral history transport. Implementations perform no database work.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait ProviderHistoryClient: Send {
     async fn fetch_page(
         &mut self,
