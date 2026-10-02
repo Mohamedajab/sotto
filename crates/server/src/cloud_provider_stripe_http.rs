@@ -14,7 +14,7 @@ use thiserror::Error;
 use tokio::time::{sleep, timeout};
 
 use crate::billing::STRIPE_API_VERSION;
-use crate::billing_catalogue::BillingInterval;
+use crate::billing_catalogue::{BillingInterval, StripePriceObservation};
 use crate::cloud_provider::ProviderEnvironment;
 use crate::cloud_provider_stripe::{
     decode_invoice_payment, validate_personal_invoice_observation, StripeAllocationBinding,
@@ -1348,6 +1348,27 @@ pub struct StripePriceResource {
     pub unit_amount: Option<i64>,
     pub interval: Option<BillingInterval>,
     pub interval_count: Option<i64>,
+}
+
+impl StripePriceResource {
+    /// Convert the authenticated transport result into the catalogue's provider observation.
+    pub fn observation(
+        &self,
+        account_id: impl Into<String>,
+        environment: ProviderEnvironment,
+    ) -> StripePriceObservation {
+        StripePriceObservation::new(
+            self.id.clone(),
+            account_id,
+            environment,
+            self.active,
+            self.livemode,
+            self.currency.clone(),
+            self.unit_amount,
+            self.interval,
+            self.interval_count,
+        )
+    }
 }
 
 /// A non-paid invoice retained by personal history collection without becoming coverage.
