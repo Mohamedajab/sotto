@@ -98,8 +98,8 @@ pub enum StripeRenewalFailureLoadError {
 /// Load all accepted renewal failures for one registered allocation in a bounded snapshot.
 ///
 /// The joined statement sees either a committed association/evidence pair or neither. Rows are
-/// ordered by the scoped event id, and limit-plus-one detection prevents returning a prefix when
-/// the local history exceeds either configured bound.
+/// ordered by the scoped event id using bytewise collation, and limit-plus-one detection prevents
+/// returning a prefix when the local history exceeds either configured bound.
 pub async fn load_personal_renewal_failures(
     pool: &PgPool,
     context: &ProviderContext,
@@ -142,7 +142,7 @@ pub async fn load_personal_renewal_failures(
            AND association.beneficiary_id = $4 \
            AND association.allocation_id = $5 \
            AND association.coverage_source_id = $6 \
-         ORDER BY failure.event_id ASC \
+         ORDER BY failure.event_id COLLATE \"C\" ASC \
          LIMIT $7 \
        ) \
        SELECT count(*)::BIGINT AS row_count, \
@@ -242,7 +242,7 @@ pub async fn load_personal_renewal_failures(
            AND association.beneficiary_id = $4 \
            AND association.allocation_id = $5 \
            AND association.coverage_source_id = $6 \
-         ORDER BY failure.event_id ASC \
+         ORDER BY failure.event_id COLLATE \"C\" ASC \
          LIMIT $7",
     )
     .bind(&context.namespace)
