@@ -507,6 +507,9 @@ pub async fn reconcile_operation(
     ) {
         return Ok(current);
     }
+    // A provider error leaves the lease until its bounded expiry. This prevents an outage from
+    // turning every worker retry into another provider request while keeping the row visible to
+    // the reconciliation candidate query.
     let resolution = provider.resolve(&current).await?;
     let mut tx = pool.begin().await.map_err(BillingOperationError::from)?;
     let resolved = match resolution {

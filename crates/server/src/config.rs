@@ -204,6 +204,9 @@ impl Config {
             _ => None,
         };
         if hosted_catalogue_configured && billing.is_none() {
+            // The hosted catalogue is dormant until the hosted billing route lands. Keep one
+            // complete Stripe configuration boundary for now so legacy billing cannot silently
+            // disappear while the new ids are present.
             return Err(Error::Config(
                 "hosted Stripe price ids require STRIPE_API_KEY, STRIPE_WEBHOOK_SECRET, and STRIPE_PRICE_ID"
                     .into(),
