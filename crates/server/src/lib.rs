@@ -23,6 +23,7 @@ pub mod account;
 pub mod audit;
 pub mod auth;
 pub mod billing;
+pub mod billing_catalogue;
 pub mod cloud_coverage;
 pub mod cloud_coverage_reconciliation;
 pub mod cloud_coverage_store;
