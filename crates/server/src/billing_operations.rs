@@ -864,5 +864,33 @@ mod tests {
             first.provider_idempotency_key,
             separate.provider_idempotency_key
         );
+        let changed_expiry = BillingOperationRequest::personal(
+            "user_1",
+            "idem_1",
+            BillingOffer::StandardMonthly,
+            1,
+            2_000_000_001,
+        );
+        assert_ne!(first.request_hash, changed_expiry.request_hash);
+        let first_org = BillingOperationRequest::organization(
+            "user_1",
+            "org_a",
+            "shared_key",
+            BillingOffer::StandardMonthly,
+            1,
+            2_000_000_000,
+        );
+        let second_org = BillingOperationRequest::organization(
+            "user_1",
+            "org_b",
+            "shared_key",
+            BillingOffer::StandardMonthly,
+            1,
+            2_000_000_000,
+        );
+        assert_ne!(
+            first_org.provider_idempotency_key,
+            second_org.provider_idempotency_key
+        );
     }
 }
