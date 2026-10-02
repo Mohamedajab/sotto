@@ -185,7 +185,10 @@ async fn reads_the_configured_stripe_test_contract_without_mutation() {
     });
     if let Ok(path) = env::var("STRIPE_SANDBOX_REPORT") {
         let path = Path::new(&path);
-        if let Some(parent) = path.parent() {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             fs::create_dir_all(parent).expect("create sandbox report directory");
         }
         fs::write(
