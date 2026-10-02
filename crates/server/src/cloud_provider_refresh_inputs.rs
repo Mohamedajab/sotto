@@ -100,12 +100,9 @@ pub async fn load(
         row.try_get::<String, _>("ownership_evidence_reference")?,
     )
     .map_err(|error| RefreshInputError::Corrupt(error.to_string()))?;
-    if event.subscription_id.as_deref() != Some(allocation.subscription_id.as_str())
-        || event.allocation_reference.as_deref()
-            != Some(allocation.external_allocation_reference.as_str())
-    {
+    if !event_matches_allocation(&event, &allocation) {
         return Err(RefreshInputError::Corrupt(
-            "receipt and allocation subscription identities differ".into(),
+            "receipt and allocation identities differ".into(),
         ));
     }
     Ok(RefreshJobInputs {
@@ -114,6 +111,20 @@ pub async fn load(
         allocation,
         receipt_status: row.try_get("status")?,
     })
+}
+
+fn event_matches_allocation(
+    event: &VerifiedProviderEvent,
+    allocation: &VerifiedAllocation,
+) -> bool {
+    event
+        .subscription_id
+        .as_deref()
+        .is_none_or(|subscription_id| subscription_id == allocation.subscription_id)
+        && event
+            .allocation_reference
+            .as_deref()
+            .is_none_or(|reference| reference == allocation.external_allocation_reference)
 }
 
 fn parse_payer_kind(value: &str) -> Result<PayerKind, RefreshInputError> {
@@ -134,5 +145,74 @@ fn parse_allocation_state(value: &str) -> Result<AllocationState, RefreshInputEr
         _ => Err(RefreshInputError::Corrupt(format!(
             "unknown allocation state {value:?}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::event_matches_allocation;
+    use crate::cloud_provider::{
+        AllocationState, PayerKind, VerifiedAllocation, VerifiedProviderEvent,
+    };
+
+    fn allocation() -> VerifiedAllocation {
+        VerifiedAllocation::new(
+            "allocation",
+            "payer",
+            "customer",
+            PayerKind::Personal,
+            "beneficiary",
+            "subscription",
+            "item",
+            "external",
+            "source",
+            0,
+            None,
+            AllocationState::Active,
+            "ownership",
+        )
+        .unwrap()
+    }
+
+    fn event(
+        subscription_id: Option<&str>,
+        allocation_reference: Option<&str>,
+    ) -> VerifiedProviderEvent {
+        VerifiedProviderEvent::from_payload(
+            "event",
+            "invoice.paid",
+            1,
+            subscription_id.map(str::to_owned),
+            allocation_reference.map(str::to_owned),
+            b"payload",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn optional_event_identity_claims_are_allowed() {
+        let allocation = allocation();
+        assert!(event_matches_allocation(&event(None, None), &allocation));
+        assert!(event_matches_allocation(
+            &event(Some("subscription"), None),
+            &allocation
+        ));
+        assert!(event_matches_allocation(
+            &event(None, Some("external")),
+            &allocation
+        ));
+    }
+
+    #[test]
+    fn present_event_identity_claims_must_match() {
+        let allocation = allocation();
+        assert!(!event_matches_allocation(
+            &event(Some("other-subscription"), None),
+            &allocation
+        ));
+        assert!(!event_matches_allocation(
+            &event(None, Some("other-external")),
+            &allocation
+        ));
     }
 }
