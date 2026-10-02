@@ -154,7 +154,7 @@ pub async fn load_personal_renewal_failures(
                 + octet_length(provider_account_id) + octet_length(provider_environment) \
                 + octet_length(allocation_reference) + octet_length(provider_customer_id) \
                 + octet_length(subscription_id) + octet_length(provider_item_id) \
-                + 12 * 8 \
+                + octet_length(interval) + 5 * 8 \
               ), 0)::TEXT AS evidence_bytes \
        FROM candidates",
     )
@@ -398,7 +398,9 @@ fn evidence_size(evidence: &StripeRenewalFailureEvidence) -> usize {
         + evidence.subscription_id().len()
         + evidence.provider_item_id().len()
         + evidence.evidence_reference().len()
-        + (12 * std::mem::size_of::<i64>())
+        + evidence.environment().as_str().len()
+        + evidence.interval().to_string().len()
+        + (5 * std::mem::size_of::<i64>())
 }
 
 /// Atomically persist one decoder-linked renewal failure and its provider invalidation.
