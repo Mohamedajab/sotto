@@ -167,7 +167,8 @@ pub async fn complete(pool: &PgPool, lease: &RefreshJobLease) -> Result<(), Refr
         "UPDATE cloud_provider_refresh_jobs \
          SET status = 'completed', lease_owner = NULL, lease_expires_at = NULL, \
              completed_at = now(), updated_at = now() \
-         WHERE job_id = $1 AND status = 'leased' AND lease_owner = $2",
+         WHERE job_id = $1 AND status = 'leased' AND lease_owner = $2 \
+           AND lease_expires_at > now()",
     )
     .bind(&lease.job_id)
     .bind(&lease.worker_id)
@@ -194,7 +195,8 @@ pub async fn fail(
             "UPDATE cloud_provider_refresh_jobs \
              SET status = 'poisoned', lease_owner = NULL, lease_expires_at = NULL, \
                  last_error_code = $1, updated_at = now() \
-             WHERE job_id = $2 AND status = 'leased' AND lease_owner = $3",
+             WHERE job_id = $2 AND status = 'leased' AND lease_owner = $3 \
+               AND lease_expires_at > now()",
         )
         .bind(error_code)
         .bind(&lease.job_id)
@@ -211,7 +213,8 @@ pub async fn fail(
         "UPDATE cloud_provider_refresh_jobs \
          SET status = 'pending', available_at = now() + $1::interval, lease_owner = NULL, \
              lease_expires_at = NULL, last_error_code = $2, updated_at = now() \
-         WHERE job_id = $3 AND status = 'leased' AND lease_owner = $4",
+         WHERE job_id = $3 AND status = 'leased' AND lease_owner = $4 \
+           AND lease_expires_at > now()",
     )
     .bind(format!("{} seconds", delay.as_secs()))
     .bind(error_code)
@@ -232,7 +235,8 @@ pub async fn release(pool: &PgPool, lease: &RefreshJobLease) -> Result<(), Refre
         "UPDATE cloud_provider_refresh_jobs \
          SET status = 'pending', available_at = now(), lease_owner = NULL, \
              lease_expires_at = NULL, updated_at = now() \
-         WHERE job_id = $1 AND status = 'leased' AND lease_owner = $2",
+         WHERE job_id = $1 AND status = 'leased' AND lease_owner = $2 \
+           AND lease_expires_at > now()",
     )
     .bind(&lease.job_id)
     .bind(&lease.worker_id)

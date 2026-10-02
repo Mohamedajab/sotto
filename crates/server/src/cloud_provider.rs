@@ -501,6 +501,7 @@ pub async fn accept_provider_invalidation(
     context: &ProviderContext,
     event: &VerifiedProviderEvent,
     allocation: &VerifiedAllocation,
+    ingest_enabled: bool,
 ) -> Result<InvalidationDisposition, ProviderAdapterError> {
     context.validate()?;
     event.validate()?;
@@ -595,7 +596,9 @@ pub async fn accept_provider_invalidation(
             return Err(ProviderAdapterError::InvalidationConflict);
         }
         let generation = existing.try_get("accepted_generation")?;
-        enqueue_refresh_job(tx, context, event, allocation).await?;
+        if ingest_enabled {
+            enqueue_refresh_job(tx, context, event, allocation).await?;
+        }
         return Ok(InvalidationDisposition::AlreadyAccepted { generation });
     }
 
@@ -656,7 +659,9 @@ pub async fn accept_provider_invalidation(
             return Err(ProviderAdapterError::InvalidationConflict);
         }
         let generation = existing.try_get("accepted_generation")?;
-        enqueue_refresh_job(tx, context, event, allocation).await?;
+        if ingest_enabled {
+            enqueue_refresh_job(tx, context, event, allocation).await?;
+        }
         return Ok(InvalidationDisposition::AlreadyAccepted { generation });
     }
     let updated = sqlx::query(
@@ -671,7 +676,9 @@ pub async fn accept_provider_invalidation(
     if updated.rows_affected() != 1 {
         return Err(ProviderAdapterError::InvalidationConflict);
     }
-    enqueue_refresh_job(tx, context, event, allocation).await?;
+    if ingest_enabled {
+        enqueue_refresh_job(tx, context, event, allocation).await?;
+    }
     Ok(InvalidationDisposition::Accepted {
         generation: next_generation,
     })
