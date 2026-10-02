@@ -30,6 +30,9 @@ pub struct StripeAuthoritySource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StripeAuthorityFacts {
     pub(crate) beneficiary_id: String,
+    pub(crate) provider_account_id: String,
+    pub(crate) environment: String,
+    pub(crate) allocation_reference: String,
     pub(crate) complete_source_set: bool,
     pub(crate) sources: Vec<StripeAuthoritySource>,
     pub(crate) invalidation_generation: i64,
@@ -105,6 +108,9 @@ pub enum StripeAuthorityAssessment {
 pub struct StripePublicationAuthority {
     policy_version: u16,
     beneficiary_id: String,
+    provider_account_id: String,
+    environment: String,
+    allocation_reference: String,
     coverage: PersonCoverage,
     sources: Vec<StripeAuthoritySource>,
     invalidation_generation: i64,
@@ -284,6 +290,9 @@ impl StripePublicationAuthority {
         Ok(Self {
             policy_version: AUTHORITY_POLICY_VERSION,
             beneficiary_id: facts.beneficiary_id,
+            provider_account_id: facts.provider_account_id,
+            environment: facts.environment,
+            allocation_reference: facts.allocation_reference,
             coverage,
             sources,
             invalidation_generation: facts.invalidation_generation,
@@ -309,6 +318,18 @@ impl StripePublicationAuthority {
 
     pub fn beneficiary_id(&self) -> &str {
         &self.beneficiary_id
+    }
+
+    pub fn provider_account_id(&self) -> &str {
+        &self.provider_account_id
+    }
+
+    pub fn environment(&self) -> &str {
+        &self.environment
+    }
+
+    pub fn allocation_reference(&self) -> &str {
+        &self.allocation_reference
     }
 
     pub fn coverage(&self) -> &PersonCoverage {
@@ -363,6 +384,17 @@ impl StripePublicationAuthority {
 fn validate_metadata(facts: &StripeAuthorityFacts) -> Result<(), StripeAuthorityError> {
     if facts.beneficiary_id.trim().is_empty() {
         return Err(StripeAuthorityError::InvalidMetadata("beneficiary"));
+    }
+    if facts.provider_account_id.trim().is_empty() {
+        return Err(StripeAuthorityError::InvalidMetadata("provider account"));
+    }
+    if facts.environment.trim().is_empty() {
+        return Err(StripeAuthorityError::InvalidMetadata("environment"));
+    }
+    if facts.allocation_reference.trim().is_empty() {
+        return Err(StripeAuthorityError::InvalidMetadata(
+            "allocation reference",
+        ));
     }
     if facts.invalidation_generation <= 0 {
         return Err(StripeAuthorityError::InvalidMetadata(
@@ -439,6 +471,9 @@ mod tests {
     fn facts(renewals: Vec<StripeAuthorityRenewal>) -> StripeAuthorityFacts {
         StripeAuthorityFacts {
             beneficiary_id: "beneficiary".into(),
+            provider_account_id: "acct_test".into(),
+            environment: "test".into(),
+            allocation_reference: "allocation:beneficiary".into(),
             complete_source_set: true,
             sources: vec![source("source-a")],
             invalidation_generation: 1,
