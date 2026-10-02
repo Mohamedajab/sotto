@@ -2,12 +2,14 @@
 //!
 //! These tests are opt-in because they create and remove rows in a disposable Postgres database.
 
+use async_trait::async_trait;
 use sqlx::PgPool;
 
 use sotto_server::billing_catalogue::BillingOffer;
 use sotto_server::billing_operations::{
-    begin_operation, load_reconciliation_candidates, record_provider_result, BeginOperation,
-    BillingOperationError, BillingOperationRequest, BillingOperationState,
+    begin_personal_operation, load_reconciliation_candidates, reconcile_operation,
+    record_provider_result, BeginOperation, BillingOperation, BillingOperationError,
+    BillingOperationProvider, BillingOperationState, ProviderResolution,
 };
 use sotto_server::db;
 
@@ -22,21 +24,6 @@ async fn pool_or_skip() -> Option<PgPool> {
     Some(pool)
 }
 
-fn request(operation_id: &str, request_hash: &str) -> BillingOperationRequest {
-    BillingOperationRequest {
-        operation_id: operation_id.into(),
-        idempotency_key: "billing-operation-test-key".into(),
-        request_hash: request_hash.into(),
-        actor_user_id: "billing-operation-test-user".into(),
-        payer_id: "billing-operation-test-payer".into(),
-        beneficiary_id: "billing-operation-test-beneficiary".into(),
-        offer: BillingOffer::StandardMonthly,
-        quote_version: 1,
-        quote_expires_at_epoch: 4_000_000_000,
-        provider_idempotency_key: format!("stripe-billing-operation-test-{operation_id}"),
-    }
-}
-
 async fn cleanup(pool: &PgPool) {
     sqlx::query(
         "DELETE FROM billing_operations WHERE actor_user_id = 'billing-operation-test-user'",
@@ -44,6 +31,21 @@ async fn cleanup(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("clean billing operation fixtures");
+    sqlx::query("DELETE FROM users WHERE id = 'billing-operation-test-user'")
+        .execute(pool)
+        .await
+        .expect("clean billing operation user fixture");
+}
+
+async fn seed_user(pool: &PgPool) {
+    sqlx::query(
+        "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES \
+         ('billing-operation-test-user', 'billing-operation-test', 'billing-operation-test-user') \
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .execute(pool)
+    .await
+    .expect("seed billing operation user fixture");
 }
 
 #[tokio::test]
@@ -52,28 +54,55 @@ async fn operation_identity_is_idempotent_and_conflicts_on_changed_request() {
         return;
     };
     cleanup(&pool).await;
+    seed_user(&pool).await;
 
-    let first = request("billing-operation-test-first", "hash-a");
     let mut tx = pool.begin().await.expect("begin operation transaction");
-    assert!(matches!(
-        begin_operation(&mut tx, &first).await.expect("create operation"),
-        BeginOperation::Created(operation) if operation.state == BillingOperationState::Pending
-    ));
+    let first_operation_id = match begin_personal_operation(
+        &mut tx,
+        "billing-operation-test-user",
+        "billing-operation-test-key",
+        BillingOffer::StandardMonthly,
+        1,
+        4_000_000_000,
+    )
+    .await
+    .expect("create operation")
+    {
+        BeginOperation::Created(operation) => {
+            assert_eq!(operation.state, BillingOperationState::Pending);
+            operation.operation_id
+        }
+        BeginOperation::AlreadyExists(_) => panic!("fixture operation unexpectedly existed"),
+    };
     tx.commit().await.expect("commit operation identity");
 
     let mut replay_tx = pool.begin().await.expect("begin replay transaction");
     assert!(matches!(
-        begin_operation(&mut replay_tx, &first)
+        begin_personal_operation(
+            &mut replay_tx,
+            "billing-operation-test-user",
+            "billing-operation-test-key",
+            BillingOffer::StandardMonthly,
+            1,
+            4_000_000_000,
+        )
             .await
             .expect("replay operation"),
-        BeginOperation::AlreadyExists(operation) if operation.operation_id == first.operation_id
+        BeginOperation::AlreadyExists(operation) if operation.operation_id == first_operation_id
     ));
     replay_tx.commit().await.expect("commit replay");
 
-    let conflicting = request("billing-operation-test-other", "hash-b");
     let mut conflict_tx = pool.begin().await.expect("begin conflict transaction");
     assert!(matches!(
-        begin_operation(&mut conflict_tx, &conflicting).await,
+        begin_personal_operation(
+            &mut conflict_tx,
+            "billing-operation-test-user",
+            "billing-operation-test-key",
+            BillingOffer::StandardAnnual,
+            1,
+            4_000_000_000,
+        )
+        .await,
         Err(BillingOperationError::IdempotencyConflict)
     ));
     conflict_tx.rollback().await.expect("rollback conflict");
@@ -81,18 +110,44 @@ async fn operation_identity_is_idempotent_and_conflicts_on_changed_request() {
     cleanup(&pool).await;
 }
 
+struct SuccessfulProvider;
+
+#[async_trait]
+impl BillingOperationProvider for SuccessfulProvider {
+    async fn resolve(
+        &self,
+        _operation: &BillingOperation,
+    ) -> Result<ProviderResolution, sotto_server::billing_operations::BillingRecoveryError> {
+        Ok(ProviderResolution::Succeeded {
+            provider_operation_id: "pi_recovered".into(),
+            result_code: "paid".into(),
+        })
+    }
+}
+
 #[tokio::test]
-async fn unknown_provider_result_remains_a_reconciliation_candidate() {
+async fn unknown_provider_result_is_reconciled_after_restart() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
     cleanup(&pool).await;
+    seed_user(&pool).await;
 
-    let operation = request("billing-operation-test-unknown", "hash-unknown");
     let mut tx = pool.begin().await.expect("begin operation transaction");
-    begin_operation(&mut tx, &operation)
-        .await
-        .expect("create operation");
+    let operation_id = match begin_personal_operation(
+        &mut tx,
+        "billing-operation-test-user",
+        "billing-operation-test-key",
+        BillingOffer::StandardMonthly,
+        1,
+        4_000_000_000,
+    )
+    .await
+    .expect("create operation")
+    {
+        BeginOperation::Created(operation) => operation.operation_id,
+        BeginOperation::AlreadyExists(_) => panic!("fixture operation unexpectedly existed"),
+    };
     tx.commit().await.expect("commit operation identity");
 
     let mut result_tx = pool
@@ -101,7 +156,7 @@ async fn unknown_provider_result_remains_a_reconciliation_candidate() {
         .expect("begin provider result transaction");
     let stored = record_provider_result(
         &mut result_tx,
-        &operation.operation_id,
+        &operation_id,
         BillingOperationState::Unknown,
         None,
         Some("provider_timeout"),
@@ -111,11 +166,60 @@ async fn unknown_provider_result_remains_a_reconciliation_candidate() {
     assert_eq!(stored.state, BillingOperationState::Unknown);
     result_tx.commit().await.expect("commit provider result");
 
+    let mut replay_tx = pool
+        .begin()
+        .await
+        .expect("begin provider replay transaction");
+    let replayed = record_provider_result(
+        &mut replay_tx,
+        &operation_id,
+        BillingOperationState::Unknown,
+        None,
+        Some("provider_timeout"),
+    )
+    .await
+    .expect("replay identical provider result");
+    assert_eq!(replayed.state, BillingOperationState::Unknown);
+    replay_tx.commit().await.expect("commit provider replay");
+
+    let mut conflicting_tx = pool
+        .begin()
+        .await
+        .expect("begin conflicting provider result transaction");
+    assert!(matches!(
+        record_provider_result(
+            &mut conflicting_tx,
+            &operation_id,
+            BillingOperationState::Succeeded,
+            Some("pi_conflicting"),
+            Some("paid"),
+        )
+        .await,
+        Err(BillingOperationError::ResultConflict)
+    ));
+    conflicting_tx
+        .rollback()
+        .await
+        .expect("rollback conflicting provider result");
+
     let candidates = load_reconciliation_candidates(&pool, 10)
         .await
         .expect("load reconciliation candidates");
     assert_eq!(candidates.len(), 1);
-    assert_eq!(candidates[0].operation_id, operation.operation_id);
+    assert_eq!(candidates[0].operation_id, operation_id);
+
+    let resolved = reconcile_operation(&pool, &SuccessfulProvider, &operation_id)
+        .await
+        .expect("reconcile provider result after restart");
+    assert_eq!(resolved.state, BillingOperationState::Succeeded);
+    assert_eq!(
+        resolved.provider_operation_id.as_deref(),
+        Some("pi_recovered")
+    );
+    assert!(load_reconciliation_candidates(&pool, 10)
+        .await
+        .expect("load resolved candidates")
+        .is_empty());
 
     cleanup(&pool).await;
 }

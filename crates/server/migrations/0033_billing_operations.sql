@@ -23,6 +23,8 @@ CREATE TABLE billing_operations (
     CONSTRAINT billing_operations_beneficiary_not_empty CHECK (btrim(beneficiary_id) <> ''),
     CONSTRAINT billing_operations_offer_not_empty CHECK (btrim(offer) <> ''),
     CONSTRAINT billing_operations_provider_key_not_empty CHECK (btrim(provider_idempotency_key) <> ''),
+    CONSTRAINT billing_operations_quote_version_positive CHECK (quote_version > 0),
+    CONSTRAINT billing_operations_quote_expiry_positive CHECK (quote_expires_at_epoch > 0),
     CONSTRAINT billing_operations_state_valid CHECK (state IN ('pending', 'succeeded', 'failed', 'unknown')),
     CONSTRAINT billing_operations_result_requires_terminal CHECK (
         state IN ('pending', 'unknown') OR result_code IS NOT NULL

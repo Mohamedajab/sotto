@@ -104,18 +104,18 @@ pub struct TelemetryConfig {
     pub ingest_enabled: bool,
 }
 
-/// Stripe billing credentials and the single subscription price.
+/// Stripe billing credentials, the legacy organisation price, and the optional hosted catalogue.
 ///
-/// All three come from the Stripe dashboard; the price id (not a number) lives here so pricing is
-/// an operational decision, never a code change. Billing endpoints return 503 when this is absent
-/// - the integration ships dark and is enabled by setting the environment variables.
+/// The ids come from the Stripe dashboard; amounts and recurrence are validated separately so
+/// pricing remains an operational decision without allowing arbitrary client-selected prices.
+/// Legacy billing endpoints return 503 when this configuration is absent.
 #[derive(Debug, Clone)]
 pub struct BillingConfig {
     /// Restricted API key (`rk_test_…` / `rk_live_…`).
     pub api_key: String,
     /// Webhook signing secret (`whsec_…`) for `POST /billing/webhook`.
     pub webhook_secret: String,
-    /// The Price id (`price_…`) of the flat per-org monthly Team subscription.
+    /// The legacy Price id (`price_…`) of the flat per-org monthly Team subscription.
     pub price_id: String,
     /// The optional server-owned four-offer catalogue. Legacy organisation billing remains
     /// available when these are absent; a partial catalogue is rejected at boot.
@@ -170,9 +170,10 @@ impl Config {
     /// Load configuration from the environment.
     ///
     /// `DATABASE_URL` is required. OAuth is enabled only when both `GITHUB_CLIENT_ID` and
-    /// `GITHUB_CLIENT_SECRET` are set, and billing only when all three `STRIPE_*` variables are,
-    /// so the server still boots (health, migrations) without them. Empty values count as unset -
-    /// docker compose interpolation (`${VAR:-}`) exports empties for every blank `.env` line.
+    /// `GITHUB_CLIENT_SECRET` are set, and legacy billing only when all three legacy `STRIPE_*`
+    /// variables are present, so the server still boots (health, migrations) without them. Empty
+    /// values count as unset - docker compose interpolation (`${VAR:-}`) exports empties for every
+    /// blank `.env` line.
     pub fn from_env() -> Result<Self> {
         let database_url = std::env::var("DATABASE_URL")
             .map_err(|_| Error::Config("DATABASE_URL is not set".into()))?;

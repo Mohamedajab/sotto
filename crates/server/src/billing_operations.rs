@@ -6,8 +6,11 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::billing_catalogue::BillingOffer;
 use crate::error::Error;
@@ -43,19 +46,47 @@ impl BillingOperationState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BillingOperationRequest {
-    pub operation_id: String,
-    pub idempotency_key: String,
-    pub request_hash: String,
-    pub actor_user_id: String,
-    pub payer_id: String,
-    pub beneficiary_id: String,
-    pub offer: BillingOffer,
-    pub quote_version: i64,
-    pub quote_expires_at_epoch: i64,
-    pub provider_idempotency_key: String,
+    operation_id: String,
+    idempotency_key: String,
+    request_hash: String,
+    actor_user_id: String,
+    payer_id: String,
+    beneficiary_id: String,
+    offer: BillingOffer,
+    quote_version: i64,
+    quote_expires_at_epoch: i64,
+    provider_idempotency_key: String,
 }
 
 impl BillingOperationRequest {
+    /// Build a personal operation from the authenticated actor. Payer and beneficiary are derived
+    /// from that identity; callers cannot submit arbitrary billing identities or provider keys.
+    pub fn personal(
+        actor_user_id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        offer: BillingOffer,
+        quote_version: i64,
+        quote_expires_at_epoch: i64,
+    ) -> Self {
+        let actor_user_id = actor_user_id.into();
+        let idempotency_key = idempotency_key.into();
+        let request_hash = request_hash(&actor_user_id, offer, quote_version);
+        let operation_id = format!("billing:{}", Uuid::new_v4());
+        let provider_idempotency_key = format!("sotto-billing:{operation_id}");
+        Self {
+            operation_id,
+            idempotency_key,
+            request_hash,
+            actor_user_id: actor_user_id.clone(),
+            payer_id: actor_user_id.clone(),
+            beneficiary_id: actor_user_id,
+            offer,
+            quote_version,
+            quote_expires_at_epoch,
+            provider_idempotency_key,
+        }
+    }
+
     pub fn validate(&self, now_epoch: i64) -> Result<(), BillingOperationError> {
         for (value, field) in [
             (&self.operation_id, "operation_id"),
@@ -113,6 +144,12 @@ pub enum BillingOperationError {
     IdempotencyConflict,
     #[error("billing operation is not pending")]
     NotPending,
+    #[error("billing operation actor is not authorised")]
+    Unauthorised,
+    #[error("billing operation return URL is not authorised")]
+    UnauthorisedReturnUrl,
+    #[error("billing operation provider result conflicts with its recorded result")]
+    ResultConflict,
     #[error("billing operation state is corrupt")]
     CorruptState,
     #[error("database error: {0}")]
@@ -132,6 +169,15 @@ impl From<BillingOperationError> for Error {
             BillingOperationError::NotPending => {
                 Self::Conflict("billing operation is not pending".into())
             }
+            BillingOperationError::Unauthorised => {
+                Self::Forbidden("billing operation is not authorised for this account".into())
+            }
+            BillingOperationError::UnauthorisedReturnUrl => {
+                Self::BadRequest("billing return URL is not authorised".into())
+            }
+            BillingOperationError::ResultConflict => Self::Conflict(
+                "billing operation provider result conflicts with its recorded result".into(),
+            ),
             BillingOperationError::CorruptState => {
                 Self::Internal("billing operation state is corrupt".into())
             }
@@ -142,7 +188,7 @@ impl From<BillingOperationError> for Error {
 
 /// Persist an operation identity before provider I/O. The caller may pass a transaction that also
 /// holds payer/beneficiary authorisation locks; no provider call belongs inside this transaction.
-pub async fn begin_operation(
+pub(crate) async fn begin_operation(
     tx: &mut Transaction<'_, Postgres>,
     request: &BillingOperationRequest,
 ) -> Result<BeginOperation, BillingOperationError> {
@@ -179,10 +225,48 @@ pub async fn begin_operation(
         || existing.quote_version != request.quote_version
         || existing.payer_id != request.payer_id
         || existing.beneficiary_id != request.beneficiary_id
+        || existing.provider_idempotency_key != request.provider_idempotency_key
     {
         return Err(BillingOperationError::IdempotencyConflict);
     }
     Ok(BeginOperation::AlreadyExists(existing))
+}
+
+/// Lock the authenticated personal payer/beneficiary before persisting the operation identity.
+/// Organisation and sponsored operations will use their own role-checked lock ordering.
+pub async fn begin_personal_operation(
+    tx: &mut Transaction<'_, Postgres>,
+    actor_user_id: &str,
+    idempotency_key: &str,
+    offer: BillingOffer,
+    quote_version: i64,
+    quote_expires_at_epoch: i64,
+) -> Result<BeginOperation, BillingOperationError> {
+    let exists: Option<String> =
+        sqlx::query_scalar("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+            .bind(actor_user_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    if exists.is_none() {
+        return Err(BillingOperationError::Unauthorised);
+    }
+    let request = BillingOperationRequest::personal(
+        actor_user_id,
+        idempotency_key,
+        offer,
+        quote_version,
+        quote_expires_at_epoch,
+    );
+    begin_operation(tx, &request).await
+}
+
+/// Accept only the server-configured return target. Client-provided URLs are never normalised or
+/// reflected into a provider session, so a forged redirect cannot be attached to an operation.
+pub fn validate_return_url(configured: &str, requested: &str) -> Result<(), BillingOperationError> {
+    if configured.is_empty() || requested != configured {
+        return Err(BillingOperationError::UnauthorisedReturnUrl);
+    }
+    Ok(())
 }
 
 /// Record a provider outcome using the persisted operation identity. Unknown outcomes remain
@@ -201,6 +285,13 @@ pub async fn record_provider_result(
             | BillingOperationState::Unknown
     ) {
         return Err(BillingOperationError::InvalidField("provider result state"));
+    }
+    if matches!(
+        state,
+        BillingOperationState::Succeeded | BillingOperationState::Failed
+    ) && result_code.is_none_or(str::is_empty)
+    {
+        return Err(BillingOperationError::InvalidField("result_code"));
     }
     let result = sqlx::query(
         "UPDATE billing_operations SET state = $2, provider_operation_id = COALESCE($3, provider_operation_id), \
@@ -223,8 +314,105 @@ pub async fn record_provider_result(
         ) {
             return Err(BillingOperationError::NotPending);
         }
+        if existing.state != state
+            || existing.provider_operation_id.as_deref() != provider_operation_id
+            || existing.result_code.as_deref() != result_code
+        {
+            return Err(BillingOperationError::ResultConflict);
+        }
     }
     load_operation(tx, operation_id).await
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderResolution {
+    Succeeded {
+        provider_operation_id: String,
+        result_code: String,
+    },
+    Failed {
+        provider_operation_id: Option<String>,
+        result_code: String,
+    },
+    Unknown {
+        result_code: Option<String>,
+    },
+}
+
+#[derive(Debug, Error)]
+pub enum BillingRecoveryError {
+    #[error("billing operation error: {0}")]
+    Operation(#[from] BillingOperationError),
+    #[error("billing provider recovery failed: {0}")]
+    Provider(String),
+}
+
+/// Provider lookup used by a restartable reconciliation worker. The provider must use the stored
+/// provider idempotency key and operation identity; it must not create a new charge.
+#[async_trait]
+pub trait BillingOperationProvider: Send + Sync {
+    async fn resolve(
+        &self,
+        operation: &BillingOperation,
+    ) -> Result<ProviderResolution, BillingRecoveryError>;
+}
+
+/// Resolve one pending or unknown operation after a process restart. The provider call happens
+/// outside the SQL transaction; the result is then committed exactly once under the operation id.
+pub async fn reconcile_operation(
+    pool: &PgPool,
+    provider: &dyn BillingOperationProvider,
+    operation_id: &str,
+) -> Result<BillingOperation, BillingRecoveryError> {
+    let current = load_operation_by_id(pool, operation_id).await?;
+    if !matches!(
+        current.state,
+        BillingOperationState::Pending | BillingOperationState::Unknown
+    ) {
+        return Ok(current);
+    }
+    let resolution = provider.resolve(&current).await?;
+    let mut tx = pool.begin().await.map_err(BillingOperationError::from)?;
+    let resolved = match resolution {
+        ProviderResolution::Succeeded {
+            provider_operation_id,
+            result_code,
+        } => {
+            record_provider_result(
+                &mut tx,
+                operation_id,
+                BillingOperationState::Succeeded,
+                Some(&provider_operation_id),
+                Some(&result_code),
+            )
+            .await?
+        }
+        ProviderResolution::Failed {
+            provider_operation_id,
+            result_code,
+        } => {
+            record_provider_result(
+                &mut tx,
+                operation_id,
+                BillingOperationState::Failed,
+                provider_operation_id.as_deref(),
+                Some(&result_code),
+            )
+            .await?
+        }
+        ProviderResolution::Unknown { result_code } => {
+            record_provider_result(
+                &mut tx,
+                operation_id,
+                BillingOperationState::Unknown,
+                None,
+                result_code.as_deref(),
+            )
+            .await?
+        }
+    };
+    tx.commit().await.map_err(BillingOperationError::from)?;
+    Ok(resolved)
 }
 
 pub async fn load_reconciliation_candidates(
@@ -257,6 +445,21 @@ async fn load_operation(
     )
     .bind(operation_id)
     .fetch_one(&mut **tx)
+    .await?;
+    operation_from_row(row)
+}
+
+async fn load_operation_by_id(
+    pool: &PgPool,
+    operation_id: &str,
+) -> Result<BillingOperation, BillingOperationError> {
+    let row = sqlx::query(
+        "SELECT operation_id, idempotency_key, request_hash, actor_user_id, payer_id, \
+         beneficiary_id, offer, quote_version, quote_expires_at_epoch, provider_idempotency_key, \
+         provider_operation_id, state, result_code FROM billing_operations WHERE operation_id = $1",
+    )
+    .bind(operation_id)
+    .fetch_one(pool)
     .await?;
     operation_from_row(row)
 }
@@ -306,23 +509,33 @@ fn current_epoch() -> i64 {
         .as_secs() as i64
 }
 
+fn request_hash(actor_user_id: &str, offer: BillingOffer, quote_version: i64) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"sotto-billing-request-v1\0");
+    digest.update(actor_user_id.as_bytes());
+    digest.update([0]);
+    digest.update(offer.as_str().as_bytes());
+    digest.update([0]);
+    digest.update(quote_version.to_be_bytes());
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn request() -> BillingOperationRequest {
-        BillingOperationRequest {
-            operation_id: "op_1".into(),
-            idempotency_key: "idem_1".into(),
-            request_hash: "hash_1".into(),
-            actor_user_id: "user_1".into(),
-            payer_id: "payer_1".into(),
-            beneficiary_id: "person_1".into(),
-            offer: BillingOffer::StandardMonthly,
-            quote_version: 1,
-            quote_expires_at_epoch: 2_000_000_000,
-            provider_idempotency_key: "stripe-op-1".into(),
-        }
+        BillingOperationRequest::personal(
+            "user_1",
+            "idem_1",
+            BillingOffer::StandardMonthly,
+            1,
+            2_000_000_000,
+        )
     }
 
     #[test]
@@ -355,6 +568,23 @@ mod tests {
         assert!(matches!(
             BillingOperationState::parse("paid"),
             Err(BillingOperationError::CorruptState)
+        ));
+    }
+
+    #[test]
+    fn return_target_must_match_the_server_configuration_exactly() {
+        assert!(validate_return_url(
+            "https://app.sotto.test/billing",
+            "https://app.sotto.test/billing"
+        )
+        .is_ok());
+        assert!(matches!(
+            validate_return_url("https://app.sotto.test/billing", "https://evil.test"),
+            Err(BillingOperationError::UnauthorisedReturnUrl)
+        ));
+        assert!(matches!(
+            validate_return_url("", "https://evil.test"),
+            Err(BillingOperationError::UnauthorisedReturnUrl)
         ));
     }
 }
