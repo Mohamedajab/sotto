@@ -97,6 +97,7 @@ pub struct StripePriceObservation {
 }
 
 impl StripePriceObservation {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: impl Into<String>,
         account_id: impl Into<String>,
