@@ -1359,6 +1359,7 @@ pub struct StripePriceResource {
     pub unit_amount: Option<i64>,
     pub interval: Option<BillingInterval>,
     pub interval_count: Option<i64>,
+    pub usage_type: Option<String>,
 }
 
 impl StripePriceResource {
@@ -1378,6 +1379,7 @@ impl StripePriceResource {
             self.unit_amount,
             self.interval,
             self.interval_count,
+            self.usage_type.clone(),
         )
     }
 }
@@ -2276,6 +2278,18 @@ fn parse_price(value: &Value) -> Result<StripePriceResource, StripeReadError> {
             ))
         })
         .transpose()?;
+    let usage_type = recurring
+        .and_then(|recurring| recurring.get("usage_type"))
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+                .ok_or(StripeReadError::MalformedResponse(
+                    "price.recurring.usage_type",
+                ))
+        })
+        .transpose()?;
     Ok(StripePriceResource {
         id: required_id(value, "price.id")?,
         active: value
@@ -2290,6 +2304,7 @@ fn parse_price(value: &Value) -> Result<StripePriceResource, StripeReadError> {
         unit_amount: optional_i64(value.get("unit_amount"), "price.unit_amount")?,
         interval,
         interval_count,
+        usage_type,
     })
 }
 

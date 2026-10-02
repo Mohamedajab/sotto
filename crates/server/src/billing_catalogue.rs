@@ -114,6 +114,7 @@ pub struct StripePriceObservation {
     pub unit_amount: Option<i64>,
     pub interval: Option<BillingInterval>,
     pub interval_count: Option<i64>,
+    pub usage_type: Option<String>,
 }
 
 impl StripePriceObservation {
@@ -128,6 +129,7 @@ impl StripePriceObservation {
         unit_amount: Option<i64>,
         interval: Option<BillingInterval>,
         interval_count: Option<i64>,
+        usage_type: Option<String>,
     ) -> Self {
         Self {
             id: id.into(),
@@ -139,6 +141,7 @@ impl StripePriceObservation {
             unit_amount,
             interval,
             interval_count,
+            usage_type,
         }
     }
 }
@@ -332,6 +335,12 @@ fn validate_price(
             field: "interval_count",
         });
     }
+    if observation.usage_type.as_deref() != Some("licensed") {
+        return Err(BillingCatalogueError::MismatchedPrice {
+            offer,
+            field: "usage_type",
+        });
+    }
     Ok(BillingPrice {
         offer,
         provider_price_id: observation.id,
@@ -355,6 +364,7 @@ mod tests {
             Some(offer.expected_amount_pence()),
             Some(offer.expected_interval()),
             Some(1),
+            Some("licensed".into()),
         )
     }
 
@@ -432,6 +442,7 @@ mod tests {
             "unit_amount",
             "interval",
             "interval_count",
+            "usage_type",
             "livemode",
         ] {
             let mut invalid = observation(BillingOffer::StandardMonthly);
@@ -440,6 +451,7 @@ mod tests {
                 "unit_amount" => invalid.unit_amount = Some(1),
                 "interval" => invalid.interval = Some(BillingInterval::Year),
                 "interval_count" => invalid.interval_count = Some(2),
+                "usage_type" => invalid.usage_type = Some("metered".into()),
                 "livemode" => invalid.livemode = true,
                 _ => unreachable!(),
             }

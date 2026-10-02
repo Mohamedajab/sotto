@@ -193,7 +193,7 @@ fn monthly_price() -> Value {
         "currency":"gbp",
         "livemode":false,
         "unit_amount":299,
-        "recurring":{"interval":"month","interval_count":1}
+        "recurring":{"interval":"month","interval_count":1,"usage_type":"licensed"}
     })
 }
 
