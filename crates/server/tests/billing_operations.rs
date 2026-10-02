@@ -9,12 +9,14 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
+use tokio::sync::Notify;
+use tokio::time::{timeout, Duration};
 
 use sotto_server::billing_catalogue::BillingOffer;
 use sotto_server::billing_operations::{
     begin_personal_operation, load_reconciliation_candidates, reconcile_operation,
     record_provider_result, BeginOperation, BillingOperation, BillingOperationError,
-    BillingOperationProvider, BillingOperationState, ProviderResolution,
+    BillingOperationProvider, BillingOperationState, BillingRecoveryError, ProviderResolution,
 };
 use sotto_server::db;
 
@@ -132,6 +134,29 @@ async fn operation_identity_is_idempotent_and_conflicts_on_changed_request() {
 struct SuccessfulProvider {
     calls: Arc<AtomicUsize>,
     keys: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[derive(Clone)]
+struct BlockingProvider {
+    calls: Arc<AtomicUsize>,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl BillingOperationProvider for BlockingProvider {
+    async fn resolve(
+        &self,
+        _operation: &BillingOperation,
+    ) -> Result<ProviderResolution, BillingRecoveryError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(ProviderResolution::Succeeded {
+            provider_operation_id: "pi_concurrent_recovery".into(),
+            result_code: "paid".into(),
+        })
+    }
 }
 
 #[async_trait]
@@ -260,6 +285,73 @@ async fn unknown_provider_result_is_reconciled_after_restart() {
     assert_eq!(replayed.state, BillingOperationState::Succeeded);
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     assert_eq!(provider.keys.lock().expect("provider key lock").len(), 1);
+
+    cleanup(&pool, USER_ID).await;
+}
+
+#[tokio::test]
+async fn concurrent_recovery_claims_the_provider_call_once() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    const USER_ID: &str = "billing-operation-test-concurrent";
+    cleanup(&pool, USER_ID).await;
+    seed_user(&pool, USER_ID).await;
+
+    let mut tx = pool.begin().await.expect("begin operation transaction");
+    let operation_id = match begin_personal_operation(
+        &mut tx,
+        USER_ID,
+        "billing-operation-test-key",
+        BillingOffer::StandardMonthly,
+        1,
+        4_000_000_000,
+        "https://app.sotto.test/billing",
+        "https://app.sotto.test/billing",
+    )
+    .await
+    .expect("create operation")
+    {
+        BeginOperation::Created(operation) => operation.operation_id,
+        BeginOperation::AlreadyExists(_) => panic!("fixture operation unexpectedly existed"),
+    };
+    tx.commit().await.expect("commit operation identity");
+
+    let provider = BlockingProvider {
+        calls: Arc::new(AtomicUsize::new(0)),
+        entered: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+    };
+    let first_provider = provider.clone();
+    let first_pool = pool.clone();
+    let first_operation_id = operation_id.clone();
+    let first = tokio::spawn(async move {
+        reconcile_operation(&first_pool, &first_provider, &first_operation_id).await
+    });
+    timeout(Duration::from_secs(5), provider.entered.notified())
+        .await
+        .expect("first recovery entered provider");
+
+    let second_provider = provider.clone();
+    let second_pool = pool.clone();
+    let second_operation_id = operation_id.clone();
+    let second = tokio::spawn(async move {
+        reconcile_operation(&second_pool, &second_provider, &second_operation_id).await
+    });
+    assert!(matches!(
+        timeout(Duration::from_secs(5), second)
+            .await
+            .expect("second recovery completed")
+            .expect("second recovery task joined"),
+        Err(BillingRecoveryError::InProgress)
+    ));
+    provider.release.notify_one();
+    let resolved = first
+        .await
+        .expect("first recovery task joined")
+        .expect("first recovery succeeded");
+    assert_eq!(resolved.state, BillingOperationState::Succeeded);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
 
     cleanup(&pool, USER_ID).await;
 }
