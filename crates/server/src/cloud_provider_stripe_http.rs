@@ -1373,6 +1373,23 @@ impl StripePersonalInvoiceHistory {
     pub fn entries(&self) -> &[StripePersonalInvoiceHistoryEntry] {
         &self.entries
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        account_id: &str,
+        environment: ProviderEnvironment,
+        subscription_id: &str,
+        customer_id: &str,
+        entries: Vec<StripePersonalInvoiceHistoryEntry>,
+    ) -> Self {
+        Self {
+            account_id: account_id.into(),
+            environment,
+            subscription_id: subscription_id.into(),
+            customer_id: customer_id.into(),
+            entries,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -99,6 +99,45 @@ impl StripeRepairCandidate {
     pub(crate) fn interval(&self) -> StripeInterval {
         self.interval
     }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_test(
+        event_id: &str,
+        event_created_at: i64,
+        account_id: &str,
+        environment: ProviderEnvironment,
+        customer_id: &str,
+        subscription_id: &str,
+        provider_item_id: &str,
+        allocation_reference: &str,
+        invoice_id: &str,
+        invoice_line_id: &str,
+        period_start: i64,
+        period_end: i64,
+        interval: StripeInterval,
+    ) -> Self {
+        Self {
+            provenance: StripeRepairProvenance {
+                event_id: event_id.into(),
+                event_created_at,
+                api_version: crate::billing::STRIPE_API_VERSION.into(),
+                account_id: account_id.into(),
+                environment,
+                payload_hash: "0".repeat(64),
+                retrieved_at: event_created_at,
+            },
+            invoice_id: invoice_id.into(),
+            invoice_line_id: invoice_line_id.into(),
+            customer_id: customer_id.into(),
+            subscription_id: subscription_id.into(),
+            provider_item_id: provider_item_id.into(),
+            allocation_reference: allocation_reference.into(),
+            period_start,
+            period_end,
+            interval,
+        }
+    }
 }
 
 #[derive(Debug, Error)]
