@@ -286,6 +286,7 @@ pub(crate) async fn begin_operation(
 
 /// Lock the authenticated personal payer/beneficiary before persisting the operation identity.
 /// Organisation and sponsored operations will use their own role-checked lock ordering.
+#[allow(clippy::too_many_arguments)]
 pub async fn begin_personal_operation(
     tx: &mut Transaction<'_, Postgres>,
     actor_user_id: &str,
@@ -318,6 +319,7 @@ pub async fn begin_personal_operation(
 /// Lock the organisation before its membership, then persist a billing operation for an owner or
 /// administrator. This lock order matches other organisation writes and keeps role changes from
 /// racing a checkout identity.
+#[allow(clippy::too_many_arguments)]
 pub async fn begin_organization_operation(
     tx: &mut Transaction<'_, Postgres>,
     actor_user_id: &str,
