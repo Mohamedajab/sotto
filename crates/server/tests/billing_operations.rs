@@ -352,6 +352,34 @@ async fn concurrent_recovery_claims_the_provider_call_once() {
     };
     tx.commit().await.expect("commit operation identity");
 
+    assert!(matches!(
+        reconcile_operation(
+            &pool,
+            &SuccessfulProvider {
+                calls: Arc::new(AtomicUsize::new(0)),
+                keys: Arc::new(std::sync::Mutex::new(Vec::new())),
+            },
+            &operation_id
+        )
+        .await,
+        Err(BillingRecoveryError::InProgress)
+    ));
+
+    let mut unknown_tx = pool
+        .begin()
+        .await
+        .expect("begin unknown result transaction");
+    record_provider_result(
+        &mut unknown_tx,
+        &operation_id,
+        BillingOperationState::Unknown,
+        None,
+        Some("provider_timeout"),
+    )
+    .await
+    .expect("record unknown provider result");
+    unknown_tx.commit().await.expect("commit unknown result");
+
     let provider = BlockingProvider {
         calls: Arc::new(AtomicUsize::new(0)),
         entered: Arc::new(Notify::new()),
@@ -426,6 +454,27 @@ async fn organisation_operations_require_role_and_active_lifecycle() {
         .rollback()
         .await
         .expect("rollback member operation");
+
+    let mut owner_active_tx = pool.begin().await.expect("begin active owner transaction");
+    assert!(matches!(
+        begin_organization_operation(
+            &mut owner_active_tx,
+            OWNER_ID,
+            ORGANIZATION_ID,
+            "owner-active-key",
+            BillingOffer::StandardMonthly,
+            1,
+            4_000_000_000,
+            "https://app.sotto.test/billing",
+            "https://app.sotto.test/billing",
+        )
+        .await,
+        Ok(BeginOperation::Created(_))
+    ));
+    owner_active_tx
+        .rollback()
+        .await
+        .expect("rollback active owner operation");
 
     sqlx::query("UPDATE organizations SET lifecycle_state = 'deleting' WHERE id = $1")
         .bind(ORGANIZATION_ID)
