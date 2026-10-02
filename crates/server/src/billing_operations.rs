@@ -208,6 +208,8 @@ pub enum BillingOperationError {
     NotPending,
     #[error("billing operation actor is not authorised")]
     Unauthorised,
+    #[error("organisation billing is unavailable while its lifecycle is not active")]
+    OrganisationNotActive,
     #[error("billing operation return URL is not authorised")]
     UnauthorisedReturnUrl,
     #[error("billing operation provider result conflicts with its recorded result")]
@@ -233,6 +235,9 @@ impl From<BillingOperationError> for Error {
             }
             BillingOperationError::Unauthorised => {
                 Self::Forbidden("billing operation is not authorised for this account".into())
+            }
+            BillingOperationError::OrganisationNotActive => {
+                Self::Conflict("organisation billing is unavailable during deletion".into())
             }
             BillingOperationError::UnauthorisedReturnUrl => {
                 Self::BadRequest("billing return URL is not authorised".into())
@@ -356,13 +361,16 @@ pub async fn begin_organization_operation(
     requested_return_url: &str,
 ) -> Result<BeginOperation, BillingOperationError> {
     validate_return_url(configured_return_url, requested_return_url)?;
-    let organization_exists: Option<String> =
-        sqlx::query_scalar("SELECT id FROM organizations WHERE id = $1 FOR UPDATE")
+    let lifecycle: Option<String> =
+        sqlx::query_scalar("SELECT lifecycle_state FROM organizations WHERE id = $1 FOR UPDATE")
             .bind(organization_id)
             .fetch_optional(&mut **tx)
             .await?;
-    if organization_exists.is_none() {
+    let Some(lifecycle) = lifecycle else {
         return Err(BillingOperationError::Unauthorised);
+    };
+    if lifecycle != "active" {
+        return Err(BillingOperationError::OrganisationNotActive);
     }
     let role: Option<String> = sqlx::query_scalar(
         "SELECT role FROM organization_memberships WHERE org_id = $1 AND user_id = $2 FOR UPDATE",
@@ -420,7 +428,7 @@ pub async fn record_provider_result(
     }
     let result = sqlx::query(
         "UPDATE billing_operations SET state = $2, provider_operation_id = COALESCE($3, provider_operation_id), \
-         result_code = $4, updated_at = now() WHERE operation_id = $1 AND state IN ('pending','unknown') \
+         result_code = $4, updated_at = now() WHERE operation_id = $1 AND state = 'pending' \
          RETURNING operation_id",
     )
     .bind(operation_id)
