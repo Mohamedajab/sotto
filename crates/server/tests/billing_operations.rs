@@ -24,25 +24,26 @@ async fn pool_or_skip() -> Option<PgPool> {
     Some(pool)
 }
 
-async fn cleanup(pool: &PgPool) {
-    sqlx::query(
-        "DELETE FROM billing_operations WHERE actor_user_id = 'billing-operation-test-user'",
-    )
-    .execute(pool)
-    .await
-    .expect("clean billing operation fixtures");
-    sqlx::query("DELETE FROM users WHERE id = 'billing-operation-test-user'")
+async fn cleanup(pool: &PgPool, user_id: &str) {
+    sqlx::query("DELETE FROM billing_operations WHERE actor_user_id = $1")
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("clean billing operation fixtures");
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
         .execute(pool)
         .await
         .expect("clean billing operation user fixture");
 }
 
-async fn seed_user(pool: &PgPool) {
+async fn seed_user(pool: &PgPool, user_id: &str) {
     sqlx::query(
-        "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES \
-         ('billing-operation-test-user', 'billing-operation-test', 'billing-operation-test-user') \
+        "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, $2, $1) \
          ON CONFLICT (id) DO NOTHING",
     )
+    .bind(user_id)
+    .bind(format!("billing-operation-test-{user_id}"))
     .execute(pool)
     .await
     .expect("seed billing operation user fixture");
@@ -53,13 +54,14 @@ async fn operation_identity_is_idempotent_and_conflicts_on_changed_request() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    cleanup(&pool).await;
-    seed_user(&pool).await;
+    const USER_ID: &str = "billing-operation-test-idempotency";
+    cleanup(&pool, USER_ID).await;
+    seed_user(&pool, USER_ID).await;
 
     let mut tx = pool.begin().await.expect("begin operation transaction");
     let first_operation_id = match begin_personal_operation(
         &mut tx,
-        "billing-operation-test-user",
+        USER_ID,
         "billing-operation-test-key",
         BillingOffer::StandardMonthly,
         1,
@@ -80,7 +82,7 @@ async fn operation_identity_is_idempotent_and_conflicts_on_changed_request() {
     assert!(matches!(
         begin_personal_operation(
             &mut replay_tx,
-            "billing-operation-test-user",
+            USER_ID,
             "billing-operation-test-key",
             BillingOffer::StandardMonthly,
             1,
@@ -96,7 +98,7 @@ async fn operation_identity_is_idempotent_and_conflicts_on_changed_request() {
     assert!(matches!(
         begin_personal_operation(
             &mut conflict_tx,
-            "billing-operation-test-user",
+            USER_ID,
             "billing-operation-test-key",
             BillingOffer::StandardAnnual,
             1,
@@ -107,7 +109,7 @@ async fn operation_identity_is_idempotent_and_conflicts_on_changed_request() {
     ));
     conflict_tx.rollback().await.expect("rollback conflict");
 
-    cleanup(&pool).await;
+    cleanup(&pool, USER_ID).await;
 }
 
 struct SuccessfulProvider;
@@ -130,13 +132,14 @@ async fn unknown_provider_result_is_reconciled_after_restart() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    cleanup(&pool).await;
-    seed_user(&pool).await;
+    const USER_ID: &str = "billing-operation-test-recovery";
+    cleanup(&pool, USER_ID).await;
+    seed_user(&pool, USER_ID).await;
 
     let mut tx = pool.begin().await.expect("begin operation transaction");
     let operation_id = match begin_personal_operation(
         &mut tx,
-        "billing-operation-test-user",
+        USER_ID,
         "billing-operation-test-key",
         BillingOffer::StandardMonthly,
         1,
@@ -221,5 +224,5 @@ async fn unknown_provider_result_is_reconciled_after_restart() {
         .expect("load resolved candidates")
         .is_empty());
 
-    cleanup(&pool).await;
+    cleanup(&pool, USER_ID).await;
 }
