@@ -119,11 +119,12 @@ impl BillingOperationRequest {
             &beneficiary_id,
             offer,
             quote_version,
+            quote_expires_at_epoch,
         );
         let operation_id = format!("billing:{}", Uuid::new_v4());
         let provider_idempotency_key = format!(
             "sotto-billing:{}",
-            identity_hash(&[&actor_user_id, &idempotency_key])
+            identity_hash(&[&actor_user_id, &payer_id, &beneficiary_id, &idempotency_key])
         );
         Self {
             operation_id,
@@ -140,6 +141,11 @@ impl BillingOperationRequest {
     }
 
     pub fn validate(&self, now_epoch: i64) -> Result<(), BillingOperationError> {
+        self.validate_identity()?;
+        self.ensure_unexpired(now_epoch)
+    }
+
+    fn validate_identity(&self) -> Result<(), BillingOperationError> {
         for (value, field) in [
             (&self.operation_id, "operation_id"),
             (&self.idempotency_key, "idempotency_key"),
@@ -156,6 +162,10 @@ impl BillingOperationRequest {
         if self.quote_version < 1 {
             return Err(BillingOperationError::InvalidField("quote_version"));
         }
+        Ok(())
+    }
+
+    fn ensure_unexpired(&self, now_epoch: i64) -> Result<(), BillingOperationError> {
         if self.quote_expires_at_epoch <= now_epoch {
             return Err(BillingOperationError::QuoteExpired);
         }
@@ -244,7 +254,13 @@ pub(crate) async fn begin_operation(
     tx: &mut Transaction<'_, Postgres>,
     request: &BillingOperationRequest,
 ) -> Result<BeginOperation, BillingOperationError> {
-    request.validate(current_epoch())?;
+    request.validate_identity()?;
+    if let Some(existing) =
+        load_by_idempotency(tx, &request.actor_user_id, &request.idempotency_key).await?
+    {
+        return compare_existing(request, existing);
+    }
+    request.ensure_unexpired(current_epoch())?;
     let inserted = sqlx::query(
         "INSERT INTO billing_operations (operation_id, idempotency_key, request_hash, actor_user_id, \
          payer_id, beneficiary_id, offer, quote_version, quote_expires_at_epoch, \
@@ -272,9 +288,17 @@ pub(crate) async fn begin_operation(
     let existing = load_by_idempotency(tx, &request.actor_user_id, &request.idempotency_key)
         .await?
         .ok_or(BillingOperationError::CorruptState)?;
+    compare_existing(request, existing)
+}
+
+fn compare_existing(
+    request: &BillingOperationRequest,
+    existing: BillingOperation,
+) -> Result<BeginOperation, BillingOperationError> {
     if existing.request_hash != request.request_hash
         || existing.offer != request.offer.as_str()
         || existing.quote_version != request.quote_version
+        || existing.quote_expires_at_epoch != request.quote_expires_at_epoch
         || existing.payer_id != request.payer_id
         || existing.beneficiary_id != request.beneficiary_id
         || existing.provider_idempotency_key != request.provider_idempotency_key
@@ -616,14 +640,17 @@ fn request_hash(
     beneficiary_id: &str,
     offer: BillingOffer,
     quote_version: i64,
+    quote_expires_at_epoch: i64,
 ) -> String {
     let quote_version = quote_version.to_string();
+    let quote_expires_at_epoch = quote_expires_at_epoch.to_string();
     identity_hash(&[
         actor_user_id,
         payer_id,
         beneficiary_id,
         offer.as_str(),
         &quote_version,
+        &quote_expires_at_epoch,
     ])
 }
 
