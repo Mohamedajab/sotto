@@ -286,8 +286,11 @@ impl StripePublicationAuthority {
         }
         if let Some(effective_at) = early_termination {
             for interval in &mut paid_intervals {
-                interval.paid_until = interval.paid_until.min(effective_at);
-                if interval.paid_until <= interval.starts_at {
+                let original_paid_until = interval.paid_until;
+                interval.paid_until = original_paid_until.min(effective_at);
+                if interval.paid_until != original_paid_until
+                    || interval.paid_until <= interval.starts_at
+                {
                     interval.failed_renewal_id = None;
                 }
             }
@@ -680,6 +683,25 @@ mod tests {
         };
         let authority = StripePublicationAuthority::from_facts(input).unwrap();
         assert_eq!(authority.coverage().paid_intervals[0].paid_until, 50);
+
+        let mut input = facts(vec![StripeAuthorityRenewal {
+            renewal_id: "renewal-terminated".into(),
+            evidence_reference: "event:renewal-terminated".into(),
+            predecessor_invoice_id: "invoice-paid".into(),
+            predecessor_period_end: 100,
+            renewal_period_start: 100,
+            automatic_cycle: true,
+            state: StripeAuthorityRenewalState::Open,
+        }]);
+        input.cancellation = StripeAuthorityCancellation::ConfirmedEarlyTermination {
+            effective_at: 50,
+            evidence_reference: "event:termination".into(),
+        };
+        let authority = StripePublicationAuthority::from_facts(input).unwrap();
+        assert_eq!(
+            authority.coverage().paid_intervals[0].failed_renewal_id,
+            None
+        );
     }
 
     #[test]
