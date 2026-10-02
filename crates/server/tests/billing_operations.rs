@@ -66,6 +66,8 @@ async fn operation_identity_is_idempotent_and_conflicts_on_changed_request() {
         BillingOffer::StandardMonthly,
         1,
         4_000_000_000,
+        "https://app.sotto.test/billing",
+        "https://app.sotto.test/billing",
     )
     .await
     .expect("create operation")
@@ -87,6 +89,8 @@ async fn operation_identity_is_idempotent_and_conflicts_on_changed_request() {
             BillingOffer::StandardMonthly,
             1,
             4_000_000_000,
+            "https://app.sotto.test/billing",
+            "https://app.sotto.test/billing",
         )
             .await
             .expect("replay operation"),
@@ -103,6 +107,8 @@ async fn operation_identity_is_idempotent_and_conflicts_on_changed_request() {
             BillingOffer::StandardAnnual,
             1,
             4_000_000_000,
+            "https://app.sotto.test/billing",
+            "https://app.sotto.test/billing",
         )
         .await,
         Err(BillingOperationError::IdempotencyConflict)
@@ -144,6 +150,8 @@ async fn unknown_provider_result_is_reconciled_after_restart() {
         BillingOffer::StandardMonthly,
         1,
         4_000_000_000,
+        "https://app.sotto.test/billing",
+        "https://app.sotto.test/billing",
     )
     .await
     .expect("create operation")

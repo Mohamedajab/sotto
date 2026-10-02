@@ -70,7 +70,56 @@ impl BillingOperationRequest {
     ) -> Self {
         let actor_user_id = actor_user_id.into();
         let idempotency_key = idempotency_key.into();
-        let request_hash = request_hash(&actor_user_id, offer, quote_version);
+        Self::from_parts(
+            actor_user_id.clone(),
+            idempotency_key,
+            actor_user_id.clone(),
+            actor_user_id,
+            offer,
+            quote_version,
+            quote_expires_at_epoch,
+        )
+    }
+
+    /// Build an organisation operation after the caller has proved membership in the
+    /// organisation. The actor remains part of the request identity so two administrators cannot
+    /// accidentally share a provider operation key for the same client idempotency key.
+    pub fn organization(
+        actor_user_id: impl Into<String>,
+        organization_id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        offer: BillingOffer,
+        quote_version: i64,
+        quote_expires_at_epoch: i64,
+    ) -> Self {
+        let organization_id = organization_id.into();
+        Self::from_parts(
+            actor_user_id.into(),
+            idempotency_key.into(),
+            organization_id.clone(),
+            organization_id,
+            offer,
+            quote_version,
+            quote_expires_at_epoch,
+        )
+    }
+
+    fn from_parts(
+        actor_user_id: String,
+        idempotency_key: String,
+        payer_id: String,
+        beneficiary_id: String,
+        offer: BillingOffer,
+        quote_version: i64,
+        quote_expires_at_epoch: i64,
+    ) -> Self {
+        let request_hash = request_hash(
+            &actor_user_id,
+            &payer_id,
+            &beneficiary_id,
+            offer,
+            quote_version,
+        );
         let operation_id = format!("billing:{}", Uuid::new_v4());
         let provider_idempotency_key = format!(
             "sotto-billing:{}",
@@ -80,9 +129,9 @@ impl BillingOperationRequest {
             operation_id,
             idempotency_key,
             request_hash,
-            actor_user_id: actor_user_id.clone(),
-            payer_id: actor_user_id.clone(),
-            beneficiary_id: actor_user_id,
+            actor_user_id,
+            payer_id,
+            beneficiary_id,
             offer,
             quote_version,
             quote_expires_at_epoch,
@@ -244,7 +293,10 @@ pub async fn begin_personal_operation(
     offer: BillingOffer,
     quote_version: i64,
     quote_expires_at_epoch: i64,
+    configured_return_url: &str,
+    requested_return_url: &str,
 ) -> Result<BeginOperation, BillingOperationError> {
+    validate_return_url(configured_return_url, requested_return_url)?;
     let exists: Option<String> =
         sqlx::query_scalar("SELECT id FROM users WHERE id = $1 FOR UPDATE")
             .bind(actor_user_id)
@@ -255,6 +307,50 @@ pub async fn begin_personal_operation(
     }
     let request = BillingOperationRequest::personal(
         actor_user_id,
+        idempotency_key,
+        offer,
+        quote_version,
+        quote_expires_at_epoch,
+    );
+    begin_operation(tx, &request).await
+}
+
+/// Lock the organisation before its membership, then persist a billing operation for an owner or
+/// administrator. This lock order matches other organisation writes and keeps role changes from
+/// racing a checkout identity.
+pub async fn begin_organization_operation(
+    tx: &mut Transaction<'_, Postgres>,
+    actor_user_id: &str,
+    organization_id: &str,
+    idempotency_key: &str,
+    offer: BillingOffer,
+    quote_version: i64,
+    quote_expires_at_epoch: i64,
+    configured_return_url: &str,
+    requested_return_url: &str,
+) -> Result<BeginOperation, BillingOperationError> {
+    validate_return_url(configured_return_url, requested_return_url)?;
+    let organization_exists: Option<String> =
+        sqlx::query_scalar("SELECT id FROM organizations WHERE id = $1 FOR UPDATE")
+            .bind(organization_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    if organization_exists.is_none() {
+        return Err(BillingOperationError::Unauthorised);
+    }
+    let role: Option<String> = sqlx::query_scalar(
+        "SELECT role FROM organization_memberships WHERE org_id = $1 AND user_id = $2 FOR UPDATE",
+    )
+    .bind(organization_id)
+    .bind(actor_user_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if !matches!(role.as_deref(), Some("owner" | "admin")) {
+        return Err(BillingOperationError::Unauthorised);
+    }
+    let request = BillingOperationRequest::organization(
+        actor_user_id,
+        organization_id,
         idempotency_key,
         offer,
         quote_version,
@@ -512,9 +608,21 @@ fn current_epoch() -> i64 {
         .as_secs() as i64
 }
 
-fn request_hash(actor_user_id: &str, offer: BillingOffer, quote_version: i64) -> String {
+fn request_hash(
+    actor_user_id: &str,
+    payer_id: &str,
+    beneficiary_id: &str,
+    offer: BillingOffer,
+    quote_version: i64,
+) -> String {
     let quote_version = quote_version.to_string();
-    identity_hash(&[actor_user_id, offer.as_str(), &quote_version])
+    identity_hash(&[
+        actor_user_id,
+        payer_id,
+        beneficiary_id,
+        offer.as_str(),
+        &quote_version,
+    ])
 }
 
 fn identity_hash(parts: &[&str]) -> String {
