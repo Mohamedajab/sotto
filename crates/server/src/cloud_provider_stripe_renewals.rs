@@ -18,6 +18,7 @@ use crate::cloud_provider_stripe::{
 use crate::cloud_provider_stripe_http::{
     StripePersonalInvoiceHistory, StripePersonalInvoiceHistoryEntry,
 };
+use crate::cloud_provider_stripe_repair::StripeRepairCandidate;
 
 /// A complete historical failure linked to the paid term immediately before it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -659,6 +660,89 @@ pub fn decode_personal_renewal_failure(
         renewal_period_end,
         event_created_at,
         interval: expected_interval,
+    };
+    evidence.evidence_reference = evidence_reference(&evidence);
+    Ok(StripeRenewalFailureResult::Linked(Box::new(evidence)))
+}
+
+/// Link an authenticated repair candidate to exactly one previously paid predecessor.
+///
+/// The API event proves the failed renewal shape and its transport identity; only this bounded
+/// history join may supply predecessor provenance. A missing or ambiguous predecessor remains
+/// `NeedsEvidence` and never creates a partial renewal record.
+#[allow(dead_code)]
+pub(crate) fn link_repaired_candidate(
+    candidate: &StripeRepairCandidate,
+    config: &StripeCoverageConfig,
+    binding: &StripeAllocationBinding,
+    history: &StripePersonalInvoiceHistory,
+) -> Result<StripeRenewalFailureResult, StripeContractError> {
+    config.validate()?;
+    let provenance = candidate.provenance();
+    if provenance.account_id() != config.account_id
+        || provenance.environment() != config.environment
+        || history.account_id() != config.account_id
+        || history.environment() != config.environment
+        || candidate.customer_id() != binding.customer_id()
+        || candidate.subscription_id() != binding.subscription_id()
+        || candidate.provider_item_id() != binding.provider_item_id()
+        || candidate.allocation_reference() != binding.allocation_reference()
+    {
+        return Err(StripeContractError::ContextMismatch);
+    }
+    let mut candidates = history
+        .entries()
+        .iter()
+        .filter_map(|entry| match entry {
+            StripePersonalInvoiceHistoryEntry::Paid(term)
+                if term.invoice_id() != candidate.invoice_id()
+                    && term.allocation_reference() == binding.allocation_reference()
+                    && term.customer_id() == binding.customer_id()
+                    && term.subscription_id() == binding.subscription_id()
+                    && term.provider_item_id() == binding.provider_item_id()
+                    && term.interval() == candidate.interval()
+                    && term.period_end() == candidate.period_start() =>
+            {
+                Some(term)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.invoice_id().cmp(right.invoice_id()));
+    candidates.dedup_by(|left, right| left.invoice_id() == right.invoice_id());
+    let term = match candidates.as_slice() {
+        [] => {
+            return Ok(StripeRenewalFailureResult::NeedsEvidence(
+                StripeRenewalFailureNeedsEvidence::NoMatchingPaidPredecessor,
+            ));
+        }
+        [term] => *term,
+        _ => {
+            return Ok(StripeRenewalFailureResult::NeedsEvidence(
+                StripeRenewalFailureNeedsEvidence::AmbiguousPaidPredecessor,
+            ));
+        }
+    };
+    let mut evidence = StripeRenewalFailureEvidence {
+        evidence_reference: String::new(),
+        renewal_id: renewal_identity(config, binding, candidate.invoice_id()),
+        event_id: provenance.event_id().to_owned(),
+        invoice_id: candidate.invoice_id().to_owned(),
+        invoice_line_id: candidate.invoice_line_id().to_owned(),
+        predecessor_invoice_id: term.invoice_id().to_owned(),
+        predecessor_evidence_reference: term.evidence_reference().to_owned(),
+        provider_account_id: config.account_id.clone(),
+        environment: config.environment,
+        allocation_reference: binding.allocation_reference().to_owned(),
+        customer_id: candidate.customer_id().to_owned(),
+        subscription_id: candidate.subscription_id().to_owned(),
+        provider_item_id: candidate.provider_item_id().to_owned(),
+        predecessor_period_start: term.period_start(),
+        predecessor_period_end: term.period_end(),
+        renewal_period_start: candidate.period_start(),
+        renewal_period_end: candidate.period_end(),
+        event_created_at: provenance.event_created_at(),
+        interval: candidate.interval(),
     };
     evidence.evidence_reference = evidence_reference(&evidence);
     Ok(StripeRenewalFailureResult::Linked(Box::new(evidence)))
