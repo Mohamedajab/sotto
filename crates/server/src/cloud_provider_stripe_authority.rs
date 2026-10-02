@@ -409,7 +409,7 @@ fn validate_metadata(facts: &StripeAuthorityFacts) -> Result<(), StripeAuthority
             "allocation reference",
         ));
     }
-    if facts.invalidation_generation <= 0 {
+    if facts.invalidation_generation < 0 {
         return Err(StripeAuthorityError::InvalidMetadata(
             "invalidation generation",
         ));
@@ -623,6 +623,10 @@ mod tests {
         let mut changed = source("source-a");
         changed.generation = 2;
         assert!(!authority.is_current(50, 1, &[changed]));
+
+        let mut baseline = facts(vec![]);
+        baseline.invalidation_generation = 0;
+        assert!(StripePublicationAuthority::from_facts(baseline).is_ok());
     }
 
     #[test]
