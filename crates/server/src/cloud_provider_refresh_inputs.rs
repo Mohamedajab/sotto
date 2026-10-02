@@ -38,7 +38,7 @@ pub async fn load(
     let row = sqlx::query(
         "SELECT receipt.event_type, receipt.provider_created_at, receipt.subscription_id, \
                 receipt.allocation_reference, receipt.normalized_payload_hash, receipt.status, \
-                allocation.payer_id, allocation.provider_customer_id, payer.payer_kind, \
+                allocation.payer_id, payer.provider_customer_id, payer.payer_kind, \
                 allocation.provider_subscription_id, allocation.provider_item_id, \
                 allocation.external_allocation_reference, allocation.effective_from, \
                 allocation.effective_until, allocation.state, allocation.ownership_evidence_reference \
