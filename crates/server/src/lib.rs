@@ -30,6 +30,8 @@ pub mod cloud_provider;
 pub mod cloud_provider_refresh;
 #[doc(hidden)]
 pub mod cloud_provider_refresh_jobs;
+#[doc(hidden)]
+pub mod cloud_provider_refresh_worker;
 pub mod cloud_provider_stripe;
 #[doc(hidden)]
 pub mod cloud_provider_stripe_authority;
