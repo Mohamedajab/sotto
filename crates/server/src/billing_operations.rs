@@ -432,6 +432,7 @@ pub async fn record_provider_result(
         "UPDATE billing_operations SET state = $2, provider_operation_id = COALESCE($3, provider_operation_id), \
          result_code = $4, reconciliation_lease_token = NULL, reconciliation_lease_until = NULL, updated_at = now() \
          WHERE operation_id = $1 AND state = 'pending' \
+         AND reconciliation_lease_token LIKE 'creator:%' \
          RETURNING operation_id",
     )
     .bind(operation_id)
