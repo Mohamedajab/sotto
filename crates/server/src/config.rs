@@ -1,5 +1,6 @@
 //! Server configuration, read from the environment.
 
+pub use crate::billing_catalogue::BillingPriceIds;
 use crate::error::{Error, Result};
 
 /// Identifies who operates this server. This is deployment metadata, not an entitlement.
@@ -122,16 +123,6 @@ pub struct BillingConfig {
     pub price_catalogue: Option<BillingPriceIds>,
     /// Where Stripe-hosted pages send the browser back to (the web app origin).
     pub return_url: String,
-}
-
-/// Provider price ids for the hosted personal Cloud offer. Amounts and recurrence are validated
-/// against authenticated Stripe Price objects before a catalogue is usable.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BillingPriceIds {
-    pub standard_monthly: String,
-    pub standard_annual: String,
-    pub founding_monthly: String,
-    pub founding_annual: String,
 }
 
 /// GitHub OAuth application credentials and the server's public origin.

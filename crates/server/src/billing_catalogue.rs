@@ -11,6 +11,26 @@ use thiserror::Error;
 
 use crate::cloud_provider::ProviderEnvironment;
 
+/// Provider price ids configured by the operator for the four hosted offers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BillingPriceIds {
+    pub standard_monthly: String,
+    pub standard_annual: String,
+    pub founding_monthly: String,
+    pub founding_annual: String,
+}
+
+impl BillingPriceIds {
+    pub fn id_for(&self, offer: BillingOffer) -> &str {
+        match offer {
+            BillingOffer::StandardMonthly => &self.standard_monthly,
+            BillingOffer::StandardAnnual => &self.standard_annual,
+            BillingOffer::FoundingMonthly => &self.founding_monthly,
+            BillingOffer::FoundingAnnual => &self.founding_annual,
+        }
+    }
+}
+
 pub const STANDARD_MONTHLY_PENCE: i64 = 299;
 pub const STANDARD_ANNUAL_PENCE: i64 = 2_999;
 pub const FOUNDING_MONTHLY_PENCE: i64 = 199;
@@ -161,6 +181,7 @@ impl BillingPriceCatalogue {
     pub fn from_provider_prices(
         account_id: impl Into<String>,
         environment: ProviderEnvironment,
+        configured_ids: &BillingPriceIds,
         observations: impl IntoIterator<Item = (BillingOffer, StripePriceObservation)>,
     ) -> Result<Self, BillingCatalogueError> {
         let account_id = account_id.into();
@@ -173,7 +194,13 @@ impl BillingPriceCatalogue {
             if prices
                 .insert(
                     offer,
-                    validate_price(offer, &account_id, environment, observation)?,
+                    validate_price(
+                        offer,
+                        &account_id,
+                        environment,
+                        configured_ids.id_for(offer),
+                        observation,
+                    )?,
                 )
                 .is_some()
             {
@@ -241,10 +268,20 @@ fn validate_price(
     offer: BillingOffer,
     account_id: &str,
     environment: ProviderEnvironment,
+    configured_id: &str,
     observation: StripePriceObservation,
 ) -> Result<BillingPrice, BillingCatalogueError> {
+    if configured_id.trim().is_empty() {
+        return Err(BillingCatalogueError::InvalidPrice {
+            offer,
+            field: "configured_id",
+        });
+    }
     if observation.id.trim().is_empty() {
         return Err(BillingCatalogueError::InvalidPrice { offer, field: "id" });
+    }
+    if observation.id != configured_id {
+        return Err(BillingCatalogueError::MismatchedPrice { offer, field: "id" });
     }
     if observation.account_id != account_id {
         return Err(BillingCatalogueError::MismatchedPrice {
@@ -325,6 +362,12 @@ mod tests {
         BillingPriceCatalogue::from_provider_prices(
             "acct_test",
             ProviderEnvironment::Test,
+            &BillingPriceIds {
+                standard_monthly: "price_standard_monthly".into(),
+                standard_annual: "price_standard_annual".into(),
+                founding_monthly: "price_founding_monthly".into(),
+                founding_annual: "price_founding_annual".into(),
+            },
             BillingOffer::ALL
                 .into_iter()
                 .map(|offer| (offer, observation(offer))),
@@ -362,6 +405,27 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_price_that_is_not_the_configured_id() {
+        let mut invalid = observation(BillingOffer::StandardMonthly);
+        invalid.id = "price_unconfigured".into();
+        let result = BillingPriceCatalogue::from_provider_prices(
+            "acct_test",
+            ProviderEnvironment::Test,
+            &BillingPriceIds {
+                standard_monthly: "price_standard_monthly".into(),
+                standard_annual: "price_standard_annual".into(),
+                founding_monthly: "price_founding_monthly".into(),
+                founding_annual: "price_founding_annual".into(),
+            },
+            [(BillingOffer::StandardMonthly, invalid)],
+        );
+        assert!(matches!(
+            result,
+            Err(BillingCatalogueError::MismatchedPrice { field: "id", .. })
+        ));
+    }
+
+    #[test]
     fn rejects_wrong_currency_amount_recurrence_or_mode() {
         for field in [
             "currency",
@@ -382,6 +446,12 @@ mod tests {
             let result = BillingPriceCatalogue::from_provider_prices(
                 "acct_test",
                 ProviderEnvironment::Test,
+                &BillingPriceIds {
+                    standard_monthly: "price_standard_monthly".into(),
+                    standard_annual: "price_standard_annual".into(),
+                    founding_monthly: "price_founding_monthly".into(),
+                    founding_annual: "price_founding_annual".into(),
+                },
                 [(BillingOffer::StandardMonthly, invalid)],
             );
             assert!(
@@ -396,6 +466,12 @@ mod tests {
         let result = BillingPriceCatalogue::from_provider_prices(
             "acct_test",
             ProviderEnvironment::Test,
+            &BillingPriceIds {
+                standard_monthly: "price_standard_monthly".into(),
+                standard_annual: "price_standard_annual".into(),
+                founding_monthly: "price_founding_monthly".into(),
+                founding_annual: "price_founding_annual".into(),
+            },
             [(
                 BillingOffer::StandardMonthly,
                 observation(BillingOffer::StandardMonthly),
