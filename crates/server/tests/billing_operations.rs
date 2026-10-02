@@ -3,7 +3,8 @@
 //! These tests are opt-in because they create and remove rows in a disposable Postgres database.
 
 use async_trait::async_trait;
-use sqlx::PgPool;
+use sqlx::{postgres::PgConnectOptions, PgPool};
+use std::str::FromStr;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -23,6 +24,12 @@ async fn pool_or_skip() -> Option<PgPool> {
         return None;
     }
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL for opted-in database tests");
+    let options = PgConnectOptions::from_str(&url).expect("parse DATABASE_URL");
+    assert!(
+        matches!(options.get_host(), "localhost" | "127.0.0.1" | "::1"),
+        "refusing billing operation tests against non-local host: {}",
+        options.get_host()
+    );
     let pool = db::connect(&url).await.expect("connect to test database");
     db::migrate(&pool).await.expect("apply migrations");
     Some(pool)
