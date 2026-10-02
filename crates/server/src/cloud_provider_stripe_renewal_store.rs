@@ -439,7 +439,8 @@ pub async fn accept_personal_renewal_failure(
           renewal_period_start, renewal_period_end, event_created_at, interval, accepted_generation) \
          VALUES ('stripe', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
                  $16, $17, $18, $19, $20, $21, $22, $23, $24) \
-         ON CONFLICT DO NOTHING",
+         ON CONFLICT (provider_namespace, provider_account_id, provider_environment, event_id) \
+         DO NOTHING",
     )
     .bind(evidence.provider_account_id())
     .bind(evidence.environment().as_str())
@@ -487,15 +488,7 @@ pub async fn accept_personal_renewal_failure(
             .await
         }
         Err(sqlx::Error::Database(database)) if database.code().as_deref() == Some("23505") => {
-            compare_existing(
-                tx,
-                context,
-                allocation,
-                evidence,
-                accepted_generation,
-                disposition,
-            )
-            .await
+            Err(StripeRenewalFailureStoreError::EvidenceConflict)
         }
         Err(error) => Err(ProviderAdapterError::Database(error).into()),
     }
