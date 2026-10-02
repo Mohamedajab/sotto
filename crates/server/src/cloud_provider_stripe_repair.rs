@@ -167,6 +167,11 @@ pub(crate) fn decode_authenticated_repair_event(
     if invoice.get("object").and_then(Value::as_str) != Some("invoice") {
         return Err(StripeRepairError::Unsupported("invoice object"));
     }
+    if required_bool(invoice, "livemode")?
+        != matches!(config.environment, ProviderEnvironment::Live)
+    {
+        return Err(StripeRepairError::ContextMismatch);
+    }
     if required_string(invoice, "billing_reason")? != "subscription_cycle"
         || required_string(invoice, "collection_method")? != "charge_automatically"
     {
@@ -393,6 +398,7 @@ mod tests {
             "livemode": false,
             "data": { "object": {
                 "object": "invoice", "id": "in_failed", "customer": "cus_one",
+                "livemode": false,
                 "metadata": { "sotto_allocation_reference": "allocation:one" },
                 "billing_reason": "subscription_cycle", "collection_method": "charge_automatically",
                 "status": "open", "currency": "gbp", "amount_due": 1000,
@@ -429,6 +435,13 @@ mod tests {
         wrong_mode["livemode"] = Value::Bool(true);
         assert!(matches!(
             decode_authenticated_repair_event(&wrong_mode, 300, &config(), &binding()),
+            Err(StripeRepairError::ContextMismatch)
+        ));
+
+        let mut wrong_invoice_mode = event();
+        wrong_invoice_mode["data"]["object"]["livemode"] = Value::Bool(true);
+        assert!(matches!(
+            decode_authenticated_repair_event(&wrong_invoice_mode, 300, &config(), &binding()),
             Err(StripeRepairError::ContextMismatch)
         ));
 
