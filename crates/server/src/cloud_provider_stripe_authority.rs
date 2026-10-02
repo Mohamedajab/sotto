@@ -21,44 +21,46 @@ pub const AUTHORITY_POLICY_VERSION: u16 = 1;
 /// One registered provider source covered by an observation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StripeAuthoritySource {
-    pub source_id: String,
-    pub generation: i64,
-    pub evidence_reference: String,
+    pub(crate) source_id: String,
+    pub(crate) generation: i64,
+    pub(crate) evidence_reference: String,
 }
 
 /// Facts needed to turn a complete Stripe observation into a publication authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StripeAuthorityFacts {
-    pub beneficiary_id: String,
-    pub complete_source_set: bool,
-    pub sources: Vec<StripeAuthoritySource>,
-    pub invalidation_generation: i64,
-    pub observed_at: Timestamp,
-    pub fresh_until: Timestamp,
-    pub paid_terms: Vec<StripeAuthorityPaidTerm>,
-    pub renewals: Vec<StripeAuthorityRenewal>,
+    pub(crate) beneficiary_id: String,
+    pub(crate) complete_source_set: bool,
+    pub(crate) sources: Vec<StripeAuthoritySource>,
+    pub(crate) invalidation_generation: i64,
+    pub(crate) observed_at: Timestamp,
+    pub(crate) fresh_until: Timestamp,
+    pub(crate) paid_terms: Vec<StripeAuthorityPaidTerm>,
+    pub(crate) renewals: Vec<StripeAuthorityRenewal>,
+    pub(crate) cancellation: StripeAuthorityCancellation,
+    pub(crate) correction: StripeAuthorityCorrection,
 }
 
 /// A paid term identified by the provider invoice it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StripeAuthorityPaidTerm {
-    pub coverage_id: String,
-    pub source_id: String,
-    pub invoice_id: String,
-    pub starts_at: Timestamp,
-    pub paid_until: Timestamp,
+    pub(crate) coverage_id: String,
+    pub(crate) source_id: String,
+    pub(crate) invoice_id: String,
+    pub(crate) starts_at: Timestamp,
+    pub(crate) paid_until: Timestamp,
 }
 
 /// The current, already-normalised state of one renewal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StripeAuthorityRenewal {
-    pub renewal_id: String,
-    pub evidence_reference: String,
-    pub predecessor_invoice_id: String,
-    pub predecessor_period_end: Timestamp,
-    pub renewal_period_start: Timestamp,
-    pub automatic_cycle: bool,
-    pub state: StripeAuthorityRenewalState,
+    pub(crate) renewal_id: String,
+    pub(crate) evidence_reference: String,
+    pub(crate) predecessor_invoice_id: String,
+    pub(crate) predecessor_period_end: Timestamp,
+    pub(crate) renewal_period_start: Timestamp,
+    pub(crate) automatic_cycle: bool,
+    pub(crate) state: StripeAuthorityRenewalState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +68,36 @@ pub enum StripeAuthorityRenewalState {
     Paid,
     Open,
     ClosedUnpaid { status: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StripeAuthorityCancellation {
+    None,
+    Scheduled {
+        effective_at: Timestamp,
+    },
+    Immediate {
+        effective_at: Timestamp,
+    },
+    ConfirmedEarlyTermination {
+        effective_at: Timestamp,
+        evidence_reference: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StripeAuthorityCorrection {
+    PaidTermPreserved,
+    PartialRefund,
+    OpenDispute,
+    Unresolved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StripeAuthorityAssessment {
+    Ready(StripePublicationAuthority),
+    NeedsEvidence(StripeAuthorityError),
+    Unsupported(StripeAuthorityError),
 }
 
 /// A complete, freshness-bound authority for one beneficiary.
@@ -106,6 +138,10 @@ pub enum StripeAuthorityError {
     NonContiguousRenewal { renewal_id: String },
     #[error("Stripe renewal {renewal_id} has unsupported terminal status {status}")]
     UnsupportedTerminalStatus { renewal_id: String, status: String },
+    #[error("Stripe cancellation evidence is incomplete")]
+    IncompleteCancellationEvidence,
+    #[error("Stripe correction state is unresolved")]
+    UnresolvedCorrection,
     #[error("Stripe publication authority is stale")]
     Stale,
     #[error("Stripe coverage is invalid: {0}")]
@@ -116,6 +152,10 @@ impl StripePublicationAuthority {
     /// Build authority only from complete, already-authenticated adapter facts.
     pub(crate) fn from_facts(facts: StripeAuthorityFacts) -> Result<Self, StripeAuthorityError> {
         validate_metadata(&facts)?;
+        validate_cancellation(&facts.cancellation)?;
+        if matches!(facts.correction, StripeAuthorityCorrection::Unresolved) {
+            return Err(StripeAuthorityError::UnresolvedCorrection);
+        }
         let sources = normalise_sources(facts.sources)?;
         if !facts.complete_source_set || sources.is_empty() {
             return Err(StripeAuthorityError::IncompleteSourceSet);
@@ -218,6 +258,24 @@ impl StripePublicationAuthority {
             }
         }
 
+        let early_termination = match facts.cancellation {
+            StripeAuthorityCancellation::ConfirmedEarlyTermination { effective_at, .. } => {
+                Some(effective_at)
+            }
+            _ => None,
+        };
+        if matches!(facts.correction, StripeAuthorityCorrection::OpenDispute) {
+            // An open dispute does not shorten a paid term, but it does keep the
+            // observation provisional until the next bounded refresh.
+        }
+        if let Some(effective_at) = early_termination {
+            for interval in &mut paid_intervals {
+                interval.paid_until = interval.paid_until.min(effective_at);
+                if interval.paid_until <= interval.starts_at {
+                    interval.failed_renewal_id = None;
+                }
+            }
+        }
         let coverage = PersonCoverage {
             beneficiary_id: facts.beneficiary_id.clone(),
             paid_intervals,
@@ -232,6 +290,17 @@ impl StripePublicationAuthority {
             observed_at: facts.observed_at,
             fresh_until: facts.fresh_until,
         })
+    }
+
+    pub(crate) fn assess(facts: StripeAuthorityFacts) -> StripeAuthorityAssessment {
+        match Self::from_facts(facts) {
+            Ok(authority) => StripeAuthorityAssessment::Ready(authority),
+            Err(error @ StripeAuthorityError::UnsupportedTerminalStatus { .. })
+            | Err(error @ StripeAuthorityError::UnresolvedCorrection) => {
+                StripeAuthorityAssessment::Unsupported(error)
+            }
+            Err(error) => StripeAuthorityAssessment::NeedsEvidence(error),
+        }
     }
 
     pub const fn policy_version(&self) -> u16 {
@@ -306,6 +375,20 @@ fn validate_metadata(facts: &StripeAuthorityFacts) -> Result<(), StripeAuthority
     Ok(())
 }
 
+fn validate_cancellation(
+    cancellation: &StripeAuthorityCancellation,
+) -> Result<(), StripeAuthorityError> {
+    if let StripeAuthorityCancellation::ConfirmedEarlyTermination {
+        evidence_reference, ..
+    } = cancellation
+    {
+        if evidence_reference.trim().is_empty() {
+            return Err(StripeAuthorityError::IncompleteCancellationEvidence);
+        }
+    }
+    Ok(())
+}
+
 fn normalise_sources(
     mut sources: Vec<StripeAuthoritySource>,
 ) -> Result<Vec<StripeAuthoritySource>, StripeAuthorityError> {
@@ -363,6 +446,8 @@ mod tests {
             fresh_until: 1_000,
             paid_terms: vec![paid_term("invoice-paid")],
             renewals,
+            cancellation: StripeAuthorityCancellation::None,
+            correction: StripeAuthorityCorrection::PaidTermPreserved,
         }
     }
 
@@ -512,6 +597,49 @@ mod tests {
         assert!(matches!(
             StripePublicationAuthority::from_facts(unconfirmed),
             Err(StripeAuthorityError::NonContiguousRenewal { .. })
+        ));
+    }
+
+    #[test]
+    fn refunds_and_disputes_preserve_paid_term_but_confirmed_termination_truncates_it() {
+        for correction in [
+            StripeAuthorityCorrection::PartialRefund,
+            StripeAuthorityCorrection::OpenDispute,
+        ] {
+            let mut input = facts(vec![]);
+            input.correction = correction;
+            let authority = StripePublicationAuthority::from_facts(input).unwrap();
+            assert_eq!(authority.coverage().paid_intervals[0].paid_until, 100);
+        }
+
+        let mut input = facts(vec![]);
+        input.cancellation = StripeAuthorityCancellation::ConfirmedEarlyTermination {
+            effective_at: 50,
+            evidence_reference: "event:termination".into(),
+        };
+        let authority = StripePublicationAuthority::from_facts(input).unwrap();
+        assert_eq!(authority.coverage().paid_intervals[0].paid_until, 50);
+    }
+
+    #[test]
+    fn missing_cancellation_or_correction_evidence_is_not_ready() {
+        let mut input = facts(vec![]);
+        input.cancellation = StripeAuthorityCancellation::ConfirmedEarlyTermination {
+            effective_at: 50,
+            evidence_reference: String::new(),
+        };
+        assert!(matches!(
+            StripePublicationAuthority::assess(input),
+            StripeAuthorityAssessment::NeedsEvidence(
+                StripeAuthorityError::IncompleteCancellationEvidence
+            )
+        ));
+
+        let mut input = facts(vec![]);
+        input.correction = StripeAuthorityCorrection::Unresolved;
+        assert!(matches!(
+            StripePublicationAuthority::assess(input),
+            StripeAuthorityAssessment::Unsupported(StripeAuthorityError::UnresolvedCorrection)
         ));
     }
 }
