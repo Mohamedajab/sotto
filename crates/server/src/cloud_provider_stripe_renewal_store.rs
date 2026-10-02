@@ -112,6 +112,80 @@ pub async fn load_personal_renewal_failures(
             "renewal failures require a personal Stripe allocation".into(),
         ));
     }
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *tx)
+        .await?;
+    let preflight = sqlx::query(
+        "WITH candidates AS ( \
+         SELECT failure.evidence_reference, failure.renewal_id, failure.event_id, \
+                failure.invoice_id, failure.invoice_line_id, failure.predecessor_invoice_id, \
+                failure.predecessor_evidence_reference, failure.provider_account_id, \
+                failure.provider_environment, failure.allocation_reference, \
+                failure.provider_customer_id, failure.subscription_id, failure.provider_item_id, \
+                failure.predecessor_period_start, failure.predecessor_period_end, \
+                failure.renewal_period_start, failure.renewal_period_end, failure.event_created_at, \
+                failure.interval \
+         FROM cloud_provider_stripe_renewal_failures AS failure \
+         JOIN cloud_provider_invalidation_associations AS association \
+           ON association.provider_namespace = failure.provider_namespace \
+          AND association.provider_account_id = failure.provider_account_id \
+          AND association.provider_environment = failure.provider_environment \
+          AND association.event_id = failure.event_id \
+         JOIN cloud_provider_allocations AS allocation \
+           ON allocation.allocation_id = association.allocation_id \
+         JOIN cloud_provider_payers AS payer ON payer.payer_id = allocation.payer_id \
+         JOIN cloud_coverage_sources AS source ON source.source_id = association.coverage_source_id \
+         WHERE association.provider_namespace = $1 \
+           AND association.provider_account_id = $2 \
+           AND association.provider_environment = $3 \
+           AND association.beneficiary_id = $4 \
+           AND association.allocation_id = $5 \
+           AND association.coverage_source_id = $6 \
+         ORDER BY failure.event_id ASC \
+         LIMIT $7 \
+       ) \
+       SELECT count(*)::BIGINT AS row_count, \
+              COALESCE(SUM( \
+                  octet_length(evidence_reference) + octet_length(renewal_id) \
+                + octet_length(event_id) + octet_length(invoice_id) \
+                + octet_length(invoice_line_id) + octet_length(predecessor_invoice_id) \
+                + octet_length(predecessor_evidence_reference) \
+                + octet_length(provider_account_id) + octet_length(provider_environment) \
+                + octet_length(allocation_reference) + octet_length(provider_customer_id) \
+                + octet_length(subscription_id) + octet_length(provider_item_id) \
+                + 12 * 8 \
+              ), 0)::TEXT AS evidence_bytes \
+       FROM candidates",
+    )
+    .bind(&context.namespace)
+    .bind(&context.account_id)
+    .bind(context.environment.as_str())
+    .bind(&allocation.beneficiary_id)
+    .bind(&allocation.allocation_id)
+    .bind(&allocation.source_id)
+    .bind(row_limit)
+    .fetch_one(&mut *tx)
+    .await?;
+    let candidate_rows = preflight.try_get::<i64, _>("row_count")?;
+    if candidate_rows > limits.max_rows as i64 {
+        return Err(StripeRenewalFailureLoadError::TooManyRows {
+            limit: limits.max_rows,
+        });
+    }
+    let candidate_bytes = preflight
+        .try_get::<String, _>("evidence_bytes")?
+        .parse::<u128>()
+        .map_err(|_| {
+            StripeRenewalFailureLoadError::Corrupt(
+                "stored renewal evidence byte count is invalid".into(),
+            )
+        })?;
+    if candidate_bytes > limits.max_evidence_bytes as u128 {
+        return Err(StripeRenewalFailureLoadError::BoundExceeded {
+            limit: limits.max_evidence_bytes,
+        });
+    }
     let rows = sqlx::query(
         "SELECT failure.provider_namespace, failure.provider_account_id, \
                 failure.provider_environment, failure.event_id, failure.evidence_version, \
@@ -178,7 +252,7 @@ pub async fn load_personal_renewal_failures(
     .bind(&allocation.allocation_id)
     .bind(&allocation.source_id)
     .bind(row_limit)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
     if rows.len() > limits.max_rows {
         return Err(StripeRenewalFailureLoadError::TooManyRows {
@@ -204,6 +278,7 @@ pub async fn load_personal_renewal_failures(
         }
         evidence.push(item);
     }
+    tx.commit().await?;
     Ok(evidence)
 }
 
