@@ -72,7 +72,10 @@ impl BillingOperationRequest {
         let idempotency_key = idempotency_key.into();
         let request_hash = request_hash(&actor_user_id, offer, quote_version);
         let operation_id = format!("billing:{}", Uuid::new_v4());
-        let provider_idempotency_key = format!("sotto-billing:{operation_id}");
+        let provider_idempotency_key = format!(
+            "sotto-billing:{}",
+            identity_hash(&[&actor_user_id, &idempotency_key])
+        );
         Self {
             operation_id,
             idempotency_key,
@@ -510,13 +513,17 @@ fn current_epoch() -> i64 {
 }
 
 fn request_hash(actor_user_id: &str, offer: BillingOffer, quote_version: i64) -> String {
+    let quote_version = quote_version.to_string();
+    identity_hash(&[actor_user_id, offer.as_str(), &quote_version])
+}
+
+fn identity_hash(parts: &[&str]) -> String {
     let mut digest = Sha256::new();
     digest.update(b"sotto-billing-request-v1\0");
-    digest.update(actor_user_id.as_bytes());
-    digest.update([0]);
-    digest.update(offer.as_str().as_bytes());
-    digest.update([0]);
-    digest.update(quote_version.to_be_bytes());
+    for part in parts {
+        digest.update(part.as_bytes());
+        digest.update([0]);
+    }
     digest
         .finalize()
         .iter()
@@ -586,5 +593,39 @@ mod tests {
             validate_return_url("", "https://evil.test"),
             Err(BillingOperationError::UnauthorisedReturnUrl)
         ));
+    }
+
+    #[test]
+    fn provider_identity_is_stable_for_replays_but_distinct_for_new_idempotency_keys() {
+        let first = BillingOperationRequest::personal(
+            "user_1",
+            "idem_1",
+            BillingOffer::StandardMonthly,
+            1,
+            2_000_000_000,
+        );
+        let replay = BillingOperationRequest::personal(
+            "user_1",
+            "idem_1",
+            BillingOffer::StandardMonthly,
+            1,
+            2_000_000_000,
+        );
+        let separate = BillingOperationRequest::personal(
+            "user_1",
+            "idem_2",
+            BillingOffer::StandardMonthly,
+            1,
+            2_000_000_000,
+        );
+        assert_eq!(first.request_hash, replay.request_hash);
+        assert_eq!(
+            first.provider_idempotency_key,
+            replay.provider_idempotency_key
+        );
+        assert_ne!(
+            first.provider_idempotency_key,
+            separate.provider_idempotency_key
+        );
     }
 }
