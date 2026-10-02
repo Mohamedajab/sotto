@@ -147,7 +147,7 @@ pub async fn load_personal_renewal_failures(
        ) \
        SELECT count(*)::BIGINT AS row_count, \
               COALESCE(SUM( \
-                  octet_length(evidence_reference) + octet_length(renewal_id) \
+                  octet_length(evidence_reference)::BIGINT + octet_length(renewal_id) \
                 + octet_length(event_id) + octet_length(invoice_id) \
                 + octet_length(invoice_line_id) + octet_length(predecessor_invoice_id) \
                 + octet_length(predecessor_evidence_reference) \
