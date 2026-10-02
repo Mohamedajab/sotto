@@ -354,6 +354,17 @@ impl StripeReadClient {
         Ok(resource)
     }
 
+    /// Read a configured Price and bind its observation to this authenticated account and mode.
+    #[doc(hidden)]
+    pub async fn price_observation(
+        &self,
+        session: &mut StripeReadSession,
+        price_id: &str,
+    ) -> Result<StripePriceObservation, StripeReadError> {
+        let resource = self.price(session, price_id).await?;
+        Ok(resource.observation(self.account_id.clone(), self.environment))
+    }
+
     /// Retrieve one immutable event through the authenticated, bounded API session.
     ///
     /// The repair decoder owns event-shape validation. This method only binds the response to the
@@ -1352,7 +1363,7 @@ pub struct StripePriceResource {
 
 impl StripePriceResource {
     /// Convert the authenticated transport result into the catalogue's provider observation.
-    pub fn observation(
+    fn observation(
         &self,
         account_id: impl Into<String>,
         environment: ProviderEnvironment,

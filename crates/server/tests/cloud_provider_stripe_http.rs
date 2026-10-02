@@ -1312,11 +1312,12 @@ async fn reads_resources_with_authentication_and_complete_pagination() {
             .id,
         "sub_1"
     );
-    let price = client.price(&mut session, "price_month").await.unwrap();
-    assert_eq!(price.id, "price_month");
-    assert_eq!(price.unit_amount, Some(299));
-    let observation = price.observation("acct_test_transport", ProviderEnvironment::Test);
+    let observation = client
+        .price_observation(&mut session, "price_month")
+        .await
+        .unwrap();
     assert_eq!(observation.id, "price_month");
+    assert_eq!(observation.unit_amount, Some(299));
     assert_eq!(observation.interval_count, Some(1));
     assert_eq!(
         client
