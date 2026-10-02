@@ -142,6 +142,8 @@ pub enum StripeAuthorityError {
     UnconfirmedRenewal { renewal_id: String },
     #[error("Stripe renewal {renewal_id} has a non-contiguous predecessor period")]
     NonContiguousRenewal { renewal_id: String },
+    #[error("Stripe renewal {renewal_id} does not meet its paid predecessor boundary")]
+    PredecessorBoundaryMismatch { renewal_id: String },
     #[error("Stripe renewal {renewal_id} has unsupported terminal status {status}")]
     UnsupportedTerminalStatus { renewal_id: String, status: String },
     #[error("Stripe cancellation evidence is incomplete")]
@@ -258,6 +260,11 @@ impl StripePublicationAuthority {
                         });
                     }
                 };
+                if paid_intervals[position].paid_until != renewal.predecessor_period_end {
+                    return Err(StripeAuthorityError::PredecessorBoundaryMismatch {
+                        renewal_id: renewal.renewal_id,
+                    });
+                }
                 if paid_intervals[position].failed_renewal_id.is_some() {
                     return Err(StripeAuthorityError::ConflictingRenewal {
                         renewal_id: renewal.renewal_id,
@@ -636,6 +643,22 @@ mod tests {
             StripePublicationAuthority::from_facts(unconfirmed),
             Err(StripeAuthorityError::NonContiguousRenewal { .. })
         ));
+
+        let mut mismatch = facts(vec![StripeAuthorityRenewal {
+            renewal_id: "renewal-2".into(),
+            evidence_reference: "event:renewal-2".into(),
+            predecessor_invoice_id: "invoice-paid".into(),
+            predecessor_period_end: 99,
+            renewal_period_start: 99,
+            automatic_cycle: true,
+            state: StripeAuthorityRenewalState::Open,
+        }]);
+        assert!(matches!(
+            StripePublicationAuthority::from_facts(mismatch.clone()),
+            Err(StripeAuthorityError::PredecessorBoundaryMismatch { .. })
+        ));
+        mismatch.paid_terms[0].paid_until = 99;
+        assert!(StripePublicationAuthority::from_facts(mismatch).is_ok());
     }
 
     #[test]
