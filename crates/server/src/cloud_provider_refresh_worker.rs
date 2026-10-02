@@ -73,6 +73,11 @@ pub async fn run_once<E: RefreshJobExecutor + ?Sized>(
     };
     let inputs = match cloud_provider_refresh_inputs::load(pool, &lease).await {
         Ok(inputs) => inputs,
+        Err(RefreshInputError::Database(error)) => {
+            return Err(RefreshWorkerError::Input(RefreshInputError::Database(
+                error,
+            )));
+        }
         Err(_error) => {
             let retrying =
                 cloud_provider_refresh_jobs::fail(pool, &lease, "refresh_input_invalid").await?;
