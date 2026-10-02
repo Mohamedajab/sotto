@@ -382,7 +382,7 @@ mod tests {
             let result = BillingPriceCatalogue::from_provider_prices(
                 "acct_test",
                 ProviderEnvironment::Test,
-                [(BillingOffer::StandardMonthly, invalid)].into_iter(),
+                [(BillingOffer::StandardMonthly, invalid)],
             );
             assert!(
                 matches!(result, Err(BillingCatalogueError::MismatchedPrice { field: actual, .. }) if actual == field),
@@ -399,8 +399,7 @@ mod tests {
             [(
                 BillingOffer::StandardMonthly,
                 observation(BillingOffer::StandardMonthly),
-            )]
-            .into_iter(),
+            )],
         );
         assert!(matches!(
             result,
