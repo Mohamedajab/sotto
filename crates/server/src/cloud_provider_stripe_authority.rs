@@ -53,7 +53,11 @@ pub struct StripeAuthorityPaidTerm {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StripeAuthorityRenewal {
     pub renewal_id: String,
+    pub evidence_reference: String,
     pub predecessor_invoice_id: String,
+    pub predecessor_period_end: Timestamp,
+    pub renewal_period_start: Timestamp,
+    pub automatic_cycle: bool,
     pub state: StripeAuthorityRenewalState,
 }
 
@@ -96,6 +100,10 @@ pub enum StripeAuthorityError {
     },
     #[error("Stripe renewal {renewal_id} has conflicting observations")]
     ConflictingRenewal { renewal_id: String },
+    #[error("Stripe renewal {renewal_id} is not confirmed as an automatic cycle")]
+    UnconfirmedRenewal { renewal_id: String },
+    #[error("Stripe renewal {renewal_id} has a non-contiguous predecessor period")]
+    NonContiguousRenewal { renewal_id: String },
     #[error("Stripe renewal {renewal_id} has unsupported terminal status {status}")]
     UnsupportedTerminalStatus { renewal_id: String, status: String },
     #[error("Stripe publication authority is stale")]
@@ -144,8 +152,14 @@ impl StripePublicationAuthority {
         for renewal in facts.renewals {
             if renewal.renewal_id.trim().is_empty()
                 || renewal.predecessor_invoice_id.trim().is_empty()
+                || renewal.evidence_reference.trim().is_empty()
             {
                 return Err(StripeAuthorityError::InvalidMetadata("renewal identity"));
+            }
+            if renewal.predecessor_period_end != renewal.renewal_period_start {
+                return Err(StripeAuthorityError::NonContiguousRenewal {
+                    renewal_id: renewal.renewal_id,
+                });
             }
             let state = match renewal.state {
                 StripeAuthorityRenewalState::Paid => StripeAuthorityRenewalState::Paid,
@@ -171,6 +185,11 @@ impl StripePublicationAuthority {
                 continue;
             }
             if !matches!(state, StripeAuthorityRenewalState::Paid) {
+                if !renewal.automatic_cycle {
+                    return Err(StripeAuthorityError::UnconfirmedRenewal {
+                        renewal_id: renewal.renewal_id,
+                    });
+                }
                 let positions = invoice_positions
                     .get(&renewal.predecessor_invoice_id)
                     .map(Vec::as_slice)
@@ -244,18 +263,28 @@ impl StripePublicationAuthority {
     }
 
     /// Authority is usable only before its freshness deadline and at its captured fence.
-    pub fn is_current(&self, now: Timestamp, invalidation_generation: i64) -> bool {
+    pub fn is_current(
+        &self,
+        now: Timestamp,
+        invalidation_generation: i64,
+        current_sources: &[StripeAuthoritySource],
+    ) -> bool {
+        let Ok(current_sources) = normalise_sources(current_sources.to_vec()) else {
+            return false;
+        };
         self.observed_at <= now
             && now < self.fresh_until
             && invalidation_generation == self.invalidation_generation
+            && current_sources == self.sources
     }
 
     pub fn evaluate(
         &self,
         now: Timestamp,
         invalidation_generation: i64,
+        current_sources: &[StripeAuthoritySource],
     ) -> Result<CoverageDecision, StripeAuthorityError> {
-        if !self.is_current(now, invalidation_generation) {
+        if !self.is_current(now, invalidation_generation, current_sources) {
             return Err(StripeAuthorityError::Stale);
         }
         Ok(evaluate(&self.coverage, now)?)
@@ -340,14 +369,15 @@ mod tests {
     #[test]
     fn paid_term_is_authoritative_until_freshness_or_generation_changes() {
         let authority = StripePublicationAuthority::from_facts(facts(vec![])).unwrap();
+        let sources = vec![source("source-a")];
         assert_eq!(authority.policy_version(), AUTHORITY_POLICY_VERSION);
         assert_eq!(
-            authority.evaluate(50, 1).unwrap().state,
+            authority.evaluate(50, 1, &sources).unwrap().state,
             CoverageState::Paid
         );
-        assert!(!authority.is_current(1_000, 1));
+        assert!(!authority.is_current(1_000, 1, &sources));
         assert!(matches!(
-            authority.evaluate(100, 2),
+            authority.evaluate(100, 2, &sources),
             Err(StripeAuthorityError::Stale)
         ));
     }
@@ -357,7 +387,11 @@ mod tests {
         let authority =
             StripePublicationAuthority::from_facts(facts(vec![StripeAuthorityRenewal {
                 renewal_id: "renewal-1".into(),
+                evidence_reference: "event:renewal-1".into(),
                 predecessor_invoice_id: "invoice-paid".into(),
+                predecessor_period_end: 100,
+                renewal_period_start: 100,
+                automatic_cycle: true,
                 state: StripeAuthorityRenewalState::Open,
             }]))
             .unwrap();
@@ -368,7 +402,10 @@ mod tests {
             Some("renewal-1")
         );
         assert_eq!(
-            authority.evaluate(100, 1).unwrap().state,
+            authority
+                .evaluate(100, 1, &[source("source-a")])
+                .unwrap()
+                .state,
             CoverageState::RenewalRecovery
         );
     }
@@ -379,14 +416,21 @@ mod tests {
             let authority =
                 StripePublicationAuthority::from_facts(facts(vec![StripeAuthorityRenewal {
                     renewal_id: format!("renewal-{status}"),
+                    evidence_reference: format!("event:renewal-{status}"),
                     predecessor_invoice_id: "invoice-paid".into(),
+                    predecessor_period_end: 100,
+                    renewal_period_start: 100,
+                    automatic_cycle: true,
                     state: StripeAuthorityRenewalState::ClosedUnpaid {
                         status: status.into(),
                     },
                 }]))
                 .unwrap();
             assert_eq!(
-                authority.evaluate(100, 1).unwrap().state,
+                authority
+                    .evaluate(100, 1, &[source("source-a")])
+                    .unwrap()
+                    .state,
                 CoverageState::RenewalRecovery
             );
         }
@@ -396,7 +440,11 @@ mod tests {
     fn unknown_terminal_status_and_missing_predecessor_fail_closed() {
         let mut unknown = facts(vec![StripeAuthorityRenewal {
             renewal_id: "renewal-1".into(),
+            evidence_reference: "event:renewal-1".into(),
             predecessor_invoice_id: "invoice-paid".into(),
+            predecessor_period_end: 100,
+            renewal_period_start: 100,
+            automatic_cycle: true,
             state: StripeAuthorityRenewalState::ClosedUnpaid {
                 status: "pending".into(),
             },
@@ -407,7 +455,11 @@ mod tests {
         ));
         unknown = facts(vec![StripeAuthorityRenewal {
             renewal_id: "renewal-1".into(),
+            evidence_reference: "event:renewal-1".into(),
             predecessor_invoice_id: "missing".into(),
+            predecessor_period_end: 100,
+            renewal_period_start: 100,
+            automatic_cycle: true,
             state: StripeAuthorityRenewalState::Open,
         }]);
         assert!(matches!(
@@ -429,6 +481,37 @@ mod tests {
         assert!(matches!(
             StripePublicationAuthority::from_facts(duplicate),
             Err(StripeAuthorityError::InvalidSource("duplicate source"))
+        ));
+    }
+
+    #[test]
+    fn changed_source_generation_invalidates_authority() {
+        let authority = StripePublicationAuthority::from_facts(facts(vec![])).unwrap();
+        let mut changed = source("source-a");
+        changed.generation = 2;
+        assert!(!authority.is_current(50, 1, &[changed]));
+    }
+
+    #[test]
+    fn unconfirmed_or_non_contiguous_renewals_fail_closed() {
+        let mut unconfirmed = facts(vec![StripeAuthorityRenewal {
+            renewal_id: "renewal-1".into(),
+            evidence_reference: "event:renewal-1".into(),
+            predecessor_invoice_id: "invoice-paid".into(),
+            predecessor_period_end: 100,
+            renewal_period_start: 100,
+            automatic_cycle: false,
+            state: StripeAuthorityRenewalState::Open,
+        }]);
+        assert!(matches!(
+            StripePublicationAuthority::from_facts(unconfirmed.clone()),
+            Err(StripeAuthorityError::UnconfirmedRenewal { .. })
+        ));
+        unconfirmed.renewals[0].automatic_cycle = true;
+        unconfirmed.renewals[0].renewal_period_start = 101;
+        assert!(matches!(
+            StripePublicationAuthority::from_facts(unconfirmed),
+            Err(StripeAuthorityError::NonContiguousRenewal { .. })
         ));
     }
 }
