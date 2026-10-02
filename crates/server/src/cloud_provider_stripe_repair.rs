@@ -17,6 +17,7 @@ use crate::cloud_provider_stripe::{
     StripeAllocationBinding, StripeContractError, StripeCoverageConfig, StripeInterval,
     STRIPE_ALLOCATION_METADATA_KEY,
 };
+use crate::cloud_provider_stripe_http::{StripeReadClient, StripeReadError, StripeReadSession};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StripeRepairProvenance {
@@ -116,6 +117,8 @@ pub(crate) enum StripeRepairError {
     ContextMismatch,
     #[error("repair event provider configuration is invalid: {0}")]
     Config(#[from] StripeContractError),
+    #[error("repair event read failed: {0}")]
+    Read(#[from] StripeReadError),
 }
 
 /// Decode an event returned by an authenticated Stripe API read.
@@ -311,6 +314,19 @@ pub(crate) fn decode_authenticated_repair_event(
         period_end,
         interval,
     })
+}
+
+/// Fetch and decode one event without holding a database connection across the provider read.
+pub(crate) async fn fetch_authenticated_repair_candidate(
+    client: &StripeReadClient,
+    session: &mut StripeReadSession,
+    event_id: &str,
+    retrieved_at: i64,
+    config: &StripeCoverageConfig,
+    binding: &StripeAllocationBinding,
+) -> Result<StripeRepairCandidate, StripeRepairError> {
+    let event = client.event_payload(session, event_id).await?;
+    decode_authenticated_repair_event(&event, retrieved_at, config, binding)
 }
 
 fn required_string(value: &Value, field: &'static str) -> Result<String, StripeRepairError> {
