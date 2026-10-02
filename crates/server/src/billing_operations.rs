@@ -470,6 +470,8 @@ pub enum BillingRecoveryError {
     Operation(#[from] BillingOperationError),
     #[error("billing provider recovery failed: {0}")]
     Provider(String),
+    #[error("billing operation recovery is already in progress")]
+    InProgress,
 }
 
 /// Provider lookup used by a restartable reconciliation worker. The provider must use the stored
@@ -489,7 +491,8 @@ pub async fn reconcile_operation(
     provider: &dyn BillingOperationProvider,
     operation_id: &str,
 ) -> Result<BillingOperation, BillingRecoveryError> {
-    let current = load_operation_by_id(pool, operation_id).await?;
+    let claim_token = format!("reconcile:{}", Uuid::new_v4());
+    let current = claim_reconciliation(pool, operation_id, &claim_token).await?;
     if !matches!(
         current.state,
         BillingOperationState::Pending | BillingOperationState::Unknown
@@ -503,9 +506,10 @@ pub async fn reconcile_operation(
             provider_operation_id,
             result_code,
         } => {
-            record_provider_result(
+            record_claimed_provider_result(
                 &mut tx,
                 operation_id,
+                &claim_token,
                 BillingOperationState::Succeeded,
                 Some(&provider_operation_id),
                 Some(&result_code),
@@ -516,9 +520,10 @@ pub async fn reconcile_operation(
             provider_operation_id,
             result_code,
         } => {
-            record_provider_result(
+            record_claimed_provider_result(
                 &mut tx,
                 operation_id,
+                &claim_token,
                 BillingOperationState::Failed,
                 provider_operation_id.as_deref(),
                 Some(&result_code),
@@ -526,9 +531,10 @@ pub async fn reconcile_operation(
             .await?
         }
         ProviderResolution::Unknown { result_code } => {
-            record_provider_result(
+            record_claimed_provider_result(
                 &mut tx,
                 operation_id,
+                &claim_token,
                 BillingOperationState::Unknown,
                 None,
                 result_code.as_deref(),
@@ -538,6 +544,100 @@ pub async fn reconcile_operation(
     };
     tx.commit().await.map_err(BillingOperationError::from)?;
     Ok(resolved)
+}
+
+async fn claim_reconciliation(
+    pool: &PgPool,
+    operation_id: &str,
+    claim_token: &str,
+) -> Result<BillingOperation, BillingRecoveryError> {
+    let mut tx = pool.begin().await.map_err(BillingOperationError::from)?;
+    let claimed = sqlx::query(
+        "UPDATE billing_operations SET reconciliation_lease_token = $2, \
+         reconciliation_lease_until = now() + interval '5 minutes', updated_at = now() \
+         WHERE operation_id = $1 AND state IN ('pending','unknown') \
+         AND (reconciliation_lease_until IS NULL OR reconciliation_lease_until < now()) \
+         RETURNING operation_id",
+    )
+    .bind(operation_id)
+    .bind(claim_token)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(BillingOperationError::from)?
+    .is_some();
+    tx.commit().await.map_err(BillingOperationError::from)?;
+    let current = load_operation_by_id(pool, operation_id).await?;
+    if claimed {
+        return Ok(current);
+    }
+    if matches!(
+        current.state,
+        BillingOperationState::Succeeded | BillingOperationState::Failed
+    ) {
+        return Ok(current);
+    }
+    Err(BillingRecoveryError::InProgress)
+}
+
+async fn record_claimed_provider_result(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+    claim_token: &str,
+    state: BillingOperationState,
+    provider_operation_id: Option<&str>,
+    result_code: Option<&str>,
+) -> Result<BillingOperation, BillingRecoveryError> {
+    validate_provider_result(state, result_code)?;
+    let updated = sqlx::query(
+        "UPDATE billing_operations SET state = $2, provider_operation_id = COALESCE($3, provider_operation_id), \
+         result_code = $4, reconciliation_lease_token = NULL, reconciliation_lease_until = NULL, updated_at = now() \
+         WHERE operation_id = $1 AND reconciliation_lease_token = $5 AND state IN ('pending','unknown') \
+         RETURNING operation_id",
+    )
+    .bind(operation_id)
+    .bind(state.as_str())
+    .bind(provider_operation_id)
+    .bind(result_code)
+    .bind(claim_token)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(BillingOperationError::from)?;
+    if updated.is_none() {
+        let existing = load_operation(tx, operation_id).await?;
+        if matches!(
+            existing.state,
+            BillingOperationState::Succeeded | BillingOperationState::Failed
+        ) && existing.state == state
+            && existing.provider_operation_id.as_deref() == provider_operation_id
+            && existing.result_code.as_deref() == result_code
+        {
+            return Ok(existing);
+        }
+        return Err(BillingRecoveryError::InProgress);
+    }
+    Ok(load_operation(tx, operation_id).await?)
+}
+
+fn validate_provider_result(
+    state: BillingOperationState,
+    result_code: Option<&str>,
+) -> Result<(), BillingOperationError> {
+    if !matches!(
+        state,
+        BillingOperationState::Succeeded
+            | BillingOperationState::Failed
+            | BillingOperationState::Unknown
+    ) {
+        return Err(BillingOperationError::InvalidField("provider result state"));
+    }
+    if matches!(
+        state,
+        BillingOperationState::Succeeded | BillingOperationState::Failed
+    ) && result_code.is_none_or(str::is_empty)
+    {
+        return Err(BillingOperationError::InvalidField("result_code"));
+    }
+    Ok(())
 }
 
 pub async fn load_reconciliation_candidates(

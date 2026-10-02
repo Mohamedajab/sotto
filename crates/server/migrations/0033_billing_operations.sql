@@ -12,6 +12,8 @@ CREATE TABLE billing_operations (
     quote_expires_at_epoch BIGINT NOT NULL,
     provider_idempotency_key TEXT NOT NULL UNIQUE,
     provider_operation_id TEXT,
+    reconciliation_lease_token TEXT,
+    reconciliation_lease_until TIMESTAMPTZ,
     state TEXT NOT NULL DEFAULT 'pending',
     result_code TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -23,6 +25,10 @@ CREATE TABLE billing_operations (
     CONSTRAINT billing_operations_beneficiary_not_empty CHECK (btrim(beneficiary_id) <> ''),
     CONSTRAINT billing_operations_offer_not_empty CHECK (btrim(offer) <> ''),
     CONSTRAINT billing_operations_provider_key_not_empty CHECK (btrim(provider_idempotency_key) <> ''),
+    CONSTRAINT billing_operations_reconciliation_lease_pair CHECK (
+        (reconciliation_lease_token IS NULL AND reconciliation_lease_until IS NULL)
+        OR (reconciliation_lease_token IS NOT NULL AND reconciliation_lease_until IS NOT NULL)
+    ),
     CONSTRAINT billing_operations_quote_version_positive CHECK (quote_version > 0),
     CONSTRAINT billing_operations_quote_expiry_positive CHECK (quote_expires_at_epoch > 0),
     CONSTRAINT billing_operations_state_valid CHECK (state IN ('pending', 'succeeded', 'failed', 'unknown')),
