@@ -15,6 +15,7 @@ use sotto_server::cloud_provider::{
     ProviderEnvironment, RejectionDisposition, VerifiedAllocation, VerifiedCollection,
     VerifiedProviderEvent,
 };
+use sotto_server::cloud_provider_refresh_jobs::{claim_due, complete, fail};
 use sotto_server::db;
 use sqlx::postgres::PgConnectOptions;
 use sqlx::PgPool;
@@ -627,6 +628,7 @@ async fn accepted_provider_invalidation_fences_an_inflight_collection() {
         &context,
         &change_event,
         &wrong_allocation,
+        true,
     )
     .await;
     assert!(matches!(
@@ -637,7 +639,7 @@ async fn accepted_provider_invalidation_fences_an_inflight_collection() {
 
     let mut invalidate = pool.begin().await.unwrap();
     assert_eq!(
-        accept_provider_invalidation(&mut invalidate, &context, &change_event, &allocation)
+        accept_provider_invalidation(&mut invalidate, &context, &change_event, &allocation, true)
             .await
             .unwrap(),
         InvalidationDisposition::Accepted { generation: 1 }
@@ -645,7 +647,7 @@ async fn accepted_provider_invalidation_fences_an_inflight_collection() {
     invalidate.commit().await.unwrap();
     let mut retry = pool.begin().await.unwrap();
     assert_eq!(
-        accept_provider_invalidation(&mut retry, &context, &change_event, &allocation)
+        accept_provider_invalidation(&mut retry, &context, &change_event, &allocation, true)
             .await
             .unwrap(),
         InvalidationDisposition::AlreadyAccepted { generation: 1 }
@@ -662,6 +664,53 @@ async fn accepted_provider_invalidation_fences_an_inflight_collection() {
     .unwrap();
     assert_eq!(queued.0, 1);
     assert_eq!(queued.1, "pending");
+
+    let first_lease = claim_due(&pool, "refresh-worker-a")
+        .await
+        .unwrap()
+        .expect("claim pending refresh job");
+    assert_eq!(first_lease.attempt_count, 1);
+    let mut wrong_owner = first_lease.clone();
+    wrong_owner.worker_id = "refresh-worker-other".into();
+    assert!(matches!(
+        complete(&pool, &wrong_owner).await,
+        Err(sotto_server::cloud_provider_refresh_jobs::RefreshJobError::LeaseLost)
+    ));
+    sqlx::query(
+        "UPDATE cloud_provider_refresh_jobs SET lease_expires_at = now() - interval '1 second' \
+         WHERE job_id = $1",
+    )
+    .bind(&first_lease.job_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(matches!(
+        complete(&pool, &first_lease).await,
+        Err(sotto_server::cloud_provider_refresh_jobs::RefreshJobError::LeaseLost)
+    ));
+
+    let mut lease = claim_due(&pool, "refresh-worker-b")
+        .await
+        .unwrap()
+        .expect("reclaim expired refresh job");
+    assert_eq!(lease.attempt_count, 2);
+    for expected_attempt in 2..=6 {
+        assert_eq!(lease.attempt_count, expected_attempt);
+        assert!(fail(&pool, &lease, "provider_timeout").await.unwrap());
+        sqlx::query(
+            "UPDATE cloud_provider_refresh_jobs SET available_at = now() WHERE job_id = $1",
+        )
+        .bind(&lease.job_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        lease = claim_due(&pool, "refresh-worker-b")
+            .await
+            .unwrap()
+            .expect("claim retryable refresh job");
+    }
+    assert_eq!(lease.attempt_count, 7);
+    assert!(!fail(&pool, &lease, "provider_timeout").await.unwrap());
 
     let mut complete = pool.begin().await.unwrap();
     let result = complete_verified_event(
@@ -744,7 +793,8 @@ async fn accepted_provider_invalidation_fences_an_inflight_collection() {
     .unwrap();
     let mut applied_rebind = pool.begin().await.unwrap();
     let rebind_result =
-        accept_provider_invalidation(&mut applied_rebind, &context, &event, &allocation).await;
+        accept_provider_invalidation(&mut applied_rebind, &context, &event, &allocation, true)
+            .await;
     assert!(matches!(
         rebind_result,
         Err(sotto_server::cloud_provider::ProviderAdapterError::AllocationConflict)
@@ -779,9 +829,15 @@ async fn accepted_provider_invalidation_fences_an_inflight_collection() {
     record_after.commit().await.unwrap();
     let mut invalidate_after = pool.begin().await.unwrap();
     assert_eq!(
-        accept_provider_invalidation(&mut invalidate_after, &context, &after_event, &allocation)
-            .await
-            .unwrap(),
+        accept_provider_invalidation(
+            &mut invalidate_after,
+            &context,
+            &after_event,
+            &allocation,
+            true,
+        )
+        .await
+        .unwrap(),
         InvalidationDisposition::Accepted { generation: 2 }
     );
     invalidate_after.commit().await.unwrap();
@@ -844,7 +900,7 @@ async fn accepted_provider_invalidation_fences_an_inflight_collection() {
     let mut holder = pool.begin().await.unwrap();
     let holder_pid = transaction_pid(&mut holder).await;
     assert_eq!(
-        accept_provider_invalidation(&mut holder, &context, &race_event, &allocation)
+        accept_provider_invalidation(&mut holder, &context, &race_event, &allocation, true)
             .await
             .unwrap(),
         InvalidationDisposition::Accepted { generation: 3 }
@@ -864,6 +920,7 @@ async fn accepted_provider_invalidation_fences_an_inflight_collection() {
             &duplicate_context,
             &duplicate_event,
             &duplicate_allocation,
+            true,
         )
         .await;
         tx.commit().await.unwrap();
@@ -885,6 +942,7 @@ async fn accepted_provider_invalidation_fences_an_inflight_collection() {
             &distinct_context,
             &distinct_event,
             &distinct_allocation,
+            true,
         )
         .await;
         tx.commit().await.unwrap();
@@ -1004,9 +1062,14 @@ async fn accepted_provider_invalidation_fences_an_inflight_collection() {
         .await
         .unwrap();
     let mut missing_accept = pool.begin().await.unwrap();
-    let missing_result =
-        accept_provider_invalidation(&mut missing_accept, &context, &missing_event, &allocation)
-            .await;
+    let missing_result = accept_provider_invalidation(
+        &mut missing_accept,
+        &context,
+        &missing_event,
+        &allocation,
+        true,
+    )
+    .await;
     assert!(matches!(
         missing_result,
         Err(sotto_server::cloud_provider::ProviderAdapterError::ProviderContextMismatch)
