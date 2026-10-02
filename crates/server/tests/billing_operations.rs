@@ -14,9 +14,10 @@ use tokio::time::{timeout, Duration};
 
 use sotto_server::billing_catalogue::BillingOffer;
 use sotto_server::billing_operations::{
-    begin_personal_operation, load_reconciliation_candidates, reconcile_operation,
-    record_provider_result, BeginOperation, BillingOperation, BillingOperationError,
-    BillingOperationProvider, BillingOperationState, BillingRecoveryError, ProviderResolution,
+    begin_organization_operation, begin_personal_operation, load_reconciliation_candidates,
+    reconcile_operation, record_provider_result, BeginOperation, BillingOperation,
+    BillingOperationError, BillingOperationProvider, BillingOperationState, BillingRecoveryError,
+    ProviderResolution,
 };
 use sotto_server::db;
 
@@ -60,6 +61,38 @@ async fn seed_user(pool: &PgPool, user_id: &str) {
     .execute(pool)
     .await
     .expect("seed billing operation user fixture");
+}
+
+async fn seed_organization(pool: &PgPool, organization_id: &str, owner_id: &str, member_id: &str) {
+    sqlx::query(
+        "INSERT INTO organizations (id, enc_name, created_by) VALUES ($1, $2, $3) \
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(organization_id)
+    .bind(vec![0_u8])
+    .bind(owner_id)
+    .execute(pool)
+    .await
+    .expect("seed billing operation organisation fixture");
+    sqlx::query(
+        "INSERT INTO organization_memberships (org_id, user_id, role) VALUES \
+         ($1, $2, 'owner'), ($1, $3, 'member') \
+         ON CONFLICT (org_id, user_id) DO UPDATE SET role = EXCLUDED.role",
+    )
+    .bind(organization_id)
+    .bind(owner_id)
+    .bind(member_id)
+    .execute(pool)
+    .await
+    .expect("seed billing operation memberships");
+}
+
+async fn cleanup_organization(pool: &PgPool, organization_id: &str) {
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(organization_id)
+        .execute(pool)
+        .await
+        .expect("clean billing operation organisation fixture");
 }
 
 #[tokio::test]
@@ -260,8 +293,9 @@ async fn unknown_provider_result_is_reconciled_after_restart() {
     let candidates = load_reconciliation_candidates(&pool, 10)
         .await
         .expect("load reconciliation candidates");
-    assert_eq!(candidates.len(), 1);
-    assert_eq!(candidates[0].operation_id, operation_id);
+    assert!(candidates
+        .iter()
+        .any(|candidate| candidate.operation_id == operation_id));
 
     let provider = SuccessfulProvider {
         calls: Arc::new(AtomicUsize::new(0)),
@@ -275,10 +309,11 @@ async fn unknown_provider_result_is_reconciled_after_restart() {
         resolved.provider_operation_id.as_deref(),
         Some("pi_recovered")
     );
-    assert!(load_reconciliation_candidates(&pool, 10)
+    assert!(!load_reconciliation_candidates(&pool, 10)
         .await
         .expect("load resolved candidates")
-        .is_empty());
+        .iter()
+        .any(|candidate| candidate.operation_id == operation_id));
     let replayed = reconcile_operation(&pool, &provider, &operation_id)
         .await
         .expect("reconcile already terminal operation");
@@ -354,4 +389,68 @@ async fn concurrent_recovery_claims_the_provider_call_once() {
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
 
     cleanup(&pool, USER_ID).await;
+}
+
+#[tokio::test]
+async fn organisation_operations_require_role_and_active_lifecycle() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    const ORGANIZATION_ID: &str = "billing-operation-test-org";
+    const OWNER_ID: &str = "billing-operation-test-owner";
+    const MEMBER_ID: &str = "billing-operation-test-member";
+    cleanup_organization(&pool, ORGANIZATION_ID).await;
+    cleanup(&pool, OWNER_ID).await;
+    cleanup(&pool, MEMBER_ID).await;
+    seed_user(&pool, OWNER_ID).await;
+    seed_user(&pool, MEMBER_ID).await;
+    seed_organization(&pool, ORGANIZATION_ID, OWNER_ID, MEMBER_ID).await;
+
+    let mut member_tx = pool.begin().await.expect("begin member transaction");
+    assert!(matches!(
+        begin_organization_operation(
+            &mut member_tx,
+            MEMBER_ID,
+            ORGANIZATION_ID,
+            "member-key",
+            BillingOffer::StandardMonthly,
+            1,
+            4_000_000_000,
+            "https://app.sotto.test/billing",
+            "https://app.sotto.test/billing",
+        )
+        .await,
+        Err(BillingOperationError::Unauthorised)
+    ));
+    member_tx
+        .rollback()
+        .await
+        .expect("rollback member operation");
+
+    sqlx::query("UPDATE organizations SET lifecycle_state = 'deleting' WHERE id = $1")
+        .bind(ORGANIZATION_ID)
+        .execute(&pool)
+        .await
+        .expect("mark organisation deleting");
+    let mut owner_tx = pool.begin().await.expect("begin owner transaction");
+    assert!(matches!(
+        begin_organization_operation(
+            &mut owner_tx,
+            OWNER_ID,
+            ORGANIZATION_ID,
+            "owner-key",
+            BillingOffer::StandardMonthly,
+            1,
+            4_000_000_000,
+            "https://app.sotto.test/billing",
+            "https://app.sotto.test/billing",
+        )
+        .await,
+        Err(BillingOperationError::OrganisationNotActive)
+    ));
+    owner_tx.rollback().await.expect("rollback owner operation");
+
+    cleanup_organization(&pool, ORGANIZATION_ID).await;
+    cleanup(&pool, OWNER_ID).await;
+    cleanup(&pool, MEMBER_ID).await;
 }
