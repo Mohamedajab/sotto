@@ -317,8 +317,7 @@ impl StripePublicationAuthority {
     pub(crate) fn assess(facts: StripeAuthorityFacts) -> StripeAuthorityAssessment {
         match Self::from_facts(facts) {
             Ok(authority) => StripeAuthorityAssessment::Ready(authority),
-            Err(error @ StripeAuthorityError::UnsupportedTerminalStatus { .. })
-            | Err(error @ StripeAuthorityError::UnresolvedCorrection) => {
+            Err(error @ StripeAuthorityError::UnsupportedTerminalStatus { .. }) => {
                 StripeAuthorityAssessment::Unsupported(error)
             }
             Err(error) => StripeAuthorityAssessment::NeedsEvidence(error),
@@ -726,7 +725,7 @@ mod tests {
         input.correction = StripeAuthorityCorrection::Unresolved;
         assert!(matches!(
             StripePublicationAuthority::assess(input),
-            StripeAuthorityAssessment::Unsupported(StripeAuthorityError::UnresolvedCorrection)
+            StripeAuthorityAssessment::NeedsEvidence(StripeAuthorityError::UnresolvedCorrection)
         ));
     }
 }
