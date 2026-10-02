@@ -194,7 +194,7 @@ impl StripePublicationAuthority {
             });
         }
 
-        let mut renewals = BTreeMap::<String, StripeAuthorityRenewalState>::new();
+        let mut renewals = BTreeMap::<String, StripeAuthorityRenewal>::new();
         for renewal in facts.renewals {
             if renewal.renewal_id.trim().is_empty()
                 || renewal.predecessor_invoice_id.trim().is_empty()
@@ -207,29 +207,32 @@ impl StripePublicationAuthority {
                     renewal_id: renewal.renewal_id,
                 });
             }
-            let state = match renewal.state {
-                StripeAuthorityRenewalState::Paid => StripeAuthorityRenewalState::Paid,
-                StripeAuthorityRenewalState::Open => StripeAuthorityRenewalState::Open,
-                StripeAuthorityRenewalState::ClosedUnpaid { status }
-                    if matches!(status.as_str(), "void" | "uncollectible") =>
-                {
-                    StripeAuthorityRenewalState::ClosedUnpaid { status }
-                }
-                StripeAuthorityRenewalState::ClosedUnpaid { status } => {
-                    return Err(StripeAuthorityError::UnsupportedTerminalStatus {
-                        renewal_id: renewal.renewal_id,
-                        status,
-                    });
-                }
-            };
-            if let Some(previous) = renewals.insert(renewal.renewal_id.clone(), state.clone()) {
-                if previous != state {
+            if let Some(previous) = renewals.get(&renewal.renewal_id) {
+                if previous != &renewal {
                     return Err(StripeAuthorityError::ConflictingRenewal {
                         renewal_id: renewal.renewal_id,
                     });
                 }
                 continue;
             }
+            let state = match &renewal.state {
+                StripeAuthorityRenewalState::Paid => StripeAuthorityRenewalState::Paid,
+                StripeAuthorityRenewalState::Open => StripeAuthorityRenewalState::Open,
+                StripeAuthorityRenewalState::ClosedUnpaid { status }
+                    if matches!(status.as_str(), "void" | "uncollectible") =>
+                {
+                    StripeAuthorityRenewalState::ClosedUnpaid {
+                        status: status.clone(),
+                    }
+                }
+                StripeAuthorityRenewalState::ClosedUnpaid { status } => {
+                    return Err(StripeAuthorityError::UnsupportedTerminalStatus {
+                        renewal_id: renewal.renewal_id,
+                        status: status.clone(),
+                    });
+                }
+            };
+            renewals.insert(renewal.renewal_id.clone(), renewal.clone());
             if !matches!(state, StripeAuthorityRenewalState::Paid) {
                 if !renewal.automatic_cycle {
                     return Err(StripeAuthorityError::UnconfirmedRenewal {
