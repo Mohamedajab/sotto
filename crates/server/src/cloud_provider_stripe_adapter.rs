@@ -11,11 +11,20 @@ use std::collections::BTreeSet;
 
 use thiserror::Error;
 
+use crate::cloud_coverage::ConfirmedPaidInterval;
 use crate::cloud_coverage_reconciliation::{CollectionTicket, SourceBinding};
-use crate::cloud_provider::{ProviderEnvironment, VerifiedAllocation};
+use crate::cloud_provider::{
+    ProviderCollectionError, ProviderContext, ProviderEnvironment, ProviderHistoryClient,
+    ProviderHistoryPage, VerifiedAllocation,
+};
 use crate::cloud_provider_stripe::STRIPE_NAMESPACE;
 use crate::cloud_provider_stripe::{StripeAllocationBinding, StripeCoverageConfig};
 use crate::cloud_provider_stripe_authority::StripeAuthoritySource;
+use crate::cloud_provider_stripe_http::{
+    StripePersonalInvoiceHistoryEntry, StripePersonalInvoiceHistoryResult, StripeReadClient,
+    StripeReadSession,
+};
+use async_trait::async_trait;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StripePreparedSource {
@@ -178,6 +187,89 @@ pub(crate) fn allocation_is_active(allocation: &VerifiedAllocation) -> bool {
         allocation.state,
         crate::cloud_provider::AllocationState::Active
     )
+}
+
+/// Concrete provider-neutral history transport for one prepared Stripe collection.
+///
+/// A single read session is shared across every source. The client therefore applies one request,
+/// page, record, byte and deadline budget instead of resetting limits for each sibling source.
+pub(crate) struct StripeHistoryClient {
+    client: StripeReadClient,
+    session: StripeReadSession,
+    prepared: StripePreparedCollection,
+}
+
+impl StripeHistoryClient {
+    pub(crate) fn new(client: StripeReadClient, prepared: StripePreparedCollection) -> Self {
+        let session = client.session();
+        Self {
+            client,
+            session,
+            prepared,
+        }
+    }
+}
+
+#[async_trait]
+impl ProviderHistoryClient for StripeHistoryClient {
+    async fn fetch_page(
+        &mut self,
+        context: &ProviderContext,
+        binding: &SourceBinding,
+        cursor: Option<&str>,
+    ) -> Result<ProviderHistoryPage, ProviderCollectionError> {
+        if context.namespace != STRIPE_NAMESPACE
+            || context.account_id != self.prepared.account_id
+            || context.environment != self.prepared.environment
+        {
+            return Err(ProviderCollectionError::ContextMismatch);
+        }
+        if cursor.is_some() {
+            return Err(ProviderCollectionError::RepeatedCursor);
+        }
+        let source = self
+            .prepared
+            .sources
+            .iter()
+            .find(|source| source.binding.source_id == binding.source_id)
+            .ok_or(ProviderCollectionError::SourceMismatch)?;
+        let history = self
+            .client
+            .personal_invoice_history(&mut self.session, &source.allocation)
+            .await
+            .map_err(|error| ProviderCollectionError::Fetch(error.to_string()))?;
+        let history = match history {
+            StripePersonalInvoiceHistoryResult::Observed(history) => history,
+            StripePersonalInvoiceHistoryResult::NeedsEvidence(_) => {
+                return Err(ProviderCollectionError::InvalidEvidence(
+                    "Stripe invoice history needs more evidence".into(),
+                ));
+            }
+        };
+        let mut paid_intervals = Vec::new();
+        let mut evidence = Vec::new();
+        for entry in history.entries() {
+            if let StripePersonalInvoiceHistoryEntry::Paid(term) = entry {
+                paid_intervals.push(ConfirmedPaidInterval {
+                    coverage_id: term.invoice_id().to_owned(),
+                    source_id: binding.source_id.clone(),
+                    starts_at: term.period_start(),
+                    paid_until: term.period_end(),
+                    failed_renewal_id: None,
+                });
+                evidence.push(term.evidence_reference().to_owned());
+            }
+        }
+        evidence.sort();
+        Ok(ProviderHistoryPage {
+            context: context.clone(),
+            source_id: binding.source_id.clone(),
+            evidence_reference: format!("stripe-history-v1:{}", evidence.join(",")),
+            paid_intervals,
+            next_cursor: None,
+            authoritative_end: true,
+        })
+    }
 }
 
 #[cfg(test)]
