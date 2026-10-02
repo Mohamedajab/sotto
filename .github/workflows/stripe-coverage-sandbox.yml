@@ -27,7 +27,6 @@ jobs:
       STRIPE_SANDBOX_ANNUAL_PRICE_ID: ${{ secrets.STRIPE_SANDBOX_ANNUAL_PRICE_ID }}
       STRIPE_SANDBOX_ALLOCATION_REFERENCE: ${{ secrets.STRIPE_SANDBOX_ALLOCATION_REFERENCE }}
       STRIPE_SANDBOX_PROVIDER_ITEM_ID: ${{ secrets.STRIPE_SANDBOX_PROVIDER_ITEM_ID }}
-      STRIPE_SANDBOX_REPORT: ${{ runner.temp }}/stripe-sandbox-contract.json
     steps:
       - uses: actions/checkout@v4
 
@@ -38,7 +37,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run the bounded read contract
-        run: cargo test -p sotto-server --test cloud_provider_stripe_sandbox -- --nocapture
+        run: |
+          export STRIPE_SANDBOX_REPORT="$RUNNER_TEMP/stripe-sandbox-contract.json"
+          cargo test -p sotto-server --test cloud_provider_stripe_sandbox -- --nocapture
 
       - name: Upload the sanitised compatibility report
         if: always()
