@@ -188,6 +188,7 @@ impl Config {
         };
 
         let billing_price_catalogue = billing_price_catalogue_from_env()?;
+        let hosted_catalogue_configured = billing_price_catalogue.is_some();
         let billing = match (
             env_nonempty("STRIPE_API_KEY"),
             env_nonempty("STRIPE_WEBHOOK_SECRET"),
@@ -202,6 +203,12 @@ impl Config {
             }),
             _ => None,
         };
+        if hosted_catalogue_configured && billing.is_none() {
+            return Err(Error::Config(
+                "hosted Stripe price ids require STRIPE_API_KEY, STRIPE_WEBHOOK_SECRET, and STRIPE_PRICE_ID"
+                    .into(),
+            ));
+        }
 
         let telemetry = TelemetryConfig {
             ping_enabled: telemetry_ping_enabled(
