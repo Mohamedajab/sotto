@@ -652,6 +652,17 @@ async fn accepted_provider_invalidation_fences_an_inflight_collection() {
     );
     retry.commit().await.unwrap();
 
+    let queued: (i64, String) = sqlx::query_as(
+        "SELECT count(*)::BIGINT, min(status) FROM cloud_provider_refresh_jobs \
+         WHERE event_id = $1",
+    )
+    .bind(&change_event_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(queued.0, 1);
+    assert_eq!(queued.1, "pending");
+
     let mut complete = pool.begin().await.unwrap();
     let result = complete_verified_event(
         &mut complete,
