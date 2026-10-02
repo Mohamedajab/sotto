@@ -11,7 +11,7 @@ account and these values:
 | Variable | Meaning |
 | --- | --- |
 | `SOTTO_RUN_STRIPE_SANDBOX_TESTS` | Must be `1` to opt in. |
-| `STRIPE_SANDBOX_READ_KEY` | `sk_test_` or `rk_test_` key with read access only. |
+| `STRIPE_SANDBOX_READ_KEY` | Restricted `rk_test_` key with read access only. |
 | `STRIPE_SANDBOX_ACCOUNT_ID` | Account returned by `GET /v1/account`. |
 | `STRIPE_SANDBOX_CUSTOMER_ID` | Customer attached to the fixture subscription. |
 | `STRIPE_SANDBOX_SUBSCRIPTION_ID` | Subscription used for the history read. |

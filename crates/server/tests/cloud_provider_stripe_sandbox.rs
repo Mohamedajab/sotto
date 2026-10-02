@@ -56,8 +56,8 @@ async fn reads_the_configured_stripe_test_contract_without_mutation() {
 
     let api_key = required("STRIPE_SANDBOX_READ_KEY");
     assert!(
-        api_key.starts_with("sk_test_") || api_key.starts_with("rk_test_"),
-        "STRIPE_SANDBOX_READ_KEY must be a Stripe test-mode key"
+        api_key.starts_with("rk_test_"),
+        "STRIPE_SANDBOX_READ_KEY must be a restricted Stripe test-mode key"
     );
     let account_id = required("STRIPE_SANDBOX_ACCOUNT_ID");
     let customer_id = required("STRIPE_SANDBOX_CUSTOMER_ID");
