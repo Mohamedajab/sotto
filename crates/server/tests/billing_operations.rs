@@ -4,6 +4,10 @@
 
 use async_trait::async_trait;
 use sqlx::PgPool;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
 use sotto_server::billing_catalogue::BillingOffer;
 use sotto_server::billing_operations::{
@@ -118,14 +122,22 @@ async fn operation_identity_is_idempotent_and_conflicts_on_changed_request() {
     cleanup(&pool, USER_ID).await;
 }
 
-struct SuccessfulProvider;
+struct SuccessfulProvider {
+    calls: Arc<AtomicUsize>,
+    keys: Arc<std::sync::Mutex<Vec<String>>>,
+}
 
 #[async_trait]
 impl BillingOperationProvider for SuccessfulProvider {
     async fn resolve(
         &self,
-        _operation: &BillingOperation,
+        operation: &BillingOperation,
     ) -> Result<ProviderResolution, sotto_server::billing_operations::BillingRecoveryError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.keys
+            .lock()
+            .expect("provider key lock")
+            .push(operation.provider_idempotency_key.clone());
         Ok(ProviderResolution::Succeeded {
             provider_operation_id: "pi_recovered".into(),
             result_code: "paid".into(),
@@ -219,7 +231,11 @@ async fn unknown_provider_result_is_reconciled_after_restart() {
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].operation_id, operation_id);
 
-    let resolved = reconcile_operation(&pool, &SuccessfulProvider, &operation_id)
+    let provider = SuccessfulProvider {
+        calls: Arc::new(AtomicUsize::new(0)),
+        keys: Arc::new(std::sync::Mutex::new(Vec::new())),
+    };
+    let resolved = reconcile_operation(&pool, &provider, &operation_id)
         .await
         .expect("reconcile provider result after restart");
     assert_eq!(resolved.state, BillingOperationState::Succeeded);
@@ -231,6 +247,12 @@ async fn unknown_provider_result_is_reconciled_after_restart() {
         .await
         .expect("load resolved candidates")
         .is_empty());
+    let replayed = reconcile_operation(&pool, &provider, &operation_id)
+        .await
+        .expect("reconcile already terminal operation");
+    assert_eq!(replayed.state, BillingOperationState::Succeeded);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.keys.lock().expect("provider key lock").len(), 1);
 
     cleanup(&pool, USER_ID).await;
 }
