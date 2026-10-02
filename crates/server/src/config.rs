@@ -117,8 +117,21 @@ pub struct BillingConfig {
     pub webhook_secret: String,
     /// The Price id (`price_…`) of the flat per-org monthly Team subscription.
     pub price_id: String,
+    /// The optional server-owned four-offer catalogue. Legacy organisation billing remains
+    /// available when these are absent; a partial catalogue is rejected at boot.
+    pub price_catalogue: Option<BillingPriceIds>,
     /// Where Stripe-hosted pages send the browser back to (the web app origin).
     pub return_url: String,
+}
+
+/// Provider price ids for the hosted personal Cloud offer. Amounts and recurrence are validated
+/// against authenticated Stripe Price objects before a catalogue is usable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BillingPriceIds {
+    pub standard_monthly: String,
+    pub standard_annual: String,
+    pub founding_monthly: String,
+    pub founding_annual: String,
 }
 
 /// GitHub OAuth application credentials and the server's public origin.
@@ -182,6 +195,7 @@ impl Config {
             _ => None,
         };
 
+        let billing_price_catalogue = billing_price_catalogue_from_env()?;
         let billing = match (
             env_nonempty("STRIPE_API_KEY"),
             env_nonempty("STRIPE_WEBHOOK_SECRET"),
@@ -191,6 +205,7 @@ impl Config {
                 api_key,
                 webhook_secret,
                 price_id,
+                price_catalogue: billing_price_catalogue,
                 return_url: billing_return_url(&public_base_url, web_origin.as_deref()),
             }),
             _ => None,
@@ -239,6 +254,43 @@ impl Config {
             provider_refresh_reconciliation_enabled,
         })
     }
+}
+
+const BILLING_CATALOGUE_ENV: [&str; 4] = [
+    "STRIPE_STANDARD_MONTHLY_PRICE_ID",
+    "STRIPE_STANDARD_ANNUAL_PRICE_ID",
+    "STRIPE_FOUNDING_MONTHLY_PRICE_ID",
+    "STRIPE_FOUNDING_ANNUAL_PRICE_ID",
+];
+
+fn billing_price_catalogue_from_env() -> Result<Option<BillingPriceIds>> {
+    let values = BILLING_CATALOGUE_ENV
+        .iter()
+        .map(|name| env_nonempty(name))
+        .collect::<Vec<_>>()
+        .try_into()
+        .expect("billing catalogue has four environment variables");
+    billing_price_catalogue_from_values(values)
+}
+
+fn billing_price_catalogue_from_values(
+    values: [Option<String>; 4],
+) -> Result<Option<BillingPriceIds>> {
+    if values.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    if values.iter().any(Option::is_none) {
+        return Err(Error::Config(
+            "all four hosted Stripe price ids must be configured together".into(),
+        ));
+    }
+    let [standard_monthly, standard_annual, founding_monthly, founding_annual] = values;
+    Ok(Some(BillingPriceIds {
+        standard_monthly: standard_monthly.expect("checked above"),
+        standard_annual: standard_annual.expect("checked above"),
+        founding_monthly: founding_monthly.expect("checked above"),
+        founding_annual: founding_annual.expect("checked above"),
+    }))
 }
 
 /// Enable the destructive worker only for the exact opt-in value, so empty or unexpected values
@@ -331,7 +383,7 @@ fn env_nonempty(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        billing_return_url, feature_flag_is_enabled,
+        billing_price_catalogue_from_values, billing_return_url, feature_flag_is_enabled,
         organisation_deletion_retention_from_env_result, organisation_deletion_worker_is_enabled,
         parse_organisation_deletion_retention_days, telemetry_ping_enabled, DeploymentMode,
         DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS, MAX_ORGANISATION_DELETION_RETENTION_DAYS,
@@ -377,6 +429,33 @@ mod tests {
         assert_eq!(
             billing_return_url("https://sotto.test", None),
             "https://sotto.test"
+        );
+    }
+
+    #[test]
+    fn billing_price_catalogue_requires_all_four_ids() {
+        assert_eq!(
+            billing_price_catalogue_from_values([None, None, None, None]).unwrap(),
+            None
+        );
+        assert!(billing_price_catalogue_from_values([
+            Some("price_month".into()),
+            None,
+            None,
+            None,
+        ])
+        .is_err());
+        assert_eq!(
+            billing_price_catalogue_from_values([
+                Some("price_month".into()),
+                Some("price_year".into()),
+                Some("price_founder_month".into()),
+                Some("price_founder_year".into()),
+            ])
+            .unwrap()
+            .unwrap()
+            .standard_monthly,
+            "price_month"
         );
     }
 
