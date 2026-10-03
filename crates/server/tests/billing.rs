@@ -635,13 +635,21 @@ async fn personal_paid_checkout_webhook_records_provider_term() {
         "type": "invoice.paid",
         "data": { "object": {
             "id": "in_personal_paid",
-            "subscription": "sub_personal_paid",
-            "payment_intent": "pi_personal_renewal",
+            "payment_intent": "pi_billing_webhook_renewal",
             "period_end": 1_950_000_000,
             "lines": {"data": [{
-                "type": "subscription",
+                "parent": {
+                    "type": "subscription_item_details",
+                    "subscription_item_details": {
+                        "subscription": "sub_personal_paid"
+                    }
+                },
                 "period": {"end": 2_100_000_000}
-            }]}
+            }]},
+            "parent": {
+                "type": "subscription_details",
+                "subscription_details": {"subscription": "sub_personal_paid"}
+            }
         }}
     })
     .to_string();
