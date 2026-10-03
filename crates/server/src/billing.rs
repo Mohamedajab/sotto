@@ -253,10 +253,11 @@ pub trait SubscriptionProvider: Send + Sync {
         price_id: &str,
         operation_id: &str,
         idempotency_key: &str,
+        expires_at_epoch: i64,
         success_url: &str,
         cancel_url: &str,
     ) -> ProviderResult<String> {
-        let _ = (price_id, operation_id, idempotency_key);
+        let _ = (price_id, operation_id, idempotency_key, expires_at_epoch);
         self.create_checkout(user_id, customer, success_url, cancel_url)
             .await
     }
@@ -413,6 +414,7 @@ impl SubscriptionProvider for StripeBilling {
         price_id: &str,
         operation_id: &str,
         idempotency_key: &str,
+        expires_at_epoch: i64,
         success_url: &str,
         cancel_url: &str,
     ) -> ProviderResult<String> {
@@ -437,6 +439,7 @@ impl SubscriptionProvider for StripeBilling {
             ),
             ("success_url".to_string(), success_url.to_string()),
             ("cancel_url".to_string(), cancel_url.to_string()),
+            ("expires_at".to_string(), expires_at_epoch.to_string()),
         ];
         if let Some(customer) = customer {
             form.push(("customer".to_string(), customer.to_string()));
@@ -928,6 +931,7 @@ async fn personal_checkout(
             &price_id,
             &operation.operation_id,
             &operation.provider_idempotency_key,
+            operation.quote_expires_at_epoch,
             &success_url,
             &cancel_url,
         )
