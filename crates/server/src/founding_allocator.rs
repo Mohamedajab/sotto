@@ -702,6 +702,14 @@ mod tests {
             leap.add_terms(FoundingOffer::Annual, 4).to_string(),
             "2028-02-29"
         );
+        assert_eq!(
+            FoundingDate::from_unix_seconds(0).unwrap().to_string(),
+            "1970-01-01"
+        );
+        assert_eq!(
+            FoundingDate::from_unix_seconds(leap.to_unix_seconds()).unwrap(),
+            leap
+        );
     }
 
     #[test]

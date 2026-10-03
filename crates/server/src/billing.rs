@@ -1376,6 +1376,22 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
     let object = &event.data.object;
     let subscription_id = event_subscription_id(&event);
     if disposition == EventDisposition::Reconcile {
+        if event.kind == "checkout.session.completed"
+            && object["client_reference_id"]
+                .as_str()
+                .is_some_and(|reference| reference.starts_with("personal:"))
+        {
+            // A personal checkout has no organisation tier to reconcile. Re-apply the verified
+            // settlement instead; the personal account store makes this equal-timestamp replay
+            // idempotent while still requiring the paid webhook evidence.
+            checkout_completed(&mut tx, object, event.created).await?;
+            if let Some(subscription_id) = subscription_id {
+                update_subscription_watermark(&mut tx, &event, &subscription_id).await?;
+            }
+            mark_webhook_event_processed(&mut tx, &event.id).await?;
+            tx.commit().await?;
+            return Ok(());
+        }
         let subscription_id = subscription_id.ok_or_else(|| {
             Error::Config("stripe reconciliation event has no subscription id".into())
         })?;
