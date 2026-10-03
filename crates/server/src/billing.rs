@@ -1502,7 +1502,7 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
 
     match disposition {
         EventDisposition::Apply => match event.kind.as_str() {
-            "checkout.session.completed" => {
+            "checkout.session.completed" | "checkout.session.async_payment_succeeded" => {
                 checkout_completed(&mut tx, object, event.created).await?
             }
             "customer.subscription.updated" => subscription_updated(&mut tx, object).await?,
@@ -1550,6 +1550,10 @@ async fn record_webhook_event(
         if processed {
             return Ok(EventDisposition::Ignore);
         }
+    }
+
+    if is_personal_checkout_event(event) {
+        return Ok(EventDisposition::Apply);
     }
 
     let Some(subscription_id) = subscription_id else {
@@ -1671,9 +1675,11 @@ async fn update_subscription_watermark(
 
 fn event_subscription_id(event: &Event) -> Option<String> {
     match event.kind.as_str() {
-        "checkout.session.completed" => event.data.object["subscription"]
-            .as_str()
-            .map(str::to_string),
+        "checkout.session.completed" | "checkout.session.async_payment_succeeded" => {
+            event.data.object["subscription"]
+                .as_str()
+                .map(str::to_string)
+        }
         "customer.subscription.updated" | "customer.subscription.deleted" => {
             event.data.object["id"].as_str().map(str::to_string)
         }
@@ -1683,12 +1689,23 @@ fn event_subscription_id(event: &Event) -> Option<String> {
 
 fn event_org_hint(event: &Event) -> Option<&str> {
     match event.kind.as_str() {
-        "checkout.session.completed" => event.data.object["client_reference_id"].as_str(),
+        "checkout.session.completed" | "checkout.session.async_payment_succeeded" => {
+            event.data.object["client_reference_id"].as_str()
+        }
         "customer.subscription.updated" | "customer.subscription.deleted" => {
             event.data.object["metadata"]["org_id"].as_str()
         }
         _ => None,
     }
+}
+
+fn is_personal_checkout_event(event: &Event) -> bool {
+    matches!(
+        event.kind.as_str(),
+        "checkout.session.completed" | "checkout.session.async_payment_succeeded"
+    ) && event.data.object["client_reference_id"]
+        .as_str()
+        .is_some_and(|reference| reference.starts_with("personal:"))
 }
 
 /// A paid checkout: record the Stripe ids and grant the Team tier. Idempotent - a redelivered
