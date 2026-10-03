@@ -245,6 +245,7 @@ pub trait SubscriptionProvider: Send + Sync {
     /// Create a personal checkout using a server-selected catalogue price. The default keeps
     /// existing provider adapters source-compatible; hosted Stripe overrides it with the personal
     /// metadata and selected price.
+    #[allow(clippy::too_many_arguments)]
     async fn create_personal_checkout(
         &self,
         user_id: &str,
@@ -396,6 +397,7 @@ impl SubscriptionProvider for StripeBilling {
             .ok_or_else(ProviderError::malformed_response)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn create_personal_checkout(
         &self,
         user_id: &str,
