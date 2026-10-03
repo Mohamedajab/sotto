@@ -140,3 +140,142 @@ pub(crate) enum SponsoredAdapterError {
     DuplicateObservation,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cloud_coverage_reconciliation::SourceBinding;
+    use crate::cloud_provider::ProviderEnvironment;
+    use crate::cloud_provider_stripe_sponsored::{
+        compose_sponsored_coverage, SponsoredAllocationInterval, SponsoredAllocationManifest,
+        SponsoredCoverageResult, SponsoredInvoiceLine, SponsoredInvoiceSettlement,
+        SponsoredStripeCoverageConfig,
+    };
+
+    fn config() -> SponsoredStripeCoverageConfig {
+        SponsoredStripeCoverageConfig::new(
+            "acct_test",
+            ProviderEnvironment::Test,
+            "price_standard_month",
+            "price_standard_year",
+            "price_founding_month",
+            "price_founding_year",
+        )
+        .unwrap()
+    }
+
+    fn candidate() -> SponsoredCoverageCandidate {
+        let manifest = SponsoredAllocationManifest::new(
+            "acct_test",
+            ProviderEnvironment::Test,
+            "cus_1",
+            "sub_1",
+            vec![
+                SponsoredAllocationInterval::new(
+                    "source_a",
+                    "allocation_a",
+                    "user_1",
+                    "item_1",
+                    "price_standard_month",
+                    0,
+                    None,
+                )
+                .unwrap(),
+                SponsoredAllocationInterval::new(
+                    "source_b",
+                    "allocation_b",
+                    "user_2",
+                    "item_1",
+                    "price_standard_month",
+                    0,
+                    None,
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let settlement = SponsoredInvoiceSettlement::new(
+            "in_1",
+            "cus_1",
+            "sub_1",
+            100,
+            200,
+            "gbp",
+            200,
+            200,
+            "evt_1",
+            vec![SponsoredInvoiceLine::new(
+                "line_1",
+                "item_1",
+                "price_standard_month",
+                100,
+                200,
+                2,
+                false,
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        let SponsoredCoverageResult::Candidate(candidate) =
+            compose_sponsored_coverage(&config(), &manifest, &settlement).unwrap()
+        else {
+            panic!("expected sponsored candidate")
+        };
+        candidate
+    }
+
+    fn ticket(source_id: &str, beneficiary_id: &str) -> CollectionTicket {
+        CollectionTicket {
+            beneficiary_id: beneficiary_id.into(),
+            attempt_id: "attempt_1".into(),
+            collection_epoch: 1,
+            source_set_generation: 1,
+            provider_invalidation_generation: Some(0),
+            expected_projection_revision: None,
+            source_bindings: vec![SourceBinding {
+                beneficiary_id: beneficiary_id.into(),
+                source_id: source_id.into(),
+                provider_namespace: STRIPE_NAMESPACE.into(),
+                external_allocation_reference: format!("allocation_{}", source_id),
+                ownership_evidence_reference: "ownership".into(),
+            }],
+            status: CollectionStatus::Pending,
+            completed_revision: None,
+        }
+    }
+
+    fn context() -> ProviderContext {
+        ProviderContext::new(STRIPE_NAMESPACE, "acct_test", ProviderEnvironment::Test).unwrap()
+    }
+
+    #[test]
+    fn grouped_candidate_is_reduced_to_the_ticket_beneficiary() {
+        let collection =
+            collection_for_ticket(&context(), &ticket("source_a", "user_1"), &candidate()).unwrap();
+        assert_eq!(collection.observations.len(), 1);
+        let SourceObservation::Complete { source_id, .. } = &collection.observations[0] else {
+            panic!("expected complete observation")
+        };
+        assert_eq!(source_id, "source_a");
+        assert!(collection
+            .aggregate_evidence_reference
+            .starts_with("stripe-sponsored-collection-v1:"));
+    }
+
+    #[test]
+    fn sibling_source_cannot_be_published_into_the_ticket() {
+        let error = collection_for_ticket(&context(), &ticket("source_b", "user_1"), &candidate())
+            .unwrap_err();
+        assert_eq!(error, SponsoredAdapterError::SourceSetMismatch);
+    }
+
+    #[test]
+    fn wrong_context_fails_before_observations() {
+        let mut wrong_context = context();
+        wrong_context.account_id = "acct_other".into();
+        assert_eq!(
+            collection_for_ticket(&wrong_context, &ticket("source_a", "user_1"), &candidate())
+                .unwrap_err(),
+            SponsoredAdapterError::ContextMismatch
+        );
+    }
+}
