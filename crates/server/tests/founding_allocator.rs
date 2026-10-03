@@ -114,6 +114,23 @@ async fn reservation_is_idempotent_and_quote_exposes_standard_price() {
     assert_eq!(quote.remaining_places, FOUNDING_CAPACITY - 1);
     assert_eq!(quote.founding_amount_pence, 199);
     assert_eq!(quote.standard_amount_pence, 299);
+    let expired_replay = reserve(
+        &mut tx,
+        "founding-test-idempotency-expired-replay-id",
+        "founding-test-idempotency-operation",
+        "founding-test-idempotency-person",
+        "founding-test-idempotency-payer",
+        FoundingOffer::Monthly,
+        1,
+        expires,
+        expires + 1,
+    )
+    .await
+    .expect("replay expired reservation");
+    assert!(matches!(
+        expired_replay,
+        ReservationOutcome::AlreadyExists(_)
+    ));
     tx.rollback().await.expect("rollback fixture");
     cleanup(&pool, fixture).await;
 }
@@ -264,6 +281,183 @@ async fn late_payment_is_refunded_when_capacity_was_consumed_after_reservation()
     .expect("late payment outcome");
     assert_eq!(outcome, ConfirmationOutcome::RefundRequired);
     confirm_tx.commit().await.expect("commit refund decision");
+    cleanup(&pool, fixture).await;
+}
+
+#[tokio::test]
+async fn expired_payment_cannot_take_a_place_held_by_a_live_reservation() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _guard = TEST_LOCK.get_or_init(|| Mutex::const_new(())).lock().await;
+    let fixture = "expired-live-interleave";
+    cleanup(&pool, fixture).await;
+    seed_awards(&pool, fixture, FOUNDING_CAPACITY - 1).await;
+
+    let now = 1_800_000_000;
+    let mut expired_tx = pool.begin().await.expect("begin expired reservation");
+    let expired = reserve(
+        &mut expired_tx,
+        "founding-test-expired-live-interleave-expired",
+        "founding-test-expired-live-interleave-expired-operation",
+        "founding-test-expired-live-interleave-expired-person",
+        "founding-test-expired-live-interleave-expired-payer",
+        FoundingOffer::Monthly,
+        1,
+        now - 1,
+        now - 1_801,
+    )
+    .await
+    .expect("create expired reservation");
+    assert!(matches!(expired, ReservationOutcome::Created(_)));
+    expired_tx
+        .commit()
+        .await
+        .expect("commit expired reservation");
+
+    let mut live_tx = pool.begin().await.expect("begin live reservation");
+    let live = reserve(
+        &mut live_tx,
+        "founding-test-expired-live-interleave-live",
+        "founding-test-expired-live-interleave-live-operation",
+        "founding-test-expired-live-interleave-live-person",
+        "founding-test-expired-live-interleave-live-payer",
+        FoundingOffer::Monthly,
+        1,
+        now + 1_800,
+        now,
+    )
+    .await
+    .expect("create live reservation");
+    assert!(matches!(live, ReservationOutcome::Created(_)));
+    live_tx.commit().await.expect("commit live reservation");
+
+    let mut expired_confirm_tx = pool.begin().await.expect("begin expired confirmation");
+    assert_eq!(
+        confirm_payment(
+            &mut expired_confirm_tx,
+            "founding-test-expired-live-interleave-expired",
+            "founding-test-expired-live-interleave-expired-payment",
+            FoundingDate::new(2026, 1, 1).unwrap(),
+            now,
+        )
+        .await
+        .expect("late expired outcome"),
+        ConfirmationOutcome::RefundRequired
+    );
+    expired_confirm_tx
+        .commit()
+        .await
+        .expect("commit expired refund");
+
+    let mut live_confirm_tx = pool.begin().await.expect("begin live confirmation");
+    assert!(matches!(
+        confirm_payment(
+            &mut live_confirm_tx,
+            "founding-test-expired-live-interleave-live",
+            "founding-test-expired-live-interleave-live-payment",
+            FoundingDate::new(2026, 1, 1).unwrap(),
+            now,
+        )
+        .await
+        .expect("live outcome"),
+        ConfirmationOutcome::Awarded(_)
+    ));
+    live_confirm_tx.commit().await.expect("commit live award");
+    cleanup(&pool, fixture).await;
+}
+
+#[tokio::test]
+async fn late_duplicate_beneficiary_payment_becomes_refund_required() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _guard = TEST_LOCK.get_or_init(|| Mutex::const_new(())).lock().await;
+    let fixture = "duplicate-beneficiary";
+    cleanup(&pool, fixture).await;
+    let now = 1_800_000_000;
+
+    let mut expired_tx = pool
+        .begin()
+        .await
+        .expect("begin expired beneficiary reservation");
+    let expired = reserve(
+        &mut expired_tx,
+        "founding-test-duplicate-beneficiary-expired",
+        "founding-test-duplicate-beneficiary-expired-operation",
+        "founding-test-duplicate-beneficiary-person",
+        "founding-test-duplicate-beneficiary-payer-a",
+        FoundingOffer::Monthly,
+        1,
+        now - 1,
+        now - 1_801,
+    )
+    .await
+    .expect("create expired beneficiary reservation");
+    assert!(matches!(expired, ReservationOutcome::Created(_)));
+    expired_tx
+        .commit()
+        .await
+        .expect("commit expired reservation");
+
+    let mut current_tx = pool
+        .begin()
+        .await
+        .expect("begin current beneficiary reservation");
+    let current = reserve(
+        &mut current_tx,
+        "founding-test-duplicate-beneficiary-current",
+        "founding-test-duplicate-beneficiary-current-operation",
+        "founding-test-duplicate-beneficiary-person",
+        "founding-test-duplicate-beneficiary-payer-b",
+        FoundingOffer::Monthly,
+        1,
+        now + 1_800,
+        now,
+    )
+    .await
+    .expect("create current beneficiary reservation");
+    assert!(matches!(current, ReservationOutcome::Created(_)));
+    current_tx
+        .commit()
+        .await
+        .expect("commit current reservation");
+
+    let mut current_confirm_tx = pool.begin().await.expect("begin current confirmation");
+    assert!(matches!(
+        confirm_payment(
+            &mut current_confirm_tx,
+            "founding-test-duplicate-beneficiary-current",
+            "founding-test-duplicate-beneficiary-current-payment",
+            FoundingDate::new(2026, 1, 1).unwrap(),
+            now,
+        )
+        .await
+        .expect("confirm current beneficiary payment"),
+        ConfirmationOutcome::Awarded(_)
+    ));
+    current_confirm_tx
+        .commit()
+        .await
+        .expect("commit current award");
+
+    let mut expired_confirm_tx = pool.begin().await.expect("begin duplicate confirmation");
+    assert_eq!(
+        confirm_payment(
+            &mut expired_confirm_tx,
+            "founding-test-duplicate-beneficiary-expired",
+            "founding-test-duplicate-beneficiary-expired-payment",
+            FoundingDate::new(2026, 1, 1).unwrap(),
+            now,
+        )
+        .await
+        .expect("duplicate beneficiary outcome"),
+        ConfirmationOutcome::RefundRequired
+    );
+    expired_confirm_tx
+        .commit()
+        .await
+        .expect("commit duplicate refund");
     cleanup(&pool, fixture).await;
 }
 

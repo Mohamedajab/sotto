@@ -246,15 +246,6 @@ pub async fn reserve(
     if quote_version < 1 {
         return Err(FoundingAllocatorError::InvalidField("quote_version"));
     }
-    if quote_expires_at_epoch <= now_epoch {
-        return Err(FoundingAllocatorError::QuoteExpired);
-    }
-    let latest_allowed_expiry = now_epoch
-        .checked_add(RESERVATION_SECONDS)
-        .ok_or(FoundingAllocatorError::InvalidField("now_epoch"))?;
-    if quote_expires_at_epoch > latest_allowed_expiry {
-        return Err(FoundingAllocatorError::InvalidField("quote_expiry"));
-    }
 
     lock_capacity(tx).await?;
     if let Some(existing) = load_reservation_by_operation(tx, operation_id).await? {
@@ -267,6 +258,15 @@ pub async fn reserve(
             return Ok(ReservationOutcome::AlreadyExists(existing));
         }
         return Err(FoundingAllocatorError::ReservationConflict);
+    }
+    if quote_expires_at_epoch <= now_epoch {
+        return Err(FoundingAllocatorError::QuoteExpired);
+    }
+    let latest_allowed_expiry = now_epoch
+        .checked_add(RESERVATION_SECONDS)
+        .ok_or(FoundingAllocatorError::InvalidField("now_epoch"))?;
+    if quote_expires_at_epoch > latest_allowed_expiry {
+        return Err(FoundingAllocatorError::InvalidField("quote_expiry"));
     }
     if load_award_by_beneficiary(tx, beneficiary_id)
         .await?
@@ -364,14 +364,12 @@ pub async fn confirm_payment(
     if duplicate_payment.is_some() {
         return Err(FoundingAllocatorError::PaymentConflict);
     }
-    // The reservation being confirmed is already included in the live-reservation count, so a
-    // zero remainder still leaves its one claimed place available for conversion into an award.
-    let awarded: i64 = sqlx::query_scalar("SELECT count(*) FROM billing_founding_awards")
-        .fetch_one(&mut **tx)
-        .await?;
-    // An expired reservation is no longer included in available_places. If all places have
-    // since been awarded, a late payment must be refunded rather than creating ordinal 101.
-    if awarded >= FOUNDING_CAPACITY || available_places(tx, now_epoch).await? < 0 {
+    let beneficiary_id: String = row.try_get("beneficiary_id")?;
+    let payer_id: String = row.try_get("payer_id")?;
+    if load_award_by_beneficiary(tx, &beneficiary_id)
+        .await?
+        .is_some()
+    {
         sqlx::query(
             "UPDATE billing_founding_reservations SET status = 'refund_required', updated_at = now() \
              WHERE reservation_id = $1",
@@ -381,8 +379,27 @@ pub async fn confirm_payment(
         .await?;
         return Ok(ConfirmationOutcome::RefundRequired);
     }
-    let beneficiary_id: String = row.try_get("beneficiary_id")?;
-    let payer_id: String = row.try_get("payer_id")?;
+    let awarded: i64 = sqlx::query_scalar("SELECT count(*) FROM billing_founding_awards")
+        .fetch_one(&mut **tx)
+        .await?;
+    let reservation_expires_at_epoch: i64 = row.try_get("quote_expires_at_epoch")?;
+    let remaining = available_places(tx, now_epoch).await?;
+    let reservation_is_live = reservation_expires_at_epoch > now_epoch;
+    // An expired reservation is no longer included in available_places. If all places have
+    // since been awarded, or the last place is held by another live reservation, a late payment
+    // must be refunded rather than taking a place that was already promised to someone else.
+    // A live reservation being confirmed itself is included in `remaining`, so zero is valid for
+    // that path.
+    if awarded >= FOUNDING_CAPACITY || remaining < 0 || (!reservation_is_live && remaining == 0) {
+        sqlx::query(
+            "UPDATE billing_founding_reservations SET status = 'refund_required', updated_at = now() \
+             WHERE reservation_id = $1",
+        )
+        .bind(reservation_id)
+        .execute(&mut **tx)
+        .await?;
+        return Ok(ConfirmationOutcome::RefundRequired);
+    }
     let offer = parse_offer(&row.try_get::<String, _>("offer")?)?;
     let ordinal: i64 = sqlx::query_scalar(
         "SELECT COALESCE(max(cohort_ordinal), 0) + 1 FROM billing_founding_awards",
