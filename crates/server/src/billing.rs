@@ -1486,7 +1486,13 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
             // A personal checkout has no organisation tier to reconcile. Re-apply the verified
             // settlement instead; the personal account store makes this equal-timestamp replay
             // idempotent while still requiring the paid webhook evidence.
-            checkout_completed(&mut tx, object, event.created).await?;
+            checkout_completed(
+                &mut tx,
+                object,
+                event.created,
+                event.kind == "checkout.session.async_payment_succeeded",
+            )
+            .await?;
             if let Some(subscription_id) = subscription_id {
                 update_subscription_watermark(&mut tx, &event, &subscription_id).await?;
             }
@@ -1522,7 +1528,13 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
     match disposition {
         EventDisposition::Apply => match event.kind.as_str() {
             "checkout.session.completed" | "checkout.session.async_payment_succeeded" => {
-                checkout_completed(&mut tx, object, event.created).await?
+                checkout_completed(
+                    &mut tx,
+                    object,
+                    event.created,
+                    event.kind == "checkout.session.async_payment_succeeded",
+                )
+                .await?
             }
             "customer.subscription.updated" => subscription_updated(&mut tx, object).await?,
             "customer.subscription.deleted" => subscription_deleted(&mut tx, object).await?,
@@ -1733,6 +1745,7 @@ async fn checkout_completed(
     tx: &mut Transaction<'_, Postgres>,
     object: &serde_json::Value,
     event_created: i64,
+    async_payment_succeeded: bool,
 ) -> Result<()> {
     // Sessions this server creates always carry the org id; anything else isn't ours to act on.
     // Said out loud, because ignoring an event and acting on one are indistinguishable from
@@ -1746,7 +1759,14 @@ async fn checkout_completed(
         return Ok(());
     };
     if let Some(operation_id) = org_id.strip_prefix("personal:") {
-        return personal_checkout_completed(tx, object, event_created, operation_id).await;
+        return personal_checkout_completed(
+            tx,
+            object,
+            event_created,
+            operation_id,
+            async_payment_succeeded,
+        )
+        .await;
     }
     let customer = object["customer"].as_str();
     let subscription = object["subscription"].as_str();
@@ -1795,8 +1815,9 @@ async fn personal_checkout_completed(
     object: &serde_json::Value,
     event_created: i64,
     operation_id: &str,
+    async_payment_succeeded: bool,
 ) -> Result<()> {
-    if object["payment_status"].as_str() != Some("paid") {
+    if !async_payment_succeeded && object["payment_status"].as_str() != Some("paid") {
         // A completed Checkout session is not itself authority. The account remains pending until
         // Stripe says the session is paid, so SCA failures and asynchronous payment methods never
         // become a free hosted term.
