@@ -2,7 +2,8 @@
 -- claims and are never themselves evidence of payment.
 CREATE TABLE billing_founding_capacity (
     singleton BOOLEAN PRIMARY KEY DEFAULT TRUE,
-    max_places BIGINT NOT NULL DEFAULT 100 CHECK (max_places = 100)
+    max_places BIGINT NOT NULL DEFAULT 100 CHECK (max_places = 100),
+    CHECK (singleton)
 );
 
 INSERT INTO billing_founding_capacity (singleton) VALUES (TRUE);
@@ -30,6 +31,10 @@ CREATE TABLE billing_founding_reservations (
 
 CREATE INDEX billing_founding_reservations_beneficiary_idx
     ON billing_founding_reservations (beneficiary_id, status);
+
+CREATE INDEX billing_founding_reservations_expiry_idx
+    ON billing_founding_reservations (quote_expires_at_epoch)
+    WHERE status = 'reserved';
 
 CREATE TABLE billing_founding_awards (
     award_id TEXT PRIMARY KEY,
