@@ -508,7 +508,7 @@ impl SubscriptionProvider for StripeBilling {
         if object["id"].as_str() != Some(subscription_id) {
             return Err(ProviderError::malformed_response());
         }
-        Ok(object["current_period_end"].as_i64())
+        Ok(subscription_period_end(&object))
     }
 
     async fn cancel_subscription(
@@ -2038,7 +2038,7 @@ async fn subscription_updated(
         .bind(subscription_id)
         .execute(&mut **tx)
         .await?;
-        if let Some(period_end) = object["current_period_end"].as_i64() {
+        if let Some(period_end) = subscription_period_end(object) {
             let paid_through = founding_allocator::FoundingDate::from_unix_seconds(period_end)
                 .map_err(|_| {
                     Error::Config("personal subscription has invalid period end".into())
@@ -2092,6 +2092,41 @@ async fn subscription_updated(
     Ok(())
 }
 
+/// Since Stripe API 2025-03-31.basil, subscription billing periods live on the subscription
+/// items rather than on the subscription object. Personal checkout creates one item, but taking
+/// the furthest item end keeps the stored term safe if that shape ever gains another item.
+fn subscription_period_end(object: &serde_json::Value) -> Option<i64> {
+    object["items"]["data"]
+        .as_array()?
+        .iter()
+        .filter_map(|item| item["current_period_end"].as_i64())
+        .filter(|end| *end > 0)
+        .max()
+}
+
+/// Invoice.period_end describes the usage period that produced the invoice and therefore looks
+/// backwards for subscription invoices. The subscription line's period.end is the service term
+/// the paid invoice covers; the top-level field remains a compatibility fallback for old payloads.
+fn invoice_period_end(object: &serde_json::Value) -> Option<i64> {
+    let lines = object["lines"]["data"].as_array();
+    let subscription_line_end = lines.and_then(|lines| {
+        lines
+            .iter()
+            .filter(|line| line["type"].as_str() == Some("subscription"))
+            .filter_map(|line| line["period"]["end"].as_i64())
+            .filter(|end| *end > 0)
+            .max()
+            .or_else(|| {
+                lines
+                    .iter()
+                    .filter_map(|line| line["period"]["end"].as_i64())
+                    .filter(|end| *end > 0)
+                    .max()
+            })
+    });
+    subscription_line_end.or_else(|| object["period_end"].as_i64().filter(|end| *end > 0))
+}
+
 async fn invoice_paid(
     tx: &mut Transaction<'_, Postgres>,
     object: &serde_json::Value,
@@ -2109,14 +2144,7 @@ async fn invoice_paid(
     if !personal {
         return Ok(());
     }
-    let period_end = object["period_end"]
-        .as_i64()
-        .or_else(|| {
-            object["lines"]["data"]
-                .as_array()
-                .and_then(|lines| lines.first())
-                .and_then(|line| line["period"]["end"].as_i64())
-        })
+    let period_end = invoice_period_end(object)
         .ok_or_else(|| Error::Config("paid personal invoice has no period end".into()))?;
     let paid_through = founding_allocator::FoundingDate::from_unix_seconds(period_end)
         .map_err(|_| Error::Config("paid personal invoice has invalid period end".into()))?;
@@ -2645,4 +2673,24 @@ mod tests {
         assert!(personal_checkout_expiry(quote_expiry + 1, now).is_err());
     }
 
+    #[test]
+    fn stripe_period_helpers_use_item_and_line_service_periods() {
+        let subscription = serde_json::json!({
+            "current_period_end": 1_700_000_001,
+            "items": {"data": [
+                {"current_period_end": 1_800_000_000},
+                {"current_period_end": 1_900_000_000}
+            ]}
+        });
+        assert_eq!(subscription_period_end(&subscription), Some(1_900_000_000));
+
+        let invoice = serde_json::json!({
+            "period_end": 1_800_000_000,
+            "lines": {"data": [
+                {"type": "invoiceitem", "period": {"end": 1_850_000_000}},
+                {"type": "subscription", "period": {"end": 1_950_000_000}}
+            ]}
+        });
+        assert_eq!(invoice_period_end(&invoice), Some(1_950_000_000));
+    }
 }

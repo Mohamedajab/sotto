@@ -21,6 +21,7 @@ use sotto_server::billing_catalogue::BillingOffer;
 use sotto_server::billing_operations::{self, BeginOperation};
 use sotto_server::config::{BillingConfig, DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS};
 use sotto_server::db;
+use sotto_server::founding_allocator::FoundingDate;
 use sotto_server::personal_billing;
 use sotto_server::state::AppState;
 
@@ -594,8 +595,73 @@ async fn personal_paid_checkout_webhook_records_provider_term() {
     assert_eq!(account.1, "sub_personal_paid");
     // Paid-through is stored as the UTC billing date anchor, so the provider's timestamp is
     // normalised to midnight rather than retaining the time-of-day component.
-    assert_eq!(account.2, 1_899_936_000);
+    assert_eq!(
+        account.2,
+        FoundingDate::from_unix_seconds(1_900_000_000)
+            .unwrap()
+            .to_unix_seconds()
+    );
     assert_eq!(account.3, "pi_personal_paid");
+
+    let subscription_update = serde_json::json!({
+        "id": "evt_personal_paid_period",
+        "created": 1_800_000_001,
+        "api_version": STRIPE_API_VERSION,
+        "type": "customer.subscription.updated",
+        "data": { "object": {
+            "id": "sub_personal_paid",
+            "status": "active",
+            "cancel_at_period_end": false,
+            "current_period_end": 1_900_000_001,
+            "items": {"data": [{"current_period_end": 2_000_000_000}]},
+            "metadata": {"personal_user_id": user_id}
+        }}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(
+            &app,
+            &subscription_update,
+            Some(&stripe_signature(&subscription_update))
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    let renewal_invoice = serde_json::json!({
+        "id": "evt_personal_paid_invoice",
+        "created": 1_800_000_002,
+        "api_version": STRIPE_API_VERSION,
+        "type": "invoice.paid",
+        "data": { "object": {
+            "id": "in_personal_paid",
+            "subscription": "sub_personal_paid",
+            "payment_intent": "pi_personal_renewal",
+            "period_end": 1_950_000_000,
+            "lines": {"data": [{
+                "type": "subscription",
+                "period": {"end": 2_100_000_000}
+            }]}
+        }}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(
+            &app,
+            &renewal_invoice,
+            Some(&stripe_signature(&renewal_invoice))
+        )
+        .await,
+        StatusCode::OK
+    );
+    let renewed_epoch: i64 = sqlx::query_scalar(
+        "SELECT paid_through_epoch FROM billing_personal_accounts WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("renewed personal account");
+    assert_eq!(renewed_epoch, 2_100_000_000,);
 }
 
 #[tokio::test]
