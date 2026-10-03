@@ -14,14 +14,10 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-#[cfg(feature = "e2e-mock-billing")]
-use axum::extract::Query;
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 #[cfg(feature = "e2e-mock-billing")]
 use axum::response::Html;
-#[cfg(feature = "e2e-mock-billing")]
-use axum::routing::get;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use hmac::{Hmac, Mac};
