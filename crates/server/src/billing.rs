@@ -1531,11 +1531,7 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
         None
     };
     if disposition == EventDisposition::Reconcile {
-        if event.kind == "checkout.session.completed"
-            && object["client_reference_id"]
-                .as_str()
-                .is_some_and(|reference| reference.starts_with("personal:"))
-        {
+        if is_personal_checkout_event(&event) {
             // A personal checkout has no organisation tier to reconcile. Re-apply the verified
             // settlement instead; the personal account store makes this equal-timestamp replay
             // idempotent while still requiring the paid webhook evidence.
