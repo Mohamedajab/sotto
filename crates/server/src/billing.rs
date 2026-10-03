@@ -251,10 +251,11 @@ pub trait SubscriptionProvider: Send + Sync {
         customer: Option<&str>,
         price_id: &str,
         operation_id: &str,
+        idempotency_key: &str,
         success_url: &str,
         cancel_url: &str,
     ) -> ProviderResult<String> {
-        let _ = (price_id, operation_id);
+        let _ = (price_id, operation_id, idempotency_key);
         self.create_checkout(user_id, customer, success_url, cancel_url)
             .await
     }
@@ -401,6 +402,7 @@ impl SubscriptionProvider for StripeBilling {
         customer: Option<&str>,
         price_id: &str,
         operation_id: &str,
+        idempotency_key: &str,
         success_url: &str,
         cancel_url: &str,
     ) -> ProviderResult<String> {
@@ -429,7 +431,13 @@ impl SubscriptionProvider for StripeBilling {
         if let Some(customer) = customer {
             form.push(("customer".to_string(), customer.to_string()));
         }
-        let session = stripe_post(&self.api_key, "checkout/sessions", &form).await?;
+        let session = stripe_post_with_idempotency(
+            &self.api_key,
+            "checkout/sessions",
+            &form,
+            idempotency_key,
+        )
+        .await?;
         session["url"]
             .as_str()
             .map(str::to_string)
@@ -856,13 +864,23 @@ async fn personal_checkout(
             tx.commit().await?;
             operation
         }
-        BeginOperation::AlreadyExists(operation) => {
+        BeginOperation::AlreadyExists(operation)
+            if !matches!(operation.state, BillingOperationState::Pending)
+                || operation.provider_checkout_url.is_some() =>
+        {
             tx.rollback().await?;
             return Ok(Json(PersonalCheckoutView {
                 operation_id: operation.operation_id,
                 state: operation.state.as_str().into(),
                 checkout_url: operation.provider_checkout_url,
             }));
+        }
+        BeginOperation::AlreadyExists(operation) => {
+            // The original provider request may have timed out after Stripe accepted it. Reuse
+            // the stored provider idempotency key and ask again only while the operation is still
+            // pending and has no recorded checkout URL.
+            tx.rollback().await?;
+            operation
         }
     };
     let (success_url, cancel_url) = checkout_return_urls(&billing.return_url);
@@ -873,6 +891,7 @@ async fn personal_checkout(
             None,
             &price_id,
             &operation.operation_id,
+            &operation.provider_idempotency_key,
             &success_url,
             &cancel_url,
         )

@@ -737,7 +737,7 @@ async fn load_by_idempotency(
         "SELECT operation_id, idempotency_key, request_hash, actor_user_id, payer_id, \
          beneficiary_id, offer, quote_version, quote_expires_at_epoch, provider_idempotency_key, \
          provider_operation_id, provider_checkout_url, state, result_code FROM billing_operations \
-         WHERE actor_user_id = $1 AND idempotency_key = $2",
+         WHERE actor_user_id = $1 AND idempotency_key = $2 FOR UPDATE",
     )
     .bind(actor_user_id)
     .bind(idempotency_key)
