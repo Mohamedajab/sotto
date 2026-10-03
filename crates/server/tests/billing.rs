@@ -17,8 +17,11 @@ use sotto_server::billing::{
     BillingState, ProviderResult, SubscriptionObservation, SubscriptionProvider,
     SubscriptionSnapshot, SubscriptionStatus, STRIPE_API_VERSION,
 };
+use sotto_server::billing_catalogue::BillingOffer;
+use sotto_server::billing_operations::{self, BeginOperation};
 use sotto_server::config::{BillingConfig, DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS};
 use sotto_server::db;
+use sotto_server::personal_billing;
 use sotto_server::state::AppState;
 
 const WEBHOOK_SECRET: &str = "whsec_test_secret";
@@ -58,6 +61,7 @@ fn app(pool: PgPool, configured: bool) -> Router {
 
 struct TestProvider {
     observation: SubscriptionObservation,
+    personal_period_end: Option<i64>,
 }
 
 #[async_trait]
@@ -81,6 +85,13 @@ impl SubscriptionProvider for TestProvider {
         _subscription_id: &str,
     ) -> ProviderResult<SubscriptionObservation> {
         Ok(self.observation.clone())
+    }
+
+    async fn personal_subscription_period_end(
+        &self,
+        _subscription_id: &str,
+    ) -> ProviderResult<Option<i64>> {
+        Ok(self.personal_period_end)
     }
 
     async fn cancel_subscription(
@@ -221,6 +232,37 @@ async fn audit_count(pool: &PgPool, org_id: &str, action: &str) -> i64 {
         .fetch_one(pool)
         .await
         .expect("audit count")
+}
+
+async fn seed_personal_account(pool: &PgPool, user_id: &str, idempotency_key: &str) -> String {
+    let mut tx = pool.begin().await.expect("begin personal account seed");
+    let operation = match billing_operations::begin_personal_operation(
+        &mut tx,
+        user_id,
+        idempotency_key,
+        BillingOffer::StandardMonthly,
+        1,
+        2_000_000_000,
+        "https://app.sotto.test",
+        "https://app.sotto.test",
+    )
+    .await
+    .expect("seed personal operation")
+    {
+        BeginOperation::Created(operation) | BeginOperation::AlreadyExists(operation) => operation,
+    };
+    personal_billing::begin_account(
+        &mut tx,
+        user_id,
+        &operation.operation_id,
+        BillingOffer::StandardMonthly,
+        2_000_000_000,
+        1_700_000_000,
+    )
+    .await
+    .expect("seed personal account");
+    tx.commit().await.expect("commit personal account seed");
+    operation.operation_id
 }
 
 #[tokio::test]
@@ -509,6 +551,101 @@ async fn checkout_completed_grants_team_and_audits_once() {
 }
 
 #[tokio::test]
+async fn personal_paid_checkout_webhook_records_provider_term() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let user_id = "billing-user-personal-paid";
+    seed_user(&pool, user_id).await;
+    let operation_id = seed_personal_account(&pool, user_id, "personal-paid-webhook").await;
+    let provider = Arc::new(TestProvider {
+        observation: SubscriptionObservation::Missing,
+        personal_period_end: Some(1_900_000_000),
+    });
+    let app = app_with_provider(pool.clone(), provider);
+    let payload = serde_json::json!({
+        "id": "evt_personal_paid_webhook",
+        "created": 1_800_000_000,
+        "api_version": STRIPE_API_VERSION,
+        "type": "checkout.session.completed",
+        "data": { "object": {
+            "client_reference_id": format!("personal:{operation_id}"),
+            "payment_status": "paid",
+            "customer": "cus_personal_paid",
+            "subscription": "sub_personal_paid",
+            "payment_intent": "pi_personal_paid"
+        }}
+    })
+    .to_string();
+
+    assert_eq!(
+        post_webhook(&app, &payload, Some(&stripe_signature(&payload))).await,
+        StatusCode::OK
+    );
+    let account: (String, String, i64, String) = sqlx::query_as(
+        "SELECT state, stripe_subscription_id, paid_through_epoch, payment_reference \
+         FROM billing_personal_accounts WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("personal account after paid webhook");
+    assert_eq!(account.0, "active");
+    assert_eq!(account.1, "sub_personal_paid");
+    // Paid-through is stored as the UTC billing date anchor, so the provider's timestamp is
+    // normalised to midnight rather than retaining the time-of-day component.
+    assert_eq!(account.2, 1_899_936_000);
+    assert_eq!(account.3, "pi_personal_paid");
+}
+
+#[tokio::test]
+async fn personal_incomplete_expired_webhook_cancels_pending_account() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let user_id = "billing-user-personal-expired";
+    seed_user(&pool, user_id).await;
+    let operation_id = seed_personal_account(&pool, user_id, "personal-expired-webhook").await;
+    let app = app_with_provider(
+        pool.clone(),
+        Arc::new(TestProvider {
+            observation: SubscriptionObservation::Missing,
+            personal_period_end: None,
+        }),
+    );
+    let payload = serde_json::json!({
+        "id": "evt_personal_incomplete_expired",
+        "created": 1_800_000_001,
+        "api_version": STRIPE_API_VERSION,
+        "type": "customer.subscription.updated",
+        "data": { "object": {
+            "id": "sub_personal_expired",
+            "status": "incomplete_expired",
+            "cancel_at_period_end": false,
+            "metadata": {
+                "personal_user_id": user_id,
+                "operation_id": operation_id
+            }
+        }}
+    })
+    .to_string();
+
+    assert_eq!(
+        post_webhook(&app, &payload, Some(&stripe_signature(&payload))).await,
+        StatusCode::OK
+    );
+    let account: (String, String) = sqlx::query_as(
+        "SELECT state, stripe_subscription_id FROM billing_personal_accounts WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("personal account after incomplete expiry");
+    assert_eq!(account.0, "canceled");
+    assert_eq!(account.1, "sub_personal_expired");
+}
+
+#[tokio::test]
 async fn subscription_status_governs_tier() {
     let Some(pool) = pool_or_skip().await else {
         return;
@@ -643,6 +780,7 @@ async fn equal_timestamp_events_reconcile_with_the_provider() {
             id: "sub_test_equal".into(),
             status: SubscriptionStatus::Canceled,
         }),
+        personal_period_end: None,
     });
     let app = app_with_provider(pool.clone(), provider);
     let event = |id: &str, status: &str| {
