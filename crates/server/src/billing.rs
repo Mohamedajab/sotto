@@ -1921,7 +1921,7 @@ async fn subscription_updated(
         };
         sqlx::query(
             "UPDATE billing_personal_accounts SET state = CASE \
-                 WHEN state = 'pending' AND $2 = 'active' THEN state ELSE $2 END, \
+                 WHEN state = 'pending' AND $2 <> 'canceled' THEN state ELSE $2 END, \
                  cancel_at_period_end = $3, updated_at = now() WHERE user_id = $1",
         )
         .bind(user_id)
