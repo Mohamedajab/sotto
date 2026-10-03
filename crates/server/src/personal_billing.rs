@@ -68,6 +68,12 @@ pub enum PersonalBillingError {
     Database(#[from] sqlx::Error),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettlementDisposition {
+    Applied,
+    AlreadyApplied,
+}
+
 /// Reserve the one personal billing account row for an operation. Replaying the same operation is
 /// idempotent; a different operation cannot create a second personal subscription.
 pub async fn begin_account(
@@ -139,6 +145,26 @@ pub async fn record_checkout_url(
     Ok(())
 }
 
+pub async fn record_event(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: &str,
+    operation_id: &str,
+    action: &str,
+    detail: Option<&str>,
+) -> Result<(), PersonalBillingError> {
+    sqlx::query(
+        "INSERT INTO billing_personal_events (user_id, operation_id, action, detail) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(user_id)
+    .bind(operation_id)
+    .bind(action)
+    .bind(detail)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 pub async fn record_paid_settlement(
     tx: &mut Transaction<'_, Postgres>,
     operation_id: &str,
@@ -147,7 +173,7 @@ pub async fn record_paid_settlement(
     payment_reference: &str,
     paid_through_epoch: i64,
     paid_through_date: &str,
-) -> Result<(), PersonalBillingError> {
+) -> Result<SettlementDisposition, PersonalBillingError> {
     let updated = sqlx::query(
         "UPDATE billing_personal_accounts SET state = 'active', stripe_customer_id = $2, \
          stripe_subscription_id = $3, payment_reference = $4, paid_through_epoch = $5, \
@@ -163,7 +189,7 @@ pub async fn record_paid_settlement(
     .fetch_optional(&mut **tx)
     .await?;
     if updated.is_some() {
-        return Ok(());
+        return Ok(SettlementDisposition::Applied);
     }
     let existing = sqlx::query(
         "SELECT stripe_customer_id, stripe_subscription_id, payment_reference, \
@@ -193,7 +219,7 @@ pub async fn record_paid_settlement(
             .as_deref()
             == Some(paid_through_date);
     if same {
-        Ok(())
+        Ok(SettlementDisposition::AlreadyApplied)
     } else {
         Err(PersonalBillingError::SettlementConflict)
     }

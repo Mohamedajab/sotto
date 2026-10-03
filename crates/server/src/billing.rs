@@ -1830,7 +1830,7 @@ async fn personal_checkout_completed(
             }
         }
     }
-    personal_billing::record_paid_settlement(
+    let settlement = personal_billing::record_paid_settlement(
         tx,
         operation_id,
         customer,
@@ -1841,17 +1841,17 @@ async fn personal_checkout_completed(
     )
     .await
     .map_err(personal_billing_error)?;
-    audit::record_tx(
-        &mut *tx,
-        &user_id,
-        "stripe",
-        "billing.personal_paid",
-        audit::Context {
-            detail: Some("personal checkout paid and coverage recorded"),
-            ..Default::default()
-        },
-    )
-    .await?;
+    if matches!(settlement, personal_billing::SettlementDisposition::Applied) {
+        personal_billing::record_event(
+            tx,
+            &user_id,
+            operation_id,
+            "billing.personal_paid",
+            Some("personal checkout paid and coverage recorded"),
+        )
+        .await
+        .map_err(personal_billing_error)?;
+    }
     Ok(())
 }
 
