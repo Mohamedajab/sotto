@@ -454,7 +454,7 @@ impl SubscriptionProvider for StripeBilling {
             &value,
             price_id,
             offer,
-            self.api_key.starts_with("sk_live_"),
+            self.api_key.starts_with("sk_live_") || self.api_key.starts_with("rk_live_"),
         )
     }
 
@@ -2380,6 +2380,34 @@ mod tests {
             ProviderError::transport().kind,
             ProviderErrorKind::Retryable
         );
+    }
+
+    #[test]
+    fn personal_price_validation_rejects_shape_drift_and_accepts_restricted_live_keys() {
+        let price = serde_json::json!({
+            "id": "price_founder",
+            "active": true,
+            "livemode": true,
+            "currency": "gbp",
+            "unit_amount": 199,
+            "recurring": {"interval": "month", "interval_count": 1, "usage_type": "licensed"}
+        });
+        assert!(validate_stripe_personal_price(
+            &price,
+            "price_founder",
+            BillingOffer::FoundingMonthly,
+            true
+        )
+        .is_ok());
+        let mut wrong_amount = price.clone();
+        wrong_amount["unit_amount"] = serde_json::json!(299);
+        assert!(validate_stripe_personal_price(
+            &wrong_amount,
+            "price_founder",
+            BillingOffer::FoundingMonthly,
+            true
+        )
+        .is_err());
     }
 
     #[test]
