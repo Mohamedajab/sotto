@@ -112,7 +112,9 @@ pub async fn record_sponsored_allocation_term(
                 allocation.provider_item_id, allocation.external_allocation_reference, \
                 allocation.coverage_source_id, allocation.effective_from, allocation.effective_until, \
                 allocation.state, allocation.ownership_evidence_reference, \
-                payer.provider_customer_id, payer.payer_kind AS payer_payer_kind, \
+                payer.provider_namespace AS payer_namespace, payer.provider_account_id AS payer_account_id, \
+                payer.provider_environment AS payer_environment, payer.provider_customer_id, \
+                payer.payer_kind AS payer_payer_kind, \
                 source.beneficiary_id AS source_beneficiary_id, source.provider_namespace AS source_namespace, \
                 source.external_allocation_reference AS source_allocation_reference, \
                 source.ownership_evidence_reference AS source_ownership_reference \
@@ -208,7 +210,9 @@ pub async fn load_sponsored_allocation_manifest(
                 allocation.provider_namespace, allocation.provider_account_id, \
                 allocation.provider_environment, allocation.provider_subscription_id, \
                 allocation.ownership_evidence_reference, term.price_id, \
-                payer.provider_customer_id, payer.payer_kind, source.provider_namespace AS source_namespace, \
+                payer.provider_namespace AS payer_namespace, payer.provider_account_id AS payer_account_id, \
+                payer.provider_environment AS payer_environment, payer.provider_customer_id, payer.payer_kind, \
+                source.provider_namespace AS source_namespace, \
                 source.ownership_evidence_reference AS source_ownership_reference \
          FROM cloud_provider_sponsored_allocation_terms AS term \
          JOIN cloud_provider_allocations AS allocation ON allocation.allocation_id = term.allocation_id \
@@ -231,7 +235,9 @@ pub async fn load_sponsored_allocation_manifest(
                 + octet_length(provider_item_id) + octet_length(external_allocation_reference) \
                 + octet_length(coverage_source_id) + octet_length(ownership_evidence_reference) \
                 + octet_length(state) + octet_length(price_id) \
-                + octet_length(provider_customer_id) + octet_length(payer_kind) \
+                + octet_length(payer_namespace) + octet_length(payer_account_id) \
+                + octet_length(payer_environment) + octet_length(provider_customer_id) \
+                + octet_length(payer_kind) \
                 + octet_length(source_namespace) + octet_length(source_ownership_reference) \
                 + 2 * 8), 0)::TEXT AS manifest_bytes \
        FROM candidates",
@@ -267,7 +273,9 @@ pub async fn load_sponsored_allocation_manifest(
                 allocation.external_allocation_reference, allocation.coverage_source_id, \
                 allocation.effective_from, allocation.effective_until, allocation.state, \
                 allocation.ownership_evidence_reference, allocation.payer_kind, \
-                payer.provider_customer_id, payer.payer_kind AS payer_payer_kind, \
+                payer.provider_namespace AS payer_namespace, payer.provider_account_id AS payer_account_id, \
+                payer.provider_environment AS payer_environment, payer.provider_customer_id, \
+                payer.payer_kind AS payer_payer_kind, \
                 term.price_id, term.effective_from AS term_effective_from, \
                 term.effective_until AS term_effective_until, \
                 source.beneficiary_id AS source_beneficiary_id, source.provider_namespace AS source_namespace, \
@@ -346,6 +354,15 @@ fn allocation_row_matches(
             .ok()
             .as_deref()
             == Some(allocation.provider_customer_id.as_str())
+        && row.try_get::<String, _>("payer_namespace").ok().as_deref()
+            == Some(context.namespace.as_str())
+        && row.try_get::<String, _>("payer_account_id").ok().as_deref()
+            == Some(context.account_id.as_str())
+        && row
+            .try_get::<String, _>("payer_environment")
+            .ok()
+            .as_deref()
+            == Some(context.environment.as_str())
         && row
             .try_get::<String, _>("provider_subscription_id")
             .ok()
@@ -406,6 +423,9 @@ fn stored_interval(
 ) -> Result<SponsoredAllocationInterval, SponsoredManifestLoadError> {
     let valid = row.try_get::<String, _>("payer_kind")? == "sponsor"
         && row.try_get::<String, _>("payer_payer_kind")? == "sponsor"
+        && row.try_get::<String, _>("payer_namespace")? == context.namespace
+        && row.try_get::<String, _>("payer_account_id")? == context.account_id
+        && row.try_get::<String, _>("payer_environment")? == context.environment.as_str()
         && row.try_get::<String, _>("provider_namespace")? == context.namespace
         && row.try_get::<String, _>("provider_account_id")? == context.account_id
         && row.try_get::<String, _>("provider_environment")? == context.environment.as_str()

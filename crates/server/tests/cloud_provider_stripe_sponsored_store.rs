@@ -190,6 +190,46 @@ async fn sponsored_terms_are_immutable_and_load_as_a_complete_manifest() {
     conflict.rollback().await.expect("rollback conflict");
 
     sqlx::query(
+        "UPDATE cloud_provider_payers SET provider_account_id = 'tampered-account' WHERE payer_id = $1",
+    )
+    .bind(&allocation.payer_id)
+    .execute(&database.pool)
+    .await
+    .expect("tamper payer");
+    let mut payer_conflict = database.pool.begin().await.expect("begin payer conflict");
+    assert!(matches!(
+        record_sponsored_allocation_term(
+            &mut payer_conflict,
+            &context,
+            &allocation,
+            "price_sponsored_monthly",
+        )
+        .await,
+        Err(SponsoredAllocationTermStoreError::AllocationConflict)
+    ));
+    payer_conflict
+        .rollback()
+        .await
+        .expect("rollback payer conflict");
+    assert!(matches!(
+        load_sponsored_allocation_manifest(
+            &database.pool,
+            &context,
+            &allocation.provider_customer_id,
+            &allocation.subscription_id,
+            SponsoredManifestLoadLimits::default(),
+        )
+        .await,
+        Err(SponsoredManifestLoadError::Corrupt(_))
+    ));
+    sqlx::query("UPDATE cloud_provider_payers SET provider_account_id = $1 WHERE payer_id = $2")
+        .bind(&context.account_id)
+        .bind(&allocation.payer_id)
+        .execute(&database.pool)
+        .await
+        .expect("restore payer");
+
+    sqlx::query(
         "UPDATE cloud_provider_sponsored_allocation_terms \
          SET effective_until = 201 WHERE allocation_id = $1",
     )
