@@ -9,8 +9,8 @@ use sotto_server::billing_catalogue::BillingOffer;
 use sotto_server::billing_operations::{begin_personal_operation, BeginOperation};
 use sotto_server::db;
 use sotto_server::personal_billing::{
-    begin_account, load_account, record_paid_settlement, record_refund_required,
-    PersonalBillingError, PersonalBillingState,
+    advance_paid_through, begin_account, load_account, record_invoice_paid, record_paid_settlement,
+    record_refund_required, PersonalBillingError, PersonalBillingState,
 };
 
 async fn pool_or_skip() -> Option<PgPool> {
@@ -133,16 +133,37 @@ async fn personal_settlement_is_idempotent_and_keeps_paid_term() {
     ));
     settlement_tx.commit().await.expect("commit settlement");
 
+    let mut renewal_tx = pool.begin().await.expect("begin renewal");
+    advance_paid_through(
+        &mut renewal_tx,
+        USER_ID,
+        "sub_personal_test",
+        1_900_000_000,
+        "2030-03-17",
+    )
+    .await
+    .expect("advance paid term");
+    record_invoice_paid(
+        &mut renewal_tx,
+        "sub_personal_test",
+        "pi_personal_renewal",
+        1_900_000_000,
+        "2030-03-17",
+    )
+    .await
+    .expect("record renewal payment");
+    renewal_tx.commit().await.expect("commit renewal");
+
     let mut load_tx = pool.begin().await.expect("begin account load");
     let account = load_account(&mut load_tx, USER_ID)
         .await
         .expect("load account")
         .expect("account exists");
     assert_eq!(account.state, PersonalBillingState::Active);
-    assert_eq!(account.paid_through_date.as_deref(), Some("2027-01-01"));
+    assert_eq!(account.paid_through_date.as_deref(), Some("2030-03-17"));
     assert_eq!(
         account.payment_reference.as_deref(),
-        Some("pi_personal_test")
+        Some("pi_personal_renewal")
     );
     load_tx.rollback().await.expect("rollback account load");
     cleanup(&pool, USER_ID).await;
