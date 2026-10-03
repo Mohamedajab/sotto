@@ -22,6 +22,7 @@ use sotto_server::cloud_provider_stripe_http::{
     StripeReadClient, StripeReadError, StripeReadLimits, StripeReadSession, StripeRefundResource,
     StripeRefundStatus,
 };
+use sotto_server::cloud_provider_stripe_sponsored::SponsoredStripeCoverageConfig;
 use tokio::net::TcpListener;
 use url::Url;
 
@@ -231,6 +232,7 @@ fn paid_invoice() -> Value {
         "currency":"gbp",
         "amount_paid":299,
         "amount_due":299,
+        "amount_remaining":0,
         "amount_overpaid":0,
         "amount_paid_off_stripe":0,
         "livemode":false,
@@ -282,6 +284,28 @@ fn paid_payment() -> Value {
         "livemode":false,
         "payment":{"type":"payment_intent","payment_intent":"pi_1"}
     })
+}
+
+fn sponsored_config() -> SponsoredStripeCoverageConfig {
+    SponsoredStripeCoverageConfig::new(
+        "acct_test_transport",
+        ProviderEnvironment::Test,
+        "price_month",
+        "price_year",
+        "price_founding_month",
+        "price_founding_year",
+    )
+    .unwrap()
+}
+
+fn sponsored_line(id: &str, invoice_id: &str) -> Value {
+    let mut line = personal_line(id);
+    line["quantity"] = json!(2);
+    line["invoice"] = json!(invoice_id);
+    line["parent"]["subscription_item_details"]["subscription_item"] = json!("si_sponsor");
+    line["parent"]["subscription_item_details"]["proration"] = json!(false);
+    line["pricing"]["price_details"]["price"] = json!("price_month");
+    line
 }
 
 fn annual_observation_responses() -> HashMap<String, Vec<MockResponse>> {
@@ -465,6 +489,75 @@ async fn assembles_a_personal_invoice_observation_from_complete_reads() {
         observation.evidence_reference(),
         "stripe:invoice:in_1:line:il_1"
     );
+}
+
+#[tokio::test]
+async fn assembles_a_grouped_sponsored_invoice_without_using_the_personal_reader() {
+    let server = mock_server(observation_responses(
+        paid_invoice(),
+        sponsored_line("il_sponsored", "in_1"),
+        paid_payment(),
+    ))
+    .await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+    let settlement = client
+        .sponsored_invoice_settlement(&mut session, "in_1", "cus_1", "sub_1", &sponsored_config())
+        .await
+        .unwrap();
+    assert_eq!(settlement.invoice_id(), "in_1");
+    assert_eq!(settlement.lines().len(), 1);
+    assert_eq!(settlement.lines()[0].quantity(), 2);
+    assert_eq!(settlement.lines()[0].provider_item_id(), "si_sponsor");
+}
+
+#[tokio::test]
+async fn sponsored_invoice_read_rejects_a_line_bound_to_another_invoice() {
+    let server = mock_server(observation_responses(
+        paid_invoice(),
+        sponsored_line("il_sponsored", "in_other"),
+        paid_payment(),
+    ))
+    .await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+    let error = client
+        .sponsored_invoice_settlement(&mut session, "in_1", "cus_1", "sub_1", &sponsored_config())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StripeReadError::Observation(
+            sotto_server::cloud_provider_stripe::StripeContractError::ContextMismatch
+        )
+    ));
+}
+
+#[tokio::test]
+async fn sponsored_invoice_read_rejects_overpayment_fields() {
+    let mut invoice = paid_invoice();
+    invoice["amount_overpaid"] = json!(1);
+    let server = mock_server(observation_responses(
+        invoice,
+        sponsored_line("il_sponsored", "in_1"),
+        paid_payment(),
+    ))
+    .await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+    let error = client
+        .sponsored_invoice_settlement(&mut session, "in_1", "cus_1", "sub_1", &sponsored_config())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StripeReadError::Observation(
+            sotto_server::cloud_provider_stripe::StripeContractError::UnsupportedSettlement(_)
+        )
+    ));
 }
 
 #[tokio::test]
