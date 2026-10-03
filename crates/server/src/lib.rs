@@ -57,6 +57,8 @@ pub mod cloud_provider_stripe_renewals;
 pub mod cloud_provider_stripe_repair;
 #[doc(hidden)]
 pub mod cloud_provider_stripe_sponsored;
+#[doc(hidden)]
+pub mod cloud_provider_stripe_sponsored_store;
 pub mod community;
 pub mod config;
 pub mod db;
