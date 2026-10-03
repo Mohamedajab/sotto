@@ -1866,6 +1866,9 @@ async fn subscription_updated(
         return Ok(());
     };
     if let Some(user_id) = personal_user_for_subscription(tx, object).await? {
+        let cancel_at_period_end = object["cancel_at_period_end"].as_bool().ok_or_else(|| {
+            Error::Config("personal subscription event has no cancellation state".into())
+        })?;
         let state = match SubscriptionStatus::parse(status) {
             SubscriptionStatus::Active | SubscriptionStatus::Trialing => "active",
             SubscriptionStatus::PastDue | SubscriptionStatus::Paused => "past_due",
@@ -1875,11 +1878,13 @@ async fn subscription_updated(
             SubscriptionStatus::Unknown(_) => return Ok(()),
         };
         sqlx::query(
-            "UPDATE billing_personal_accounts SET state = $2, updated_at = now() \
-             WHERE user_id = $1",
+            "UPDATE billing_personal_accounts SET state = CASE \
+                 WHEN state = 'pending' AND $2 = 'active' THEN state ELSE $2 END, \
+                 cancel_at_period_end = $3, updated_at = now() WHERE user_id = $1",
         )
         .bind(user_id)
         .bind(state)
+        .bind(cancel_at_period_end)
         .execute(&mut **tx)
         .await?;
         return Ok(());
@@ -1930,7 +1935,7 @@ async fn subscription_deleted(
     if let Some(user_id) = personal_user_for_subscription(tx, object).await? {
         sqlx::query(
             "UPDATE billing_personal_accounts SET state = 'canceled', \
-             stripe_subscription_id = NULL, updated_at = now() WHERE user_id = $1",
+             updated_at = now() WHERE user_id = $1",
         )
         .bind(user_id)
         .execute(&mut **tx)
