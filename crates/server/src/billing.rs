@@ -1788,9 +1788,7 @@ fn event_subscription_id(event: &Event) -> Option<String> {
                 .as_str()
                 .map(str::to_string)
         }
-        "invoice.paid" => event.data.object["subscription"]
-            .as_str()
-            .map(str::to_string),
+        "invoice.paid" => invoice_subscription_id(&event.data.object).map(str::to_string),
         "customer.subscription.updated" | "customer.subscription.deleted" => {
             event.data.object["id"].as_str().map(str::to_string)
         }
@@ -2112,7 +2110,10 @@ fn invoice_period_end(object: &serde_json::Value) -> Option<i64> {
     let subscription_line_end = lines.and_then(|lines| {
         lines
             .iter()
-            .filter(|line| line["type"].as_str() == Some("subscription"))
+            .filter(|line| {
+                line["parent"]["type"].as_str() == Some("subscription_item_details")
+                    || line["type"].as_str() == Some("subscription")
+            })
             .filter_map(|line| line["period"]["end"].as_i64())
             .filter(|end| *end > 0)
             .max()
@@ -2127,11 +2128,15 @@ fn invoice_period_end(object: &serde_json::Value) -> Option<i64> {
     subscription_line_end.or_else(|| object["period_end"].as_i64().filter(|end| *end > 0))
 }
 
+fn invoice_subscription_id(object: &serde_json::Value) -> Option<&str> {
+    object["parent"]["subscription_details"]["subscription"].as_str()
+}
+
 async fn invoice_paid(
     tx: &mut Transaction<'_, Postgres>,
     object: &serde_json::Value,
 ) -> Result<()> {
-    let Some(subscription_id) = object["subscription"].as_str() else {
+    let Some(subscription_id) = invoice_subscription_id(object) else {
         return Ok(());
     };
     let personal: bool = sqlx::query_scalar(
@@ -2688,9 +2693,12 @@ mod tests {
             "period_end": 1_800_000_000,
             "lines": {"data": [
                 {"type": "invoiceitem", "period": {"end": 1_850_000_000}},
-                {"type": "subscription", "period": {"end": 1_950_000_000}}
-            ]}
+                {"parent": {"type": "subscription_item_details"},
+                 "period": {"end": 1_950_000_000}}
+            ]},
+            "parent": {"subscription_details": {"subscription": "sub-1"}}
         });
         assert_eq!(invoice_period_end(&invoice), Some(1_950_000_000));
+        assert_eq!(invoice_subscription_id(&invoice), Some("sub-1"));
     }
 }
