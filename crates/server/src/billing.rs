@@ -129,7 +129,6 @@ impl ProviderError {
         }
     }
 
-    #[cfg(feature = "e2e-mock-billing")]
     fn unsupported(operation: &str) -> Self {
         Self {
             status: None,
@@ -258,6 +257,16 @@ pub trait SubscriptionProvider: Send + Sync {
         let _ = (price_id, operation_id);
         self.create_checkout(user_id, customer, success_url, cancel_url)
             .await
+    }
+
+    /// Validate the configured Stripe price before quoting or creating a personal checkout.
+    /// Providers that cannot authenticate their price catalogue keep this route disabled.
+    async fn validate_personal_price(
+        &self,
+        _price_id: &str,
+        _offer: BillingOffer,
+    ) -> ProviderResult<()> {
+        Err(ProviderError::unsupported("personal_price_validation"))
     }
 
     async fn create_portal(&self, customer: &str, return_url: &str) -> ProviderResult<String>;
@@ -427,6 +436,20 @@ impl SubscriptionProvider for StripeBilling {
             .ok_or_else(ProviderError::malformed_response)
     }
 
+    async fn validate_personal_price(
+        &self,
+        price_id: &str,
+        offer: BillingOffer,
+    ) -> ProviderResult<()> {
+        let value = stripe_get(&self.api_key, &format!("prices/{price_id}")).await?;
+        validate_stripe_personal_price(
+            &value,
+            price_id,
+            offer,
+            self.api_key.starts_with("sk_live_"),
+        )
+    }
+
     async fn create_portal(&self, customer: &str, return_url: &str) -> ProviderResult<String> {
         let form = vec![
             ("customer".to_string(), customer.to_string()),
@@ -530,6 +553,14 @@ impl SubscriptionProvider for E2eBilling {
 
     async fn create_portal(&self, _customer: &str, return_url: &str) -> ProviderResult<String> {
         self.page_url("portal", &[("return_url", return_url)])
+    }
+
+    async fn validate_personal_price(
+        &self,
+        _price_id: &str,
+        _offer: BillingOffer,
+    ) -> ProviderResult<()> {
+        Ok(())
     }
 
     async fn get_subscription(
@@ -659,6 +690,20 @@ fn billing_offer(value: &str) -> Result<BillingOffer> {
         .ok_or_else(|| Error::BadRequest("unsupported billing offer".into()))
 }
 
+async fn validate_personal_catalogue(
+    billing: &BillingState,
+    catalogue: &BillingPriceIds,
+) -> Result<()> {
+    for offer in BillingOffer::ALL {
+        billing
+            .provider
+            .validate_personal_price(catalogue.id_for(offer), offer)
+            .await
+            .map_err(ProviderError::into_error)?;
+    }
+    Ok(())
+}
+
 fn billing_epoch() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -688,10 +733,11 @@ async fn personal_quote(
     Query(query): Query<PersonalQuoteQuery>,
 ) -> Result<Json<PersonalQuoteView>> {
     let billing = billing_config(&state)?;
-    let _catalogue = billing
+    let catalogue = billing
         .price_catalogue()
         .ok_or_else(|| Error::NotConfigured("hosted personal billing is not configured".into()))?;
     let offer = billing_offer(&query.offer)?;
+    validate_personal_catalogue(billing, catalogue).await?;
     let now = billing_epoch();
     let expires = now
         .checked_add(founding_allocator::RESERVATION_SECONDS)
@@ -765,6 +811,7 @@ async fn personal_checkout(
         .price_catalogue()
         .ok_or_else(|| Error::NotConfigured("hosted personal billing is not configured".into()))?;
     let offer = billing_offer(&request.offer)?;
+    validate_personal_catalogue(billing, catalogue).await?;
     let price_id = catalogue.id_for(offer).to_string();
     billing_operations::validate_return_url(&billing.return_url, &request.return_url)
         .map_err(Error::from)?;
@@ -1198,6 +1245,41 @@ async fn stripe_get(api_key: &str, path: &str) -> ProviderResult<serde_json::Val
         .await
         .map_err(|_| ProviderError::transport())?;
     stripe_response(response).await
+}
+
+fn validate_stripe_personal_price(
+    value: &serde_json::Value,
+    price_id: &str,
+    offer: BillingOffer,
+    expected_livemode: bool,
+) -> ProviderResult<()> {
+    if value["id"].as_str() != Some(price_id)
+        || value["active"].as_bool() != Some(true)
+        || value["livemode"].as_bool() != Some(expected_livemode)
+        || value["currency"].as_str() != Some("gbp")
+        || value["unit_amount"].as_i64() != Some(offer.expected_amount_pence())
+    {
+        return Err(ProviderError::malformed_response());
+    }
+    let recurring = value["recurring"]
+        .as_object()
+        .ok_or_else(ProviderError::malformed_response)?;
+    if recurring
+        .get("interval")
+        .and_then(serde_json::Value::as_str)
+        != Some(offer.expected_interval().as_str())
+        || recurring
+            .get("interval_count")
+            .and_then(serde_json::Value::as_i64)
+            != Some(1)
+        || recurring
+            .get("usage_type")
+            .and_then(serde_json::Value::as_str)
+            != Some("licensed")
+    {
+        return Err(ProviderError::malformed_response());
+    }
+    Ok(())
 }
 
 /// Delete one Stripe resource with an idempotency key and the explicit cancellation form.
