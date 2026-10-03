@@ -11,18 +11,18 @@
 
 use std::fmt;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 #[cfg(feature = "e2e-mock-billing")]
 use axum::extract::Query;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 #[cfg(feature = "e2e-mock-billing")]
 use axum::response::Html;
 #[cfg(feature = "e2e-mock-billing")]
 use axum::routing::get;
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -33,8 +33,12 @@ use sqlx::{Postgres, Transaction};
 use url::Url;
 
 use crate::auth::AuthUser;
+use crate::billing_catalogue::{BillingOffer, BillingPriceIds};
+use crate::billing_operations::{self, BeginOperation, BillingOperationState};
 use crate::config::BillingConfig;
 use crate::error::{Error, Result};
+use crate::founding_allocator::{self, FoundingOffer};
+use crate::personal_billing;
 use crate::state::AppState;
 use crate::{audit, org};
 
@@ -243,6 +247,23 @@ pub trait SubscriptionProvider: Send + Sync {
         cancel_url: &str,
     ) -> ProviderResult<String>;
 
+    /// Create a personal checkout using a server-selected catalogue price. The default keeps
+    /// existing provider adapters source-compatible; hosted Stripe overrides it with the personal
+    /// metadata and selected price.
+    async fn create_personal_checkout(
+        &self,
+        user_id: &str,
+        customer: Option<&str>,
+        price_id: &str,
+        operation_id: &str,
+        success_url: &str,
+        cancel_url: &str,
+    ) -> ProviderResult<String> {
+        let _ = (price_id, operation_id);
+        self.create_checkout(user_id, customer, success_url, cancel_url)
+            .await
+    }
+
     async fn create_portal(&self, customer: &str, return_url: &str) -> ProviderResult<String>;
 
     async fn get_subscription(
@@ -268,12 +289,17 @@ pub struct BillingState {
     provider: Arc<dyn SubscriptionProvider>,
     webhook_secret: String,
     return_url: String,
+    price_catalogue: Option<BillingPriceIds>,
 }
 
 impl BillingState {
     /// Share the provider with the deletion worker without exposing billing credentials.
     pub fn provider(&self) -> Arc<dyn SubscriptionProvider> {
         Arc::clone(&self.provider)
+    }
+
+    pub fn price_catalogue(&self) -> Option<&BillingPriceIds> {
+        self.price_catalogue.as_ref()
     }
 
     pub fn from_config(config: BillingConfig) -> Self {
@@ -285,6 +311,7 @@ impl BillingState {
             provider: Arc::new(provider),
             webhook_secret: config.webhook_secret,
             return_url: config.return_url,
+            price_catalogue: config.price_catalogue,
         }
     }
 
@@ -297,6 +324,7 @@ impl BillingState {
             provider,
             webhook_secret,
             return_url,
+            price_catalogue: None,
         }
     }
 
@@ -306,6 +334,7 @@ impl BillingState {
             provider: Arc::new(E2eBilling { provider_origin }),
             webhook_secret: config.webhook_secret,
             return_url: config.return_url,
+            price_catalogue: config.price_catalogue,
         }
     }
 }
@@ -342,6 +371,47 @@ impl SubscriptionProvider for StripeBilling {
             form.push(("customer".to_string(), customer.to_string()));
         }
 
+        let session = stripe_post(&self.api_key, "checkout/sessions", &form).await?;
+        session["url"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(ProviderError::malformed_response)
+    }
+
+    async fn create_personal_checkout(
+        &self,
+        user_id: &str,
+        customer: Option<&str>,
+        price_id: &str,
+        operation_id: &str,
+        success_url: &str,
+        cancel_url: &str,
+    ) -> ProviderResult<String> {
+        if price_id.is_empty() {
+            return Err(ProviderError::malformed_response());
+        }
+        let mut form = vec![
+            ("mode".to_string(), "subscription".to_string()),
+            ("line_items[0][price]".to_string(), price_id.to_string()),
+            ("line_items[0][quantity]".to_string(), "1".to_string()),
+            (
+                "client_reference_id".to_string(),
+                format!("personal:{operation_id}"),
+            ),
+            (
+                "subscription_data[metadata][personal_user_id]".to_string(),
+                user_id.to_string(),
+            ),
+            (
+                "subscription_data[metadata][operation_id]".to_string(),
+                operation_id.to_string(),
+            ),
+            ("success_url".to_string(), success_url.to_string()),
+            ("cancel_url".to_string(), cancel_url.to_string()),
+        ];
+        if let Some(customer) = customer {
+            form.push(("customer".to_string(), customer.to_string()));
+        }
         let session = stripe_post(&self.api_key, "checkout/sessions", &form).await?;
         session["url"]
             .as_str()
@@ -468,6 +538,12 @@ pub fn router() -> Router<AppState> {
     let router = Router::new()
         .route("/orgs/{org_id}/billing/checkout", post(create_checkout))
         .route("/orgs/{org_id}/billing/portal", post(create_portal))
+        .route("/billing/personal/quote", get(personal_quote))
+        .route("/billing/personal/checkout", post(personal_checkout))
+        .route(
+            "/billing/personal/operations/{operation_id}",
+            get(personal_operation),
+        )
         .route("/billing/webhook", post(webhook));
 
     #[cfg(feature = "e2e-mock-billing")]
@@ -499,6 +575,262 @@ async fn require_billing_admin(
         ));
     }
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct PersonalQuoteQuery {
+    offer: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PersonalQuoteView {
+    offer: String,
+    amount_pence: i64,
+    currency: &'static str,
+    interval: &'static str,
+    tax_treatment: &'static str,
+    quote_version: i64,
+    quote_expires_at_epoch: i64,
+    founding: bool,
+    founding_remaining_places: Option<i64>,
+    founding_term: Option<&'static str>,
+    next_renewal_amount_pence: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct PersonalCheckoutRequest {
+    offer: String,
+    idempotency_key: String,
+    quote_version: i64,
+    quote_expires_at_epoch: i64,
+    return_url: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PersonalCheckoutView {
+    operation_id: String,
+    state: String,
+    checkout_url: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PersonalOperationView {
+    operation_id: String,
+    offer: String,
+    state: String,
+    provider_operation_id: Option<String>,
+    checkout_url: Option<String>,
+}
+
+fn billing_offer(value: &str) -> Result<BillingOffer> {
+    BillingOffer::ALL
+        .into_iter()
+        .find(|offer| offer.as_str() == value)
+        .ok_or_else(|| Error::BadRequest("unsupported billing offer".into()))
+}
+
+fn billing_epoch() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_secs() as i64
+}
+
+fn personal_billing_error(error: personal_billing::PersonalBillingError) -> Error {
+    match error {
+        personal_billing::PersonalBillingError::AccountExists => {
+            Error::Conflict("a personal billing account already exists".into())
+        }
+        personal_billing::PersonalBillingError::CorruptState => {
+            Error::Internal("personal billing state is corrupt".into())
+        }
+        personal_billing::PersonalBillingError::Database(error) => Error::Db(error),
+    }
+}
+
+/// `GET /billing/personal/quote` - return a server-selected, short-lived person quote.
+async fn personal_quote(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Query(query): Query<PersonalQuoteQuery>,
+) -> Result<Json<PersonalQuoteView>> {
+    let billing = billing_config(&state)?;
+    let _catalogue = billing
+        .price_catalogue()
+        .ok_or_else(|| Error::NotConfigured("hosted personal billing is not configured".into()))?;
+    let offer = billing_offer(&query.offer)?;
+    let now = billing_epoch();
+    let expires = now
+        .checked_add(founding_allocator::RESERVATION_SECONDS)
+        .ok_or_else(|| Error::Internal("billing clock overflow".into()))?;
+    let mut tx = state.pool.begin().await?;
+    if personal_billing::load_account(&mut tx, &user.user_id)
+        .await
+        .map_err(personal_billing_error)?
+        .is_some()
+    {
+        return Err(Error::Conflict(
+            "personal billing is already active or pending".into(),
+        ));
+    }
+    let sponsored: Option<String> = sqlx::query_scalar(
+        "SELECT allocation_id FROM cloud_provider_allocations \
+         WHERE beneficiary_id = $1 AND state IN ('pending', 'active') LIMIT 1",
+    )
+    .bind(&user.user_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if sponsored.is_some() {
+        return Err(Error::Conflict(
+            "this person already has sponsored hosted coverage".into(),
+        ));
+    }
+    let amount_pence = offer.expected_amount_pence();
+    let interval = offer.expected_interval();
+    let founding = FoundingOffer::from_billing_offer(offer);
+    let (remaining, founding_term, next_renewal) = if let Some(founding_offer) = founding {
+        let status = founding_allocator::quote_status(&mut tx, founding_offer, now)
+            .await
+            .map_err(|error| Error::Internal(error.to_string()))?;
+        (
+            Some(status.remaining_places),
+            Some(match founding_offer {
+                FoundingOffer::Monthly => "through the founding monthly term",
+                FoundingOffer::Annual => "through the founding annual term",
+            }),
+            status.standard_amount_pence,
+        )
+    } else {
+        (None, None, amount_pence)
+    };
+    tx.rollback().await?;
+    Ok(Json(PersonalQuoteView {
+        offer: offer.as_str().into(),
+        amount_pence,
+        currency: "gbp",
+        interval: interval.as_str(),
+        tax_treatment: "shown_at_checkout",
+        quote_version: 1,
+        quote_expires_at_epoch: expires,
+        founding: founding.is_some(),
+        founding_remaining_places: remaining,
+        founding_term,
+        next_renewal_amount_pence: next_renewal,
+    }))
+}
+
+/// `POST /billing/personal/checkout` - persist the operation before asking Stripe for a hosted
+/// page. The provider result is the creation of the checkout session; coverage waits for the
+/// verified paid webhook handled below.
+async fn personal_checkout(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(request): Json<PersonalCheckoutRequest>,
+) -> Result<Json<PersonalCheckoutView>> {
+    let billing = billing_config(&state)?;
+    let catalogue = billing
+        .price_catalogue()
+        .ok_or_else(|| Error::NotConfigured("hosted personal billing is not configured".into()))?;
+    let offer = billing_offer(&request.offer)?;
+    let price_id = catalogue.id_for(offer).to_string();
+    billing_operations::validate_return_url(&billing.return_url, &request.return_url)
+        .map_err(Error::from)?;
+    let mut tx = state.pool.begin().await?;
+    let operation = billing_operations::begin_personal_operation(
+        &mut tx,
+        &user.user_id,
+        &request.idempotency_key,
+        offer,
+        request.quote_version,
+        request.quote_expires_at_epoch,
+        &billing.return_url,
+        &request.return_url,
+    )
+    .await
+    .map_err(Error::from)?;
+    let operation = match operation {
+        BeginOperation::Created(operation) => {
+            personal_billing::begin_account(&mut tx, &user.user_id, &operation.operation_id, offer)
+                .await
+                .map_err(personal_billing_error)?;
+            if let Some(founding_offer) = FoundingOffer::from_billing_offer(offer) {
+                founding_allocator::reserve(
+                    &mut tx,
+                    &format!("founding:{}", operation.operation_id),
+                    &operation.operation_id,
+                    &user.user_id,
+                    &user.user_id,
+                    founding_offer,
+                    request.quote_version,
+                    request.quote_expires_at_epoch,
+                    billing_epoch(),
+                )
+                .await
+                .map_err(|error| Error::Conflict(error.to_string()))?;
+            }
+            tx.commit().await?;
+            operation
+        }
+        BeginOperation::AlreadyExists(operation) => {
+            tx.rollback().await?;
+            return Ok(Json(PersonalCheckoutView {
+                operation_id: operation.operation_id,
+                state: operation.state.as_str().into(),
+                checkout_url: operation.provider_checkout_url,
+            }));
+        }
+    };
+    let (success_url, cancel_url) = checkout_return_urls(&billing.return_url);
+    let checkout_url = billing
+        .provider
+        .create_personal_checkout(
+            &user.user_id,
+            None,
+            &price_id,
+            &operation.operation_id,
+            &success_url,
+            &cancel_url,
+        )
+        .await
+        .map_err(ProviderError::into_error)?;
+    let mut result_tx = state.pool.begin().await?;
+    personal_billing::record_checkout_url(&mut result_tx, &operation.operation_id, &checkout_url)
+        .await
+        .map_err(personal_billing_error)?;
+    let result = billing_operations::record_provider_result(
+        &mut result_tx,
+        &operation.operation_id,
+        BillingOperationState::Succeeded,
+        None,
+        Some("checkout_created"),
+    )
+    .await
+    .map_err(Error::from)?;
+    result_tx.commit().await?;
+    Ok(Json(PersonalCheckoutView {
+        operation_id: result.operation_id,
+        state: result.state.as_str().into(),
+        checkout_url: Some(checkout_url),
+    }))
+}
+
+async fn personal_operation(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(operation_id): Path<String>,
+) -> Result<Json<PersonalOperationView>> {
+    let operation =
+        billing_operations::load_operation_for_actor(&state.pool, &operation_id, &user.user_id)
+            .await
+            .map_err(Error::from)?
+            .ok_or_else(|| Error::NotFound("billing operation not found".into()))?;
+    Ok(Json(PersonalOperationView {
+        operation_id: operation.operation_id,
+        offer: operation.offer,
+        state: operation.state.as_str().into(),
+        provider_operation_id: operation.provider_operation_id,
+        checkout_url: operation.provider_checkout_url,
+    }))
 }
 
 /// A provider-hosted page for the browser to navigate to.

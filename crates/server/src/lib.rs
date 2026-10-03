@@ -64,6 +64,7 @@ pub mod error;
 pub mod health;
 pub mod machine;
 pub mod org;
+pub mod personal_billing;
 // The lifecycle seam, HTTP adapter, and worker remain doc-hidden: deletion is enabled per
 // deployment rather than presented as a stable public API surface, and the internal seam is not
 // something an embedder should call directly.

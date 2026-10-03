@@ -24,7 +24,7 @@ pub enum BillingOperationState {
 }
 
 impl BillingOperationState {
-    fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
             Self::Succeeded => "succeeded",
@@ -186,6 +186,7 @@ pub struct BillingOperation {
     pub quote_expires_at_epoch: i64,
     pub provider_idempotency_key: String,
     pub provider_operation_id: Option<String>,
+    pub provider_checkout_url: Option<String>,
     pub state: BillingOperationState,
     pub result_code: Option<String>,
 }
@@ -665,13 +666,36 @@ pub async fn load_reconciliation_candidates(
     let rows = sqlx::query(
         "SELECT operation_id, idempotency_key, request_hash, actor_user_id, payer_id, \
          beneficiary_id, offer, quote_version, quote_expires_at_epoch, provider_idempotency_key, \
-         provider_operation_id, state, result_code FROM billing_operations \
+         provider_operation_id, provider_checkout_url, state, result_code FROM billing_operations \
          WHERE state IN ('pending','unknown') ORDER BY updated_at, operation_id LIMIT $1",
     )
     .bind(limit)
     .fetch_all(pool)
     .await?;
     rows.into_iter().map(operation_from_row).collect()
+}
+
+/// Load one operation only when it belongs to the authenticated actor. A missing row and a row
+/// owned by another person are intentionally indistinguishable to the HTTP surface.
+pub async fn load_operation_for_actor(
+    pool: &PgPool,
+    operation_id: &str,
+    actor_user_id: &str,
+) -> Result<Option<BillingOperation>, BillingOperationError> {
+    let row = sqlx::query(
+        "SELECT operation_id, idempotency_key, request_hash, actor_user_id, payer_id, \
+         beneficiary_id, offer, quote_version, quote_expires_at_epoch, provider_idempotency_key, \
+         provider_operation_id, provider_checkout_url, state, result_code \
+         FROM billing_operations WHERE operation_id = $1",
+    )
+    .bind(operation_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let operation = operation_from_row(row)?;
+    Ok((operation.actor_user_id == actor_user_id).then_some(operation))
 }
 
 async fn load_operation(
@@ -681,7 +705,7 @@ async fn load_operation(
     let row = sqlx::query(
         "SELECT operation_id, idempotency_key, request_hash, actor_user_id, payer_id, \
          beneficiary_id, offer, quote_version, quote_expires_at_epoch, provider_idempotency_key, \
-         provider_operation_id, state, result_code FROM billing_operations WHERE operation_id = $1",
+         provider_operation_id, provider_checkout_url, state, result_code FROM billing_operations WHERE operation_id = $1",
     )
     .bind(operation_id)
     .fetch_one(&mut **tx)
@@ -696,7 +720,7 @@ async fn load_operation_by_id(
     let row = sqlx::query(
         "SELECT operation_id, idempotency_key, request_hash, actor_user_id, payer_id, \
          beneficiary_id, offer, quote_version, quote_expires_at_epoch, provider_idempotency_key, \
-         provider_operation_id, state, result_code FROM billing_operations WHERE operation_id = $1",
+         provider_operation_id, provider_checkout_url, state, result_code FROM billing_operations WHERE operation_id = $1",
     )
     .bind(operation_id)
     .fetch_one(pool)
@@ -712,7 +736,7 @@ async fn load_by_idempotency(
     let row = sqlx::query(
         "SELECT operation_id, idempotency_key, request_hash, actor_user_id, payer_id, \
          beneficiary_id, offer, quote_version, quote_expires_at_epoch, provider_idempotency_key, \
-         provider_operation_id, state, result_code FROM billing_operations \
+         provider_operation_id, provider_checkout_url, state, result_code FROM billing_operations \
          WHERE actor_user_id = $1 AND idempotency_key = $2",
     )
     .bind(actor_user_id)
@@ -737,6 +761,7 @@ fn operation_from_row(
         quote_expires_at_epoch: row.try_get("quote_expires_at_epoch")?,
         provider_idempotency_key: row.try_get("provider_idempotency_key")?,
         provider_operation_id: row.try_get("provider_operation_id")?,
+        provider_checkout_url: row.try_get("provider_checkout_url")?,
         state: BillingOperationState::parse(row.try_get::<String, _>("state")?.as_str())?,
         result_code: row.try_get("result_code")?,
     })
