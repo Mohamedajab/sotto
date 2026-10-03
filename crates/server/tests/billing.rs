@@ -627,6 +627,19 @@ async fn personal_paid_checkout_webhook_records_provider_term() {
         .await,
         StatusCode::OK
     );
+    let rollover_epoch: i64 = sqlx::query_scalar(
+        "SELECT paid_through_epoch FROM billing_personal_accounts WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("personal account after subscription rollover");
+    assert_eq!(
+        rollover_epoch,
+        FoundingDate::from_unix_seconds(1_900_000_000)
+            .unwrap()
+            .to_unix_seconds()
+    );
 
     let renewal_invoice = serde_json::json!({
         "id": "evt_personal_paid_invoice",

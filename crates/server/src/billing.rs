@@ -2036,21 +2036,6 @@ async fn subscription_updated(
         .bind(subscription_id)
         .execute(&mut **tx)
         .await?;
-        if let Some(period_end) = subscription_period_end(object) {
-            let paid_through = founding_allocator::FoundingDate::from_unix_seconds(period_end)
-                .map_err(|_| {
-                    Error::Config("personal subscription has invalid period end".into())
-                })?;
-            personal_billing::advance_paid_through(
-                tx,
-                &user_id,
-                subscription_id,
-                period_end,
-                &paid_through.to_string(),
-            )
-            .await
-            .map_err(personal_billing_error)?;
-        }
         return Ok(());
     }
     let Some(org_id) = org_for_subscription(tx, object).await? else {
