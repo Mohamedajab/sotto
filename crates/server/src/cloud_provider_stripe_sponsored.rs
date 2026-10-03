@@ -279,6 +279,17 @@ impl SponsoredAllocationManifest {
         for (index, allocation) in self.allocations.iter().enumerate() {
             allocation.validate()?;
             if self.allocations[..index].iter().any(|previous| {
+                previous.allocation_reference == allocation.allocation_reference
+                    && previous.overlaps(
+                        allocation.effective_from,
+                        allocation.effective_until.unwrap_or(i64::MAX),
+                    )
+            }) {
+                return Err(SponsoredCoverageError::ConflictingAllocationReference {
+                    allocation_reference: allocation.allocation_reference.clone(),
+                });
+            }
+            if self.allocations[..index].iter().any(|previous| {
                 previous.beneficiary_id == allocation.beneficiary_id
                     && previous.overlaps(
                         allocation.effective_from,
@@ -451,6 +462,16 @@ impl SponsoredInvoiceSettlement {
         if self.lines.is_empty() {
             return Err(SponsoredCoverageError::InvalidInput("invoice lines"));
         }
+        for (index, line) in self.lines.iter().enumerate() {
+            if self.lines[..index]
+                .iter()
+                .any(|previous| previous.line_id == line.line_id)
+            {
+                return Err(SponsoredCoverageError::InvalidInput(
+                    "invoice line ids must differ",
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -579,6 +600,8 @@ pub enum SponsoredCoverageError {
     ContextMismatch { field: &'static str },
     #[error("beneficiary has overlapping allocation intervals: {beneficiary_id}")]
     ConcurrentAllocation { beneficiary_id: String },
+    #[error("allocation reference is reused over an overlapping interval: {allocation_reference}")]
+    ConflictingAllocationReference { allocation_reference: String },
 }
 
 /// Convert one fully settled sponsored invoice into beneficiary-scoped paid intervals.
@@ -1040,6 +1063,24 @@ mod tests {
         assert!(matches!(
             result,
             Err(SponsoredCoverageError::ConcurrentAllocation { .. })
+        ));
+    }
+
+    #[test]
+    fn allocation_reference_cannot_cover_two_people_at_once() {
+        let result = SponsoredAllocationManifest::new(
+            "acct_test",
+            ProviderEnvironment::Test,
+            "cus_1",
+            "sub_1",
+            vec![
+                allocation("same", "user_1", "item_1", "price_standard_month", 0, None),
+                allocation("same", "user_2", "item_1", "price_standard_month", 0, None),
+            ],
+        );
+        assert!(matches!(
+            result,
+            Err(SponsoredCoverageError::ConflictingAllocationReference { .. })
         ));
     }
 
