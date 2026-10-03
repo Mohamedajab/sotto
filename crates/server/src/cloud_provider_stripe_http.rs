@@ -519,10 +519,34 @@ impl StripeReadClient {
         let amount_paid = invoice
             .amount_paid
             .ok_or(StripeReadError::MalformedResponse("invoice.amount_paid"))?;
+        let amount_remaining =
+            invoice
+                .amount_remaining
+                .ok_or(StripeReadError::MalformedResponse(
+                    "invoice.amount_remaining",
+                ))?;
+        let amount_overpaid = invoice
+            .amount_overpaid
+            .ok_or(StripeReadError::MalformedResponse(
+                "invoice.amount_overpaid",
+            ))?;
+        let amount_paid_off_stripe =
+            invoice
+                .amount_paid_off_stripe
+                .ok_or(StripeReadError::MalformedResponse(
+                    "invoice.amount_paid_off_stripe",
+                ))?;
         let currency = invoice
             .currency
             .clone()
             .ok_or(StripeReadError::MalformedResponse("invoice.currency"))?;
+        if amount_remaining != 0 || amount_overpaid != 0 || amount_paid_off_stripe != 0 {
+            return Err(StripeReadError::Observation(
+                StripeContractError::UnsupportedSettlement(
+                    "sponsored invoice has unresolved financial amounts",
+                ),
+            ));
+        }
         if payment.invoice_id() != invoice_id
             || payment.amount_requested() != amount_due
             || payment.amount_paid() != amount_paid
@@ -538,6 +562,10 @@ impl StripeReadClient {
                 || line.pricing_type.as_deref() != Some("price_details")
                 || line.livemode != Some(matches!(self.environment, ProviderEnvironment::Live))
                 || line.subscription_id.as_deref() != Some(subscription_id)
+                || line
+                    .invoice_id
+                    .as_deref()
+                    .is_some_and(|line_invoice_id| line_invoice_id != invoice_id)
             {
                 return Err(StripeReadError::Observation(
                     StripeContractError::ContextMismatch,
