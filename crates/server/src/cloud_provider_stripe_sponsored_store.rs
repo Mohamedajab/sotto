@@ -51,6 +51,8 @@ pub enum SponsoredAllocationTermStoreError {
     AllocationConflict,
     #[error("sponsored allocation has no registered owner")]
     AllocationMissing,
+    #[error("sponsored allocation has no persisted term")]
+    TermMissing,
     #[error("sponsored allocation term conflicts with the registered term")]
     TermConflict,
 }
@@ -86,6 +88,8 @@ impl SponsoredManifestLoadLimits {
 pub enum SponsoredManifestLoadError {
     #[error("sponsored manifest load limits must be nonzero and fit in a database integer")]
     InvalidLimits,
+    #[error("sponsored manifest period must be nonnegative and end after it starts")]
+    InvalidPeriod,
     #[error("sponsored allocation manifest exceeded the row bound of {limit}")]
     TooManyRows { limit: usize },
     #[error("sponsored allocation manifest exceeded the byte bound of {limit}")]
@@ -309,6 +313,8 @@ pub async fn load_sponsored_allocation_manifest(
     context: &ProviderContext,
     customer_id: &str,
     subscription_id: &str,
+    period_start: i64,
+    period_end: i64,
     limits: SponsoredManifestLoadLimits,
 ) -> Result<SponsoredAllocationManifest, SponsoredManifestLoadError> {
     let row_limit = limits.validate()?;
@@ -319,6 +325,9 @@ pub async fn load_sponsored_allocation_manifest(
         return Err(SponsoredManifestLoadError::Corrupt(
             "manifest requires a Stripe context and nonempty customer and subscription".into(),
         ));
+    }
+    if period_start < 0 || period_end <= period_start {
+        return Err(SponsoredManifestLoadError::InvalidPeriod);
     }
 
     let mut tx = pool.begin().await?;
@@ -339,6 +348,8 @@ pub async fn load_sponsored_allocation_manifest(
            AND allocation.payer_kind = 'sponsor' \
            AND payer.provider_customer_id = $5 \
            AND payer.payer_kind = 'sponsor' \
+           AND allocation.effective_from < $7 \
+           AND (allocation.effective_until IS NULL OR allocation.effective_until > $6) \
            AND term.allocation_id IS NULL",
     )
     .bind(&context.namespace)
@@ -346,6 +357,8 @@ pub async fn load_sponsored_allocation_manifest(
     .bind(context.environment.as_str())
     .bind(subscription_id)
     .bind(customer_id)
+    .bind(period_start)
+    .bind(period_end)
     .fetch_one(&mut *tx)
     .await?;
     if missing_terms > 0 {
@@ -376,8 +389,10 @@ pub async fn load_sponsored_allocation_manifest(
            AND allocation.provider_subscription_id = $4 \
            AND payer.provider_customer_id = $5 \
            AND payer.payer_kind = 'sponsor' \
+           AND allocation.effective_from < $7 \
+           AND (allocation.effective_until IS NULL OR allocation.effective_until > $6) \
          ORDER BY allocation.effective_from, allocation.allocation_id COLLATE \"C\" \
-         LIMIT $6 \
+         LIMIT $8 \
        ) \
        SELECT count(*)::BIGINT AS row_count, \
               COALESCE(SUM( \
@@ -399,6 +414,8 @@ pub async fn load_sponsored_allocation_manifest(
     .bind(context.environment.as_str())
     .bind(subscription_id)
     .bind(customer_id)
+    .bind(period_start)
+    .bind(period_end)
     .bind(row_limit)
     .fetch_one(&mut *tx)
     .await?;
@@ -443,14 +460,18 @@ pub async fn load_sponsored_allocation_manifest(
            AND allocation.provider_subscription_id = $4 \
            AND payer.provider_customer_id = $5 \
            AND payer.payer_kind = 'sponsor' \
+           AND allocation.effective_from < $7 \
+           AND (allocation.effective_until IS NULL OR allocation.effective_until > $6) \
          ORDER BY allocation.effective_from, allocation.allocation_id COLLATE \"C\" \
-         LIMIT $6",
+         LIMIT $8",
     )
     .bind(&context.namespace)
     .bind(&context.account_id)
     .bind(context.environment.as_str())
     .bind(subscription_id)
     .bind(customer_id)
+    .bind(period_start)
+    .bind(period_end)
     .bind(row_limit)
     .fetch_all(&mut *tx)
     .await?;
