@@ -458,6 +458,68 @@ async fn late_duplicate_beneficiary_payment_becomes_refund_required() {
         .commit()
         .await
         .expect("commit duplicate refund");
+
+    let mut replay_tx = pool.begin().await.expect("begin refund replay");
+    assert_eq!(
+        confirm_payment(
+            &mut replay_tx,
+            "founding-test-duplicate-beneficiary-expired",
+            "founding-test-duplicate-beneficiary-expired-payment",
+            FoundingDate::new(2026, 1, 1).unwrap(),
+            now + 1,
+        )
+        .await
+        .expect("replay refund"),
+        ConfirmationOutcome::RefundRequired
+    );
+    assert!(matches!(
+        confirm_payment(
+            &mut replay_tx,
+            "founding-test-duplicate-beneficiary-expired",
+            "founding-test-duplicate-beneficiary-other-payment",
+            FoundingDate::new(2026, 1, 1).unwrap(),
+            now + 1,
+        )
+        .await,
+        Err(sotto_server::founding_allocator::FoundingAllocatorError::ConfirmationConflict)
+    ));
+    replay_tx.rollback().await.expect("rollback refund replay");
+
+    let mut other_reservation_tx = pool.begin().await.expect("begin payment reuse reservation");
+    let other = reserve(
+        &mut other_reservation_tx,
+        "founding-test-duplicate-beneficiary-other",
+        "founding-test-duplicate-beneficiary-other-operation",
+        "founding-test-duplicate-beneficiary-other-person",
+        "founding-test-duplicate-beneficiary-other-payer",
+        FoundingOffer::Monthly,
+        1,
+        now + 1_800,
+        now,
+    )
+    .await
+    .expect("create payment reuse reservation");
+    assert!(matches!(other, ReservationOutcome::Created(_)));
+    other_reservation_tx
+        .commit()
+        .await
+        .expect("commit payment reuse reservation");
+    let mut payment_reuse_tx = pool.begin().await.expect("begin payment reuse");
+    assert!(matches!(
+        confirm_payment(
+            &mut payment_reuse_tx,
+            "founding-test-duplicate-beneficiary-other",
+            "founding-test-duplicate-beneficiary-expired-payment",
+            FoundingDate::new(2026, 1, 1).unwrap(),
+            now,
+        )
+        .await,
+        Err(sotto_server::founding_allocator::FoundingAllocatorError::PaymentConflict)
+    ));
+    payment_reuse_tx
+        .rollback()
+        .await
+        .expect("rollback payment reuse");
     cleanup(&pool, fixture).await;
 }
 

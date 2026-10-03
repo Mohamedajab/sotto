@@ -350,6 +350,12 @@ pub async fn confirm_payment(
         return Ok(ConfirmationOutcome::AlreadyAwarded(award));
     }
     if status == "refund_required" {
+        let stored_payment: String = row
+            .try_get::<Option<String>, _>("payment_reference")?
+            .ok_or(FoundingAllocatorError::CorruptState)?;
+        if stored_payment != payment_reference {
+            return Err(FoundingAllocatorError::ConfirmationConflict);
+        }
         return Ok(ConfirmationOutcome::RefundRequired);
     }
     if status != "reserved" {
@@ -371,10 +377,12 @@ pub async fn confirm_payment(
         .is_some()
     {
         sqlx::query(
-            "UPDATE billing_founding_reservations SET status = 'refund_required', updated_at = now() \
+            "UPDATE billing_founding_reservations SET status = 'refund_required', \
+             payment_reference = $2, updated_at = now() \
              WHERE reservation_id = $1",
         )
         .bind(reservation_id)
+        .bind(payment_reference)
         .execute(&mut **tx)
         .await?;
         return Ok(ConfirmationOutcome::RefundRequired);
@@ -392,10 +400,12 @@ pub async fn confirm_payment(
     // that path.
     if awarded >= FOUNDING_CAPACITY || remaining < 0 || (!reservation_is_live && remaining == 0) {
         sqlx::query(
-            "UPDATE billing_founding_reservations SET status = 'refund_required', updated_at = now() \
+            "UPDATE billing_founding_reservations SET status = 'refund_required', \
+             payment_reference = $2, updated_at = now() \
              WHERE reservation_id = $1",
         )
         .bind(reservation_id)
+        .bind(payment_reference)
         .execute(&mut **tx)
         .await?;
         return Ok(ConfirmationOutcome::RefundRequired);
