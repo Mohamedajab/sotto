@@ -27,7 +27,7 @@ use axum::{Json, Router};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use sqlx::{Postgres, Transaction};
+use sqlx::{Postgres, Row, Transaction};
 
 #[cfg(feature = "e2e-mock-billing")]
 use url::Url;
@@ -277,6 +277,18 @@ pub trait SubscriptionProvider: Send + Sync {
         idempotency_key: &str,
         org_id: &str,
     ) -> ProviderResult<SubscriptionObservation>;
+
+    /// Request cancellation at the end of the paid term. Existing test adapters inherit the
+    /// legacy method until they opt into the personal lifecycle explicitly.
+    async fn cancel_personal_subscription(
+        &self,
+        subscription_id: &str,
+        idempotency_key: &str,
+        user_id: &str,
+    ) -> ProviderResult<SubscriptionObservation> {
+        self.cancel_subscription(subscription_id, idempotency_key, user_id)
+            .await
+    }
 }
 
 /// Compatibility name for callers that still refer to the pre-provider billing trait.
@@ -477,6 +489,26 @@ impl SubscriptionProvider for StripeBilling {
         let fresh = self.get_subscription(subscription_id).await;
         cancellation_outcome(cancellation.map(|_| ()), fresh)
     }
+
+    async fn cancel_personal_subscription(
+        &self,
+        subscription_id: &str,
+        idempotency_key: &str,
+        _user_id: &str,
+    ) -> ProviderResult<SubscriptionObservation> {
+        let form = vec![("cancel_at_period_end".to_string(), "true".to_string())];
+        let response = stripe_post_with_idempotency(
+            &self.api_key,
+            &format!("subscriptions/{subscription_id}"),
+            &form,
+            idempotency_key,
+        )
+        .await?;
+        Ok(SubscriptionObservation::Current(subscription_snapshot(
+            &response,
+            subscription_id,
+        )?))
+    }
 }
 
 #[cfg(feature = "e2e-mock-billing")]
@@ -544,6 +576,8 @@ pub fn router() -> Router<AppState> {
             "/billing/personal/operations/{operation_id}",
             get(personal_operation),
         )
+        .route("/billing/personal/portal", post(personal_portal))
+        .route("/billing/personal/cancel", post(personal_cancel))
         .route("/billing/webhook", post(webhook));
 
     #[cfg(feature = "e2e-mock-billing")]
@@ -643,6 +677,9 @@ fn personal_billing_error(error: personal_billing::PersonalBillingError) -> Erro
         }
         personal_billing::PersonalBillingError::CorruptState => {
             Error::Internal("personal billing state is corrupt".into())
+        }
+        personal_billing::PersonalBillingError::SettlementConflict => {
+            Error::Conflict("personal settlement conflicts with stored evidence".into())
         }
         personal_billing::PersonalBillingError::Database(error) => Error::Db(error),
     }
@@ -830,6 +867,101 @@ async fn personal_operation(
         state: operation.state.as_str().into(),
         provider_operation_id: operation.provider_operation_id,
         checkout_url: operation.provider_checkout_url,
+    }))
+}
+
+#[derive(Debug, Serialize)]
+struct PersonalLifecycleView {
+    state: String,
+    stripe_subscription_id: Option<String>,
+    paid_through_date: Option<String>,
+    cancel_at_period_end: bool,
+    portal_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PersonalCancelRequest {
+    idempotency_key: String,
+}
+
+async fn personal_portal(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> Result<Json<PersonalLifecycleView>> {
+    let billing = billing_config(&state)?;
+    let mut tx = state.pool.begin().await?;
+    let account = personal_billing::load_account(&mut tx, &user.user_id)
+        .await
+        .map_err(personal_billing_error)?
+        .ok_or_else(|| Error::NotFound("personal billing account not found".into()))?;
+    let customer = account.stripe_customer_id.clone().ok_or_else(|| {
+        Error::Conflict("personal billing has not received a paid customer yet".into())
+    })?;
+    tx.rollback().await?;
+    let portal_url = billing
+        .provider
+        .create_portal(&customer, &app_url(&billing.return_url))
+        .await
+        .map_err(ProviderError::into_error)?;
+    Ok(Json(PersonalLifecycleView {
+        state: account.state.as_str().into(),
+        stripe_subscription_id: account.stripe_subscription_id,
+        paid_through_date: account.paid_through_date,
+        cancel_at_period_end: account.cancel_at_period_end,
+        portal_url: Some(portal_url),
+    }))
+}
+
+async fn personal_cancel(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(request): Json<PersonalCancelRequest>,
+) -> Result<Json<PersonalLifecycleView>> {
+    if request.idempotency_key.trim().is_empty() {
+        return Err(Error::BadRequest(
+            "idempotency_key must not be empty".into(),
+        ));
+    }
+    let billing = billing_config(&state)?;
+    let mut tx = state.pool.begin().await?;
+    let account = personal_billing::load_account(&mut tx, &user.user_id)
+        .await
+        .map_err(personal_billing_error)?
+        .ok_or_else(|| Error::NotFound("personal billing account not found".into()))?;
+    if account.cancel_at_period_end {
+        tx.rollback().await?;
+        return Ok(Json(PersonalLifecycleView {
+            state: account.state.as_str().into(),
+            stripe_subscription_id: account.stripe_subscription_id,
+            paid_through_date: account.paid_through_date,
+            cancel_at_period_end: true,
+            portal_url: None,
+        }));
+    }
+    let subscription_id = account.stripe_subscription_id.clone().ok_or_else(|| {
+        Error::Conflict("personal billing has not received a paid subscription yet".into())
+    })?;
+    tx.rollback().await?;
+    billing
+        .provider
+        .cancel_personal_subscription(&subscription_id, &request.idempotency_key, &user.user_id)
+        .await
+        .map_err(ProviderError::into_error)?;
+    let mut update_tx = state.pool.begin().await?;
+    sqlx::query(
+        "UPDATE billing_personal_accounts SET cancel_at_period_end = TRUE, \
+         cancellation_requested_at = now(), updated_at = now() WHERE user_id = $1",
+    )
+    .bind(&user.user_id)
+    .execute(&mut *update_tx)
+    .await?;
+    update_tx.commit().await?;
+    Ok(Json(PersonalLifecycleView {
+        state: account.state.as_str().into(),
+        stripe_subscription_id: Some(subscription_id),
+        paid_through_date: account.paid_through_date,
+        cancel_at_period_end: true,
+        portal_url: None,
     }))
 }
 
@@ -1036,6 +1168,23 @@ async fn stripe_post(
         .post(format!("https://api.stripe.com/v1/{path}"))
         .bearer_auth(api_key)
         .headers(stripe_headers(None)?)
+        .form(form)
+        .send()
+        .await
+        .map_err(|_| ProviderError::transport())?;
+    stripe_response(response).await
+}
+
+async fn stripe_post_with_idempotency(
+    api_key: &str,
+    path: &str,
+    form: &[(String, String)],
+    idempotency_key: &str,
+) -> ProviderResult<serde_json::Value> {
+    let response = stripe_client()
+        .post(format!("https://api.stripe.com/v1/{path}"))
+        .bearer_auth(api_key)
+        .headers(stripe_headers(Some(idempotency_key))?)
         .form(form)
         .send()
         .await
@@ -1254,7 +1403,9 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
 
     match disposition {
         EventDisposition::Apply => match event.kind.as_str() {
-            "checkout.session.completed" => checkout_completed(&mut tx, object).await?,
+            "checkout.session.completed" => {
+                checkout_completed(&mut tx, object, event.created).await?
+            }
             "customer.subscription.updated" => subscription_updated(&mut tx, object).await?,
             "customer.subscription.deleted" => subscription_deleted(&mut tx, object).await?,
             _ => {}
@@ -1446,6 +1597,7 @@ fn event_org_hint(event: &Event) -> Option<&str> {
 async fn checkout_completed(
     tx: &mut Transaction<'_, Postgres>,
     object: &serde_json::Value,
+    event_created: i64,
 ) -> Result<()> {
     // Sessions this server creates always carry the org id; anything else isn't ours to act on.
     // Said out loud, because ignoring an event and acting on one are indistinguishable from
@@ -1458,6 +1610,9 @@ async fn checkout_completed(
         );
         return Ok(());
     };
+    if let Some(operation_id) = org_id.strip_prefix("personal:") {
+        return personal_checkout_completed(tx, object, event_created, operation_id).await;
+    }
     let customer = object["customer"].as_str();
     let subscription = object["subscription"].as_str();
 
@@ -1500,19 +1655,120 @@ async fn checkout_completed(
     Ok(())
 }
 
+async fn personal_checkout_completed(
+    tx: &mut Transaction<'_, Postgres>,
+    object: &serde_json::Value,
+    event_created: i64,
+    operation_id: &str,
+) -> Result<()> {
+    if object["payment_status"].as_str() != Some("paid") {
+        // A completed Checkout session is not itself authority. The account remains pending until
+        // Stripe says the session is paid, so SCA failures and asynchronous payment methods never
+        // become a free hosted term.
+        return Ok(());
+    }
+    let customer = object["customer"]
+        .as_str()
+        .ok_or_else(|| Error::Config("paid personal checkout has no customer".into()))?;
+    let subscription = object["subscription"]
+        .as_str()
+        .ok_or_else(|| Error::Config("paid personal checkout has no subscription".into()))?;
+    let payment_reference = object["payment_intent"]
+        .as_str()
+        .or_else(|| object["id"].as_str())
+        .ok_or_else(|| Error::Config("paid personal checkout has no payment reference".into()))?;
+    let account = sqlx::query(
+        "SELECT user_id, offer FROM billing_personal_accounts WHERE operation_id = $1 FOR UPDATE",
+    )
+    .bind(operation_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| Error::Config("personal checkout operation is not registered".into()))?;
+    let user_id: String = account.try_get("user_id")?;
+    let offer = billing_offer(&account.try_get::<String, _>("offer")?)?;
+    let paid_on = founding_allocator::FoundingDate::from_unix_seconds(event_created)
+        .map_err(|_| Error::Config("personal checkout timestamp is invalid".into()))?;
+    let interval_offer = match offer {
+        BillingOffer::StandardMonthly | BillingOffer::FoundingMonthly => FoundingOffer::Monthly,
+        BillingOffer::StandardAnnual | BillingOffer::FoundingAnnual => FoundingOffer::Annual,
+    };
+    let paid_through = paid_on.add_term(interval_offer);
+    if FoundingOffer::from_billing_offer(offer).is_some() {
+        let reservation_id = format!("founding:{operation_id}");
+        match founding_allocator::confirm_payment(
+            tx,
+            &reservation_id,
+            payment_reference,
+            paid_on,
+            event_created,
+        )
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?
+        {
+            founding_allocator::ConfirmationOutcome::Awarded(_)
+            | founding_allocator::ConfirmationOutcome::AlreadyAwarded(_) => {}
+            founding_allocator::ConfirmationOutcome::RefundRequired => {
+                return Err(Error::Conflict(
+                    "founding capacity was consumed; refund is required".into(),
+                ));
+            }
+        }
+    }
+    personal_billing::record_paid_settlement(
+        tx,
+        operation_id,
+        customer,
+        subscription,
+        payment_reference,
+        paid_through.to_unix_seconds(),
+        &paid_through.to_string(),
+    )
+    .await
+    .map_err(personal_billing_error)?;
+    audit::record_tx(
+        &mut *tx,
+        &user_id,
+        "stripe",
+        "billing.personal_paid",
+        audit::Context {
+            detail: Some("personal checkout paid and coverage recorded"),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(())
+}
+
 /// A subscription lifecycle change: the status decides the tier. Handles late/failed payments
 /// (`unpaid` → free) and recoveries (`active` again → team).
 async fn subscription_updated(
     tx: &mut Transaction<'_, Postgres>,
     object: &serde_json::Value,
 ) -> Result<()> {
-    let Some(org_id) = org_for_subscription(tx, object).await? else {
+    let Some(status) = object["status"].as_str() else {
+        eprintln!("warning: ignored Stripe subscription event without a status");
         return Ok(());
     };
-    let Some(status) = object["status"].as_str() else {
-        eprintln!(
-            "warning: ignored Stripe subscription event without a status for organisation {org_id}"
-        );
+    if let Some(user_id) = personal_user_for_subscription(tx, object).await? {
+        let state = match SubscriptionStatus::parse(status) {
+            SubscriptionStatus::Active | SubscriptionStatus::Trialing => "active",
+            SubscriptionStatus::PastDue | SubscriptionStatus::Paused => "past_due",
+            SubscriptionStatus::Unpaid => "unpaid",
+            SubscriptionStatus::Canceled | SubscriptionStatus::IncompleteExpired => "canceled",
+            SubscriptionStatus::Incomplete => "pending",
+            SubscriptionStatus::Unknown(_) => return Ok(()),
+        };
+        sqlx::query(
+            "UPDATE billing_personal_accounts SET state = $2, updated_at = now() \
+             WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .bind(state)
+        .execute(&mut **tx)
+        .await?;
+        return Ok(());
+    }
+    let Some(org_id) = org_for_subscription(tx, object).await? else {
         return Ok(());
     };
     let parsed_status = SubscriptionStatus::parse(status);
@@ -1555,6 +1811,16 @@ async fn subscription_deleted(
     tx: &mut Transaction<'_, Postgres>,
     object: &serde_json::Value,
 ) -> Result<()> {
+    if let Some(user_id) = personal_user_for_subscription(tx, object).await? {
+        sqlx::query(
+            "UPDATE billing_personal_accounts SET state = 'canceled', \
+             stripe_subscription_id = NULL, updated_at = now() WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await?;
+        return Ok(());
+    }
     let Some(org_id) = org_for_subscription(tx, object).await? else {
         return Ok(());
     };
@@ -1654,6 +1920,24 @@ async fn org_for_subscription(
             .fetch_optional(&mut **tx)
             .await?,
     )
+}
+
+async fn personal_user_for_subscription(
+    tx: &mut Transaction<'_, Postgres>,
+    object: &serde_json::Value,
+) -> Result<Option<String>> {
+    if let Some(user_id) = object["metadata"]["personal_user_id"].as_str() {
+        return Ok(Some(user_id.to_string()));
+    }
+    let Some(subscription_id) = object["id"].as_str() else {
+        return Ok(None);
+    };
+    Ok(sqlx::query_scalar(
+        "SELECT user_id FROM billing_personal_accounts WHERE stripe_subscription_id = $1",
+    )
+    .bind(subscription_id)
+    .fetch_optional(&mut **tx)
+    .await?)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

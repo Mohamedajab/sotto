@@ -115,6 +115,41 @@ impl FoundingDate {
         Self::new(year, month, day)
     }
 
+    /// Convert a non-negative Unix timestamp to the UTC calendar date used by billing anchors.
+    pub fn from_unix_seconds(seconds: i64) -> Result<Self, CalendarError> {
+        if seconds < 0 {
+            return Err(CalendarError::InvalidDate);
+        }
+        let days = seconds / 86_400;
+        let shifted = days + 719_468;
+        let era = if shifted >= 0 {
+            shifted / 146_097
+        } else {
+            (shifted - 146_096) / 146_097
+        };
+        let day_of_era = shifted - era * 146_097;
+        let year_of_era =
+            (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+        let year = year_of_era + era * 400;
+        let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+        let month_part = (5 * day_of_year + 2) / 153;
+        let day = day_of_year - (153 * month_part + 2) / 5 + 1;
+        let month = month_part + if month_part < 10 { 3 } else { -9 };
+        let year = year + i64::from(month <= 2);
+        Self::new(year as i32, month as u8, day as u8)
+    }
+
+    pub fn to_unix_seconds(self) -> i64 {
+        let year = i64::from(self.year) - i64::from(self.month <= 2);
+        let era = year.div_euclid(400);
+        let year_of_era = year - era * 400;
+        let month = i64::from(self.month);
+        let month_from_march = month + if month > 2 { -3 } else { 9 };
+        let day_of_year = (153 * month_from_march + 2) / 5 + i64::from(self.day) - 1;
+        let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+        (era * 146_097 + day_of_era - 719_468) * 86_400
+    }
+
     pub fn add_term(self, offer: FoundingOffer) -> Self {
         self.add_terms(offer, 1)
     }

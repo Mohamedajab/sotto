@@ -51,6 +51,8 @@ pub struct PersonalBillingAccount {
     pub stripe_subscription_id: Option<String>,
     pub state: PersonalBillingState,
     pub paid_through_epoch: Option<i64>,
+    pub paid_through_date: Option<String>,
+    pub payment_reference: Option<String>,
     pub cancel_at_period_end: bool,
 }
 
@@ -60,6 +62,8 @@ pub enum PersonalBillingError {
     AccountExists,
     #[error("personal billing account is corrupt")]
     CorruptState,
+    #[error("personal settlement conflicts with stored evidence")]
+    SettlementConflict,
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
 }
@@ -109,7 +113,8 @@ pub async fn load_account(
 ) -> Result<Option<PersonalBillingAccount>, PersonalBillingError> {
     let row = sqlx::query(
         "SELECT user_id, operation_id, offer, stripe_customer_id, stripe_subscription_id, \
-                state, paid_through_epoch, cancel_at_period_end \
+                state, paid_through_epoch, paid_through_date, payment_reference, \
+                cancel_at_period_end \
          FROM billing_personal_accounts WHERE user_id = $1",
     )
     .bind(user_id)
@@ -134,6 +139,66 @@ pub async fn record_checkout_url(
     Ok(())
 }
 
+pub async fn record_paid_settlement(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+    customer_id: &str,
+    subscription_id: &str,
+    payment_reference: &str,
+    paid_through_epoch: i64,
+    paid_through_date: &str,
+) -> Result<(), PersonalBillingError> {
+    let updated = sqlx::query(
+        "UPDATE billing_personal_accounts SET state = 'active', stripe_customer_id = $2, \
+         stripe_subscription_id = $3, payment_reference = $4, paid_through_epoch = $5, \
+         paid_through_date = $6, cancel_at_period_end = FALSE, updated_at = now() \
+         WHERE operation_id = $1 AND state = 'pending' RETURNING user_id",
+    )
+    .bind(operation_id)
+    .bind(customer_id)
+    .bind(subscription_id)
+    .bind(payment_reference)
+    .bind(paid_through_epoch)
+    .bind(paid_through_date)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if updated.is_some() {
+        return Ok(());
+    }
+    let existing = sqlx::query(
+        "SELECT stripe_customer_id, stripe_subscription_id, payment_reference, \
+                paid_through_epoch, paid_through_date, state \
+         FROM billing_personal_accounts WHERE operation_id = $1",
+    )
+    .bind(operation_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(PersonalBillingError::CorruptState)?;
+    let same = existing.try_get::<String, _>("state")? == "active"
+        && existing
+            .try_get::<Option<String>, _>("stripe_customer_id")?
+            .as_deref()
+            == Some(customer_id)
+        && existing
+            .try_get::<Option<String>, _>("stripe_subscription_id")?
+            .as_deref()
+            == Some(subscription_id)
+        && existing
+            .try_get::<Option<String>, _>("payment_reference")?
+            .as_deref()
+            == Some(payment_reference)
+        && existing.try_get::<Option<i64>, _>("paid_through_epoch")? == Some(paid_through_epoch)
+        && existing
+            .try_get::<Option<String>, _>("paid_through_date")?
+            .as_deref()
+            == Some(paid_through_date);
+    if same {
+        Ok(())
+    } else {
+        Err(PersonalBillingError::SettlementConflict)
+    }
+}
+
 fn account_from_row(
     row: sqlx::postgres::PgRow,
 ) -> Result<PersonalBillingAccount, PersonalBillingError> {
@@ -152,6 +217,8 @@ fn account_from_row(
         stripe_subscription_id: row.try_get("stripe_subscription_id")?,
         state: PersonalBillingState::parse(&row.try_get::<String, _>("state")?)?,
         paid_through_epoch: row.try_get("paid_through_epoch")?,
+        paid_through_date: row.try_get("paid_through_date")?,
+        payment_reference: row.try_get("payment_reference")?,
         cancel_at_period_end: row.try_get("cancel_at_period_end")?,
     })
 }
