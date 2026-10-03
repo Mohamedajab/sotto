@@ -6,10 +6,13 @@
 //! never reads Stripe or Postgres and it deliberately does not relax the personal invoice
 //! validator.
 
+use std::collections::BTreeMap;
+
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::cloud_coverage::{ConfirmedPaidInterval, PersonCoverage};
+use crate::cloud_coverage_reconciliation::SourceObservation;
 use crate::cloud_provider::{PayerKind, ProviderEnvironment};
 
 const SEMANTIC_DOMAIN: &[u8] = b"sotto-stripe-sponsored-coverage-v1\0";
@@ -135,6 +138,7 @@ impl SponsoredStripeCoverageConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SponsoredAllocationInterval {
+    source_id: String,
     allocation_reference: String,
     beneficiary_id: String,
     provider_item_id: String,
@@ -145,6 +149,7 @@ pub struct SponsoredAllocationInterval {
 
 impl SponsoredAllocationInterval {
     pub fn new(
+        source_id: impl Into<String>,
         allocation_reference: impl Into<String>,
         beneficiary_id: impl Into<String>,
         provider_item_id: impl Into<String>,
@@ -153,6 +158,7 @@ impl SponsoredAllocationInterval {
         effective_until: Option<i64>,
     ) -> Result<Self, SponsoredCoverageError> {
         let interval = Self {
+            source_id: source_id.into(),
             allocation_reference: allocation_reference.into(),
             beneficiary_id: beneficiary_id.into(),
             provider_item_id: provider_item_id.into(),
@@ -166,6 +172,10 @@ impl SponsoredAllocationInterval {
 
     pub fn allocation_reference(&self) -> &str {
         &self.allocation_reference
+    }
+
+    pub fn source_id(&self) -> &str {
+        &self.source_id
     }
 
     pub fn beneficiary_id(&self) -> &str {
@@ -190,6 +200,7 @@ impl SponsoredAllocationInterval {
 
     fn validate(&self) -> Result<(), SponsoredCoverageError> {
         for (value, name) in [
+            (&self.source_id, "source"),
             (&self.allocation_reference, "allocation reference"),
             (&self.beneficiary_id, "beneficiary"),
             (&self.provider_item_id, "provider item"),
@@ -278,6 +289,14 @@ impl SponsoredAllocationManifest {
         }
         for (index, allocation) in self.allocations.iter().enumerate() {
             allocation.validate()?;
+            if self.allocations[..index]
+                .iter()
+                .any(|previous| previous.source_id == allocation.source_id)
+            {
+                return Err(SponsoredCoverageError::ConflictingSourceReference {
+                    source_id: allocation.source_id.clone(),
+                });
+            }
             if self.allocations[..index].iter().any(|previous| {
                 previous.allocation_reference == allocation.allocation_reference
                     && previous.overlaps(
@@ -563,6 +582,37 @@ impl SponsoredCoverageCandidate {
             })
             .collect()
     }
+
+    /// Group the complete snapshot into the source observations expected by reconciliation.
+    /// Every source carries only its own named beneficiary's intervals.
+    pub fn source_observations(&self) -> Vec<SourceObservation> {
+        let mut grouped = BTreeMap::<String, Vec<ConfirmedPaidInterval>>::new();
+        for beneficiary in &self.beneficiaries {
+            for term in &beneficiary.paid_terms {
+                grouped
+                    .entry(term.interval.source_id.clone())
+                    .or_default()
+                    .push(term.interval.clone());
+            }
+        }
+        grouped
+            .into_iter()
+            .map(|(source_id, mut paid_intervals)| {
+                paid_intervals.sort_by_key(|interval| {
+                    (
+                        interval.starts_at,
+                        interval.paid_until,
+                        interval.coverage_id.clone(),
+                    )
+                });
+                SourceObservation::Complete {
+                    evidence_reference: format!("{}:{source_id}", self.semantic_reference),
+                    source_id,
+                    paid_intervals,
+                }
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -602,6 +652,8 @@ pub enum SponsoredCoverageError {
     ConcurrentAllocation { beneficiary_id: String },
     #[error("allocation reference is reused over an overlapping interval: {allocation_reference}")]
     ConflictingAllocationReference { allocation_reference: String },
+    #[error("source is reused over an overlapping interval: {source_id}")]
+    ConflictingSourceReference { source_id: String },
 }
 
 /// Convert one fully settled sponsored invoice into beneficiary-scoped paid intervals.
@@ -702,7 +754,7 @@ pub fn compose_sponsored_coverage(
                 let coverage_id = coverage_id(settlement, allocation, price_class, start, end);
                 let interval = ConfirmedPaidInterval {
                     coverage_id,
-                    source_id: allocation.allocation_reference().to_owned(),
+                    source_id: allocation.source_id().to_owned(),
                     starts_at: start,
                     paid_until: end,
                     failed_renewal_id: None,
@@ -795,6 +847,7 @@ fn coverage_id(
         settlement.invoice_id.as_str(),
         settlement.evidence_reference.as_str(),
         allocation.allocation_reference(),
+        allocation.source_id(),
         allocation.beneficiary_id(),
         allocation.provider_item_id(),
         allocation.price_id(),
@@ -870,7 +923,16 @@ mod tests {
         start: i64,
         end: Option<i64>,
     ) -> SponsoredAllocationInterval {
-        SponsoredAllocationInterval::new(reference, beneficiary, item, price, start, end).unwrap()
+        SponsoredAllocationInterval::new(
+            format!("source-{reference}"),
+            reference,
+            beneficiary,
+            item,
+            price,
+            start,
+            end,
+        )
+        .unwrap()
     }
 
     fn settlement(lines: Vec<SponsoredInvoiceLine>) -> SponsoredInvoiceSettlement {
@@ -919,6 +981,7 @@ mod tests {
         assert_eq!(coverages.len(), 2);
         assert_eq!(coverages[0].beneficiary_id, "user_1");
         assert_eq!(coverages[0].paid_intervals.len(), 1);
+        assert_eq!(candidate.source_observations().len(), 2);
     }
 
     #[test]
@@ -1074,13 +1137,67 @@ mod tests {
             "cus_1",
             "sub_1",
             vec![
-                allocation("same", "user_1", "item_1", "price_standard_month", 0, None),
-                allocation("same", "user_2", "item_1", "price_standard_month", 0, None),
+                SponsoredAllocationInterval::new(
+                    "source_a",
+                    "same",
+                    "user_1",
+                    "item_1",
+                    "price_standard_month",
+                    0,
+                    None,
+                )
+                .unwrap(),
+                SponsoredAllocationInterval::new(
+                    "source_b",
+                    "same",
+                    "user_2",
+                    "item_1",
+                    "price_standard_month",
+                    0,
+                    None,
+                )
+                .unwrap(),
             ],
         );
         assert!(matches!(
             result,
             Err(SponsoredCoverageError::ConflictingAllocationReference { .. })
+        ));
+    }
+
+    #[test]
+    fn source_reference_cannot_cover_two_people_at_once() {
+        let result = SponsoredAllocationManifest::new(
+            "acct_test",
+            ProviderEnvironment::Test,
+            "cus_1",
+            "sub_1",
+            vec![
+                SponsoredAllocationInterval::new(
+                    "source_same",
+                    "allocation_a",
+                    "user_1",
+                    "item_1",
+                    "price_standard_month",
+                    0,
+                    None,
+                )
+                .unwrap(),
+                SponsoredAllocationInterval::new(
+                    "source_same",
+                    "allocation_b",
+                    "user_2",
+                    "item_1",
+                    "price_standard_month",
+                    0,
+                    None,
+                )
+                .unwrap(),
+            ],
+        );
+        assert!(matches!(
+            result,
+            Err(SponsoredCoverageError::ConflictingSourceReference { .. })
         ));
     }
 
