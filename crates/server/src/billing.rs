@@ -868,14 +868,17 @@ async fn personal_checkout(
     )
     .await
     .map_err(Error::from)?;
+    let mut checkout_expires_at_epoch = None;
     let operation = match operation {
         BeginOperation::Created(operation) => {
+            let expiry = personal_checkout_expiry(request.quote_expires_at_epoch, billing_epoch())?;
+            checkout_expires_at_epoch = Some(expiry);
             personal_billing::begin_account(
                 &mut tx,
                 &user.user_id,
                 &operation.operation_id,
                 offer,
-                request.quote_expires_at_epoch,
+                expiry,
                 billing_epoch(),
             )
             .await
@@ -889,7 +892,7 @@ async fn personal_checkout(
                     &user.user_id,
                     founding_offer,
                     request.quote_version,
-                    request.quote_expires_at_epoch,
+                    expiry,
                     billing_epoch(),
                 )
                 .await
@@ -922,6 +925,10 @@ async fn personal_checkout(
             operation
         }
     };
+    let checkout_expires_at_epoch = match checkout_expires_at_epoch {
+        Some(expiry) => expiry,
+        None => personal_checkout_expiry(operation.quote_expires_at_epoch, billing_epoch())?,
+    };
     let (success_url, cancel_url) = checkout_return_urls(&billing.return_url);
     let checkout_url = billing
         .provider
@@ -931,7 +938,7 @@ async fn personal_checkout(
             &price_id,
             &operation.operation_id,
             &operation.provider_idempotency_key,
-            operation.quote_expires_at_epoch,
+            checkout_expires_at_epoch,
             &success_url,
             &cancel_url,
         )
@@ -956,6 +963,21 @@ async fn personal_checkout(
         state: result.state.as_str().into(),
         checkout_url: Some(checkout_url),
     }))
+}
+
+fn personal_checkout_expiry(quote_expires_at_epoch: i64, now_epoch: i64) -> Result<i64> {
+    let latest_quote_expiry = now_epoch
+        .checked_add(founding_allocator::RESERVATION_SECONDS)
+        .ok_or_else(|| Error::Internal("billing clock overflow".into()))?;
+    if quote_expires_at_epoch <= now_epoch {
+        return Err(Error::Conflict("billing quote expired".into()));
+    }
+    if quote_expires_at_epoch > latest_quote_expiry {
+        return Err(Error::BadRequest("billing quote expiry is invalid".into()));
+    }
+    quote_expires_at_epoch
+        .checked_add(founding_allocator::RESERVATION_SECONDS)
+        .ok_or_else(|| Error::Internal("billing clock overflow".into()))
 }
 
 async fn personal_operation(
@@ -2610,4 +2632,17 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.kind, ProviderErrorKind::Retryable);
     }
+
+    #[test]
+    fn personal_checkout_expiry_leaves_stripe_a_full_window() {
+        let now = 1_700_000_000;
+        let quote_expiry = now + founding_allocator::RESERVATION_SECONDS;
+        assert_eq!(
+            personal_checkout_expiry(quote_expiry, now).unwrap(),
+            now + founding_allocator::RESERVATION_SECONDS * 2
+        );
+        assert!(personal_checkout_expiry(now, now).is_err());
+        assert!(personal_checkout_expiry(quote_expiry + 1, now).is_err());
+    }
+
 }

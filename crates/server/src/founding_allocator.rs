@@ -14,6 +14,9 @@ use crate::billing_catalogue::{BillingInterval, BillingOffer};
 
 pub const FOUNDING_CAPACITY: i64 = 100;
 pub const RESERVATION_SECONDS: i64 = 30 * 60;
+/// A Checkout Session is created after the quote, so its expiry may be one quote window beyond
+/// the reservation window while still satisfying Stripe's minimum lifetime.
+pub const MAX_RESERVATION_SECONDS: i64 = RESERVATION_SECONDS * 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FoundingCapacityStatus {
@@ -298,7 +301,7 @@ pub async fn reserve(
         return Err(FoundingAllocatorError::QuoteExpired);
     }
     let latest_allowed_expiry = now_epoch
-        .checked_add(RESERVATION_SECONDS)
+        .checked_add(MAX_RESERVATION_SECONDS)
         .ok_or(FoundingAllocatorError::InvalidField("now_epoch"))?;
     if quote_expires_at_epoch > latest_allowed_expiry {
         return Err(FoundingAllocatorError::InvalidField("quote_expiry"));
