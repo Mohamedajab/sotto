@@ -3,8 +3,8 @@
 //! The provider normaliser consumes a complete [`SponsoredAllocationManifest`].  This module is
 //! the persistence boundary for that manifest: an allocation is first registered by the provider
 //! adapter, then its Stripe price is recorded once for the allocation's already-dated ownership
-//! interval.  Replacing or removing a seat therefore requires a new allocation/source interval;
-//! the old row is never silently rewritten.
+//! interval.  Replacing a seat requires a new allocation/source interval; removing one closes the
+//! old row through the audited end operation rather than silently rewriting its price history.
 
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use thiserror::Error;
@@ -19,6 +19,19 @@ use crate::cloud_provider_stripe_sponsored::{
 pub enum SponsoredAllocationTermDisposition {
     Recorded,
     AlreadyRecorded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SponsoredAllocationEndDisposition {
+    Ended,
+    AlreadyEnded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SponsoredAllocationEndReceipt {
+    pub allocation_id: String,
+    pub effective_until: i64,
+    pub disposition: SponsoredAllocationEndDisposition,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,11 +188,122 @@ pub async fn record_sponsored_allocation_term(
     }
 }
 
-/// Load a complete sponsored manifest in one repeatable-read snapshot.
+/// Close one open sponsored allocation and its immutable term at an audited boundary.
 ///
-/// Historical ended allocations remain in the manifest because a paid invoice may cover a term
-/// that has already ended by the time it is replayed.  The row and byte limits are checked before
-/// any manifest is returned; corruption or an over-bound history never yields a usable prefix.
+/// This is the only supported way to remove or replace a seat during a paid subscription.  The
+/// allocation and term are locked and updated in the caller-owned transaction together, so a
+/// manifest can never observe an ended ownership row with an open price term (or the reverse).
+pub async fn end_sponsored_allocation(
+    tx: &mut Transaction<'_, Postgres>,
+    context: &ProviderContext,
+    allocation: &VerifiedAllocation,
+    effective_until: i64,
+    ending_evidence_reference: &str,
+) -> Result<SponsoredAllocationEndReceipt, SponsoredAllocationTermStoreError> {
+    if context.namespace != STRIPE_NAMESPACE
+        || allocation.payer_kind != PayerKind::Sponsor
+        || effective_until <= allocation.effective_from
+        || ending_evidence_reference.trim().is_empty()
+    {
+        return Err(SponsoredAllocationTermStoreError::InvalidAllocation);
+    }
+
+    let row = sqlx::query(
+        "SELECT allocation.payer_id, allocation.payer_kind, allocation.beneficiary_id, \
+                allocation.provider_namespace, allocation.provider_account_id, \
+                allocation.provider_environment, allocation.provider_subscription_id, \
+                allocation.provider_item_id, allocation.external_allocation_reference, \
+                allocation.coverage_source_id, allocation.effective_from, allocation.effective_until, \
+                allocation.state, allocation.ownership_evidence_reference, \
+                allocation.effective_until_evidence_reference, \
+                payer.provider_namespace AS payer_namespace, payer.provider_account_id AS payer_account_id, \
+                payer.provider_environment AS payer_environment, payer.provider_customer_id, \
+                payer.payer_kind AS payer_payer_kind, \
+                source.beneficiary_id AS source_beneficiary_id, source.provider_namespace AS source_namespace, \
+                source.external_allocation_reference AS source_allocation_reference, \
+                source.ownership_evidence_reference AS source_ownership_reference, \
+                term.price_id AS term_price_id, term.effective_from AS term_effective_from, \
+                term.effective_until AS term_effective_until \
+         FROM cloud_provider_allocations AS allocation \
+         JOIN cloud_provider_payers AS payer ON payer.payer_id = allocation.payer_id \
+         JOIN cloud_coverage_sources AS source ON source.source_id = allocation.coverage_source_id \
+         JOIN cloud_provider_sponsored_allocation_terms AS term \
+           ON term.allocation_id = allocation.allocation_id \
+         WHERE allocation.allocation_id = $1 \
+         FOR UPDATE OF allocation, payer, source, term",
+    )
+    .bind(&allocation.allocation_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(SponsoredAllocationTermStoreError::AllocationMissing)?;
+
+    let stored_until = row.try_get::<Option<i64>, _>("effective_until")?;
+    let mut expected_allocation = allocation.clone();
+    expected_allocation.effective_until = stored_until;
+    if !allocation_row_matches(&row, context, &expected_allocation)
+        || row.try_get::<i64, _>("term_effective_from")? != allocation.effective_from
+    {
+        return Err(SponsoredAllocationTermStoreError::AllocationConflict);
+    }
+    if row.try_get::<Option<i64>, _>("term_effective_until")? != stored_until {
+        return Err(SponsoredAllocationTermStoreError::TermConflict);
+    }
+
+    if let Some(existing_until) = stored_until {
+        if existing_until == effective_until {
+            let stored_evidence =
+                row.try_get::<Option<String>, _>("effective_until_evidence_reference")?;
+            if row.try_get::<Option<i64>, _>("term_effective_until")? == Some(existing_until)
+                && stored_evidence.as_deref() == Some(ending_evidence_reference)
+            {
+                return Ok(SponsoredAllocationEndReceipt {
+                    allocation_id: allocation.allocation_id.clone(),
+                    effective_until,
+                    disposition: SponsoredAllocationEndDisposition::AlreadyEnded,
+                });
+            }
+        }
+        return Err(SponsoredAllocationTermStoreError::AllocationConflict);
+    }
+
+    let allocation_update = sqlx::query(
+        "UPDATE cloud_provider_allocations \
+         SET effective_until = $2, effective_until_evidence_reference = $3, updated_at = now() \
+         WHERE allocation_id = $1 AND effective_until IS NULL",
+    )
+    .bind(&allocation.allocation_id)
+    .bind(effective_until)
+    .bind(ending_evidence_reference)
+    .execute(&mut **tx)
+    .await?;
+    if allocation_update.rows_affected() != 1 {
+        return Err(SponsoredAllocationTermStoreError::AllocationConflict);
+    }
+    let term_update = sqlx::query(
+        "UPDATE cloud_provider_sponsored_allocation_terms \
+         SET effective_until = $2, updated_at = now() \
+         WHERE allocation_id = $1 AND effective_until IS NULL",
+    )
+    .bind(&allocation.allocation_id)
+    .bind(effective_until)
+    .execute(&mut **tx)
+    .await?;
+    if term_update.rows_affected() != 1 {
+        return Err(SponsoredAllocationTermStoreError::TermConflict);
+    }
+    Ok(SponsoredAllocationEndReceipt {
+        allocation_id: allocation.allocation_id.clone(),
+        effective_until,
+        disposition: SponsoredAllocationEndDisposition::Ended,
+    })
+}
+
+/// Load the sponsored manifest that overlaps one invoice period in one repeatable-read snapshot.
+///
+/// Historical ended allocations remain eligible when they overlap the requested period because a
+/// paid invoice may cover a term that has already ended by the time it is replayed.  The row and
+/// byte limits are checked before any manifest is returned; corruption or an over-bound history
+/// never yields a usable prefix.
 pub async fn load_sponsored_allocation_manifest(
     pool: &PgPool,
     context: &ProviderContext,

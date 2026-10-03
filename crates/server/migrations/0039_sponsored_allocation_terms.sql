@@ -3,6 +3,11 @@
 -- A new allocation (and therefore a new source id) is required when a named seat changes price or
 -- ends; that keeps every manifest interval independently attributable and makes mid-term removal
 -- explicit through effective_until.
+ALTER TABLE cloud_provider_allocations
+    ADD COLUMN effective_until_evidence_reference TEXT
+        CHECK (effective_until_evidence_reference IS NULL
+            OR btrim(effective_until_evidence_reference) <> '');
+
 CREATE TABLE cloud_provider_sponsored_allocation_terms (
     allocation_id TEXT PRIMARY KEY
         REFERENCES cloud_provider_allocations (allocation_id) ON DELETE RESTRICT,
