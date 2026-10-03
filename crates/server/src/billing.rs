@@ -834,7 +834,7 @@ async fn personal_checkout(
                 .await
                 .map_err(personal_billing_error)?;
             if let Some(founding_offer) = FoundingOffer::from_billing_offer(offer) {
-                founding_allocator::reserve(
+                let reservation = founding_allocator::reserve(
                     &mut tx,
                     &format!("founding:{}", operation.operation_id),
                     &operation.operation_id,
@@ -847,6 +847,11 @@ async fn personal_checkout(
                 )
                 .await
                 .map_err(|error| Error::Conflict(error.to_string()))?;
+                if matches!(reservation, founding_allocator::ReservationOutcome::Full) {
+                    return Err(Error::Conflict(
+                        "founding hosted places are no longer available".into(),
+                    ));
+                }
             }
             tx.commit().await?;
             operation
