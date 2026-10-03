@@ -12,14 +12,16 @@ CREATE TABLE billing_personal_accounts (
     stripe_customer_id       TEXT UNIQUE,
     stripe_subscription_id   TEXT UNIQUE,
     state                    TEXT NOT NULL DEFAULT 'pending' CHECK (
-        state IN ('pending', 'active', 'past_due', 'unpaid', 'canceled')
+        state IN ('pending', 'active', 'past_due', 'unpaid', 'canceled', 'refund_required')
     ),
+    pending_expires_at_epoch BIGINT NOT NULL,
     paid_through_epoch       BIGINT,
     cancel_at_period_end     BOOLEAN NOT NULL DEFAULT FALSE,
     cancellation_requested_at TIMESTAMPTZ,
     created_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
     CHECK (btrim(user_id) <> ''),
+    CHECK (pending_expires_at_epoch > 0),
     CHECK (paid_through_epoch IS NULL OR paid_through_epoch > 0),
     CHECK ((state = 'pending') OR stripe_subscription_id IS NOT NULL)
 );

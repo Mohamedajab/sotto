@@ -278,6 +278,14 @@ pub trait SubscriptionProvider: Send + Sync {
         subscription_id: &str,
     ) -> ProviderResult<SubscriptionObservation>;
 
+    /// Read the provider's current period end for a newly paid personal subscription.
+    async fn personal_subscription_period_end(
+        &self,
+        _subscription_id: &str,
+    ) -> ProviderResult<Option<i64>> {
+        Ok(None)
+    }
+
     async fn cancel_subscription(
         &self,
         subscription_id: &str,
@@ -487,6 +495,17 @@ impl SubscriptionProvider for StripeBilling {
             }
             Err(error) => Err(error),
         }
+    }
+
+    async fn personal_subscription_period_end(
+        &self,
+        subscription_id: &str,
+    ) -> ProviderResult<Option<i64>> {
+        let object = stripe_get(&self.api_key, &format!("subscriptions/{subscription_id}")).await?;
+        if object["id"].as_str() != Some(subscription_id) {
+            return Err(ProviderError::malformed_response());
+        }
+        Ok(object["current_period_end"].as_i64())
     }
 
     async fn cancel_subscription(
@@ -753,14 +772,22 @@ async fn personal_quote(
         .checked_add(founding_allocator::RESERVATION_SECONDS)
         .ok_or_else(|| Error::Internal("billing clock overflow".into()))?;
     let mut tx = state.pool.begin().await?;
-    if personal_billing::load_account(&mut tx, &user.user_id)
+    if let Some(account) = personal_billing::load_account(&mut tx, &user.user_id)
         .await
         .map_err(personal_billing_error)?
-        .is_some()
     {
-        return Err(Error::Conflict(
-            "personal billing is already active or pending".into(),
-        ));
+        let reusable = matches!(
+            account.state,
+            personal_billing::PersonalBillingState::Canceled
+        ) || (matches!(
+            account.state,
+            personal_billing::PersonalBillingState::Pending
+        ) && account.pending_expires_at_epoch <= now);
+        if !reusable {
+            return Err(Error::Conflict(
+                "personal billing is already active or pending".into(),
+            ));
+        }
     }
     let sponsored: Option<String> = sqlx::query_scalar(
         "SELECT allocation_id FROM cloud_provider_allocations \
@@ -840,9 +867,16 @@ async fn personal_checkout(
     .map_err(Error::from)?;
     let operation = match operation {
         BeginOperation::Created(operation) => {
-            personal_billing::begin_account(&mut tx, &user.user_id, &operation.operation_id, offer)
-                .await
-                .map_err(personal_billing_error)?;
+            personal_billing::begin_account(
+                &mut tx,
+                &user.user_id,
+                &operation.operation_id,
+                offer,
+                request.quote_expires_at_epoch,
+                billing_epoch(),
+            )
+            .await
+            .map_err(personal_billing_error)?;
             if let Some(founding_offer) = FoundingOffer::from_billing_offer(offer) {
                 let reservation = founding_allocator::reserve(
                     &mut tx,
@@ -1479,6 +1513,19 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
 
     let object = &event.data.object;
     let subscription_id = event_subscription_id(&event);
+    let personal_period_end = if is_personal_checkout_event(&event) {
+        if let Some(subscription_id) = subscription_id.as_deref() {
+            billing
+                .provider
+                .personal_subscription_period_end(subscription_id)
+                .await
+                .map_err(ProviderError::into_error)?
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     if disposition == EventDisposition::Reconcile {
         if event.kind == "checkout.session.completed"
             && object["client_reference_id"]
@@ -1493,6 +1540,7 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
                 object,
                 event.created,
                 event.kind == "checkout.session.async_payment_succeeded",
+                personal_period_end,
             )
             .await?;
             if let Some(subscription_id) = subscription_id {
@@ -1535,11 +1583,13 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
                     object,
                     event.created,
                     event.kind == "checkout.session.async_payment_succeeded",
+                    personal_period_end,
                 )
                 .await?
             }
             "customer.subscription.updated" => subscription_updated(&mut tx, object).await?,
             "customer.subscription.deleted" => subscription_deleted(&mut tx, object).await?,
+            "invoice.paid" => invoice_paid(&mut tx, object).await?,
             _ => {}
         },
         EventDisposition::Reconcile | EventDisposition::Ignore => {
@@ -1586,6 +1636,9 @@ async fn record_webhook_event(
     }
 
     if is_personal_checkout_event(event) {
+        return Ok(EventDisposition::Apply);
+    }
+    if event.kind == "invoice.paid" {
         return Ok(EventDisposition::Apply);
     }
 
@@ -1713,6 +1766,9 @@ fn event_subscription_id(event: &Event) -> Option<String> {
                 .as_str()
                 .map(str::to_string)
         }
+        "invoice.paid" => event.data.object["subscription"]
+            .as_str()
+            .map(str::to_string),
         "customer.subscription.updated" | "customer.subscription.deleted" => {
             event.data.object["id"].as_str().map(str::to_string)
         }
@@ -1748,6 +1804,7 @@ async fn checkout_completed(
     object: &serde_json::Value,
     event_created: i64,
     async_payment_succeeded: bool,
+    personal_period_end: Option<i64>,
 ) -> Result<()> {
     // Sessions this server creates always carry the org id; anything else isn't ours to act on.
     // Said out loud, because ignoring an event and acting on one are indistinguishable from
@@ -1767,6 +1824,7 @@ async fn checkout_completed(
             event_created,
             operation_id,
             async_payment_succeeded,
+            personal_period_end,
         )
         .await;
     }
@@ -1818,6 +1876,7 @@ async fn personal_checkout_completed(
     event_created: i64,
     operation_id: &str,
     async_payment_succeeded: bool,
+    personal_period_end: Option<i64>,
 ) -> Result<()> {
     if !async_payment_succeeded && object["payment_status"].as_str() != Some("paid") {
         // A completed Checkout session is not itself authority. The account remains pending until
@@ -1850,7 +1909,12 @@ async fn personal_checkout_completed(
         BillingOffer::StandardMonthly | BillingOffer::FoundingMonthly => FoundingOffer::Monthly,
         BillingOffer::StandardAnnual | BillingOffer::FoundingAnnual => FoundingOffer::Annual,
     };
-    let paid_through = paid_on.add_term(interval_offer);
+    let paid_through = if let Some(period_end) = personal_period_end {
+        founding_allocator::FoundingDate::from_unix_seconds(period_end)
+            .map_err(|_| Error::Config("personal subscription period end is invalid".into()))?
+    } else {
+        paid_on.add_term(interval_offer)
+    };
     if FoundingOffer::from_billing_offer(offer).is_some() {
         let reservation_id = format!("founding:{operation_id}");
         match founding_allocator::confirm_payment(
@@ -1866,9 +1930,27 @@ async fn personal_checkout_completed(
             founding_allocator::ConfirmationOutcome::Awarded(_)
             | founding_allocator::ConfirmationOutcome::AlreadyAwarded(_) => {}
             founding_allocator::ConfirmationOutcome::RefundRequired => {
-                return Err(Error::Conflict(
-                    "founding capacity was consumed; refund is required".into(),
-                ));
+                let refund = personal_billing::record_refund_required(
+                    tx,
+                    operation_id,
+                    customer,
+                    subscription,
+                    payment_reference,
+                )
+                .await
+                .map_err(personal_billing_error)?;
+                if matches!(refund, personal_billing::SettlementDisposition::Applied) {
+                    personal_billing::record_event(
+                        tx,
+                        &user_id,
+                        operation_id,
+                        "billing.personal_refund_required",
+                        Some("founding capacity was consumed after payment"),
+                    )
+                    .await
+                    .map_err(personal_billing_error)?;
+                }
+                return Ok(());
             }
         }
     }
@@ -1908,6 +1990,9 @@ async fn subscription_updated(
         return Ok(());
     };
     if let Some(user_id) = personal_user_for_subscription(tx, object).await? {
+        let subscription_id = object["id"].as_str().ok_or_else(|| {
+            Error::Config("personal subscription event has no subscription id".into())
+        })?;
         let cancel_at_period_end = object["cancel_at_period_end"].as_bool().ok_or_else(|| {
             Error::Config("personal subscription event has no cancellation state".into())
         })?;
@@ -1922,13 +2007,30 @@ async fn subscription_updated(
         sqlx::query(
             "UPDATE billing_personal_accounts SET state = CASE \
                  WHEN state = 'pending' AND $2 <> 'canceled' THEN state ELSE $2 END, \
-                 cancel_at_period_end = $3, updated_at = now() WHERE user_id = $1",
+                 cancel_at_period_end = $3, stripe_subscription_id = COALESCE(stripe_subscription_id, $4), \
+                 updated_at = now() WHERE user_id = $1",
         )
-        .bind(user_id)
+        .bind(&user_id)
         .bind(state)
         .bind(cancel_at_period_end)
+        .bind(subscription_id)
         .execute(&mut **tx)
         .await?;
+        if let Some(period_end) = object["current_period_end"].as_i64() {
+            let paid_through = founding_allocator::FoundingDate::from_unix_seconds(period_end)
+                .map_err(|_| {
+                    Error::Config("personal subscription has invalid period end".into())
+                })?;
+            personal_billing::advance_paid_through(
+                tx,
+                &user_id,
+                subscription_id,
+                period_end,
+                &paid_through.to_string(),
+            )
+            .await
+            .map_err(personal_billing_error)?;
+        }
         return Ok(());
     }
     let Some(org_id) = org_for_subscription(tx, object).await? else {
@@ -1968,6 +2070,50 @@ async fn subscription_updated(
     Ok(())
 }
 
+async fn invoice_paid(
+    tx: &mut Transaction<'_, Postgres>,
+    object: &serde_json::Value,
+) -> Result<()> {
+    let Some(subscription_id) = object["subscription"].as_str() else {
+        return Ok(());
+    };
+    let personal: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM billing_personal_accounts \
+         WHERE stripe_subscription_id = $1)",
+    )
+    .bind(subscription_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !personal {
+        return Ok(());
+    }
+    let period_end = object["period_end"]
+        .as_i64()
+        .or_else(|| {
+            object["lines"]["data"]
+                .as_array()
+                .and_then(|lines| lines.first())
+                .and_then(|line| line["period"]["end"].as_i64())
+        })
+        .ok_or_else(|| Error::Config("paid personal invoice has no period end".into()))?;
+    let paid_through = founding_allocator::FoundingDate::from_unix_seconds(period_end)
+        .map_err(|_| Error::Config("paid personal invoice has invalid period end".into()))?;
+    let payment_reference = object["payment_intent"]
+        .as_str()
+        .or_else(|| object["id"].as_str())
+        .ok_or_else(|| Error::Config("paid personal invoice has no payment reference".into()))?;
+    personal_billing::record_invoice_paid(
+        tx,
+        subscription_id,
+        payment_reference,
+        period_end,
+        &paid_through.to_string(),
+    )
+    .await
+    .map_err(personal_billing_error)?;
+    Ok(())
+}
+
 /// The subscription ended for good: back to the free tier (existing data stays readable - the
 /// entitlement gates are creation-time only).
 async fn subscription_deleted(
@@ -1975,11 +2121,16 @@ async fn subscription_deleted(
     object: &serde_json::Value,
 ) -> Result<()> {
     if let Some(user_id) = personal_user_for_subscription(tx, object).await? {
+        let subscription_id = object["id"].as_str().ok_or_else(|| {
+            Error::Config("personal subscription event has no subscription id".into())
+        })?;
         sqlx::query(
             "UPDATE billing_personal_accounts SET state = 'canceled', \
-             updated_at = now() WHERE user_id = $1",
+             stripe_subscription_id = COALESCE(stripe_subscription_id, $2), updated_at = now() \
+             WHERE user_id = $1",
         )
         .bind(user_id)
+        .bind(subscription_id)
         .execute(&mut **tx)
         .await?;
         return Ok(());
