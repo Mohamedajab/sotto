@@ -26,6 +26,9 @@ use crate::cloud_provider_stripe_corrections::{
     StripePersonalInvoiceCorrectionEvidence, StripeRetainedPaidTerm, StripeUnresolvedCorrections,
 };
 use crate::cloud_provider_stripe_renewals::StripeRenewalFailureEvidence;
+use crate::cloud_provider_stripe_sponsored::{
+    SponsoredInvoiceLine, SponsoredInvoiceSettlement, SponsoredStripeCoverageConfig,
+};
 
 const STRIPE_ORIGIN: &str = "https://api.stripe.com/";
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -458,6 +461,125 @@ impl StripeReadClient {
             validate_mode(payment.livemode, self.environment)?;
         }
         Ok(payments)
+    }
+
+    /// Read one paid sponsored invoice and normalise its grouped subscription-item lines.
+    ///
+    /// The allocation manifest is intentionally supplied by the caller and joined later by the
+    /// pure sponsored composer. This method only authenticates the invoice, its lines and its
+    /// payment settlement under the existing bounded session.
+    #[doc(hidden)]
+    pub async fn sponsored_invoice_settlement(
+        &self,
+        session: &mut StripeReadSession,
+        invoice_id: &str,
+        customer_id: &str,
+        subscription_id: &str,
+        sponsored: &SponsoredStripeCoverageConfig,
+    ) -> Result<SponsoredInvoiceSettlement, StripeReadError> {
+        if sponsored.account_id() != self.account_id || sponsored.environment() != self.environment
+        {
+            return Err(StripeReadError::ContextMismatch);
+        }
+        let invoice = self.invoice(session, invoice_id).await?;
+        if invoice.parent_type.as_deref() != Some("subscription_details")
+            || invoice.customer_id.as_deref() != Some(customer_id)
+            || invoice.subscription_id.as_deref() != Some(subscription_id)
+            || invoice.status.as_deref() != Some("paid")
+        {
+            return Err(StripeReadError::Observation(
+                StripeContractError::ContextMismatch,
+            ));
+        }
+        let lines = self.invoice_lines(session, invoice_id).await?;
+        let payments = self.invoice_payments(session, invoice_id).await?;
+        if payments.len() != 1 {
+            return Err(StripeReadError::Observation(
+                StripeContractError::UnsupportedSettlement(
+                    "sponsored invoice has an ambiguous payment list",
+                ),
+            ));
+        }
+        let payment = payments[0].settlement(&self.coverage)?;
+        let period_start = lines
+            .iter()
+            .filter_map(|line| line.period_start)
+            .min()
+            .ok_or(StripeReadError::MalformedResponse(
+                "lines.data.period.start",
+            ))?;
+        let period_end = lines
+            .iter()
+            .filter_map(|line| line.period_end)
+            .max()
+            .ok_or(StripeReadError::MalformedResponse("lines.data.period.end"))?;
+        let amount_due = invoice
+            .amount_due
+            .ok_or(StripeReadError::MalformedResponse("invoice.amount_due"))?;
+        let amount_paid = invoice
+            .amount_paid
+            .ok_or(StripeReadError::MalformedResponse("invoice.amount_paid"))?;
+        let currency = invoice
+            .currency
+            .clone()
+            .ok_or(StripeReadError::MalformedResponse("invoice.currency"))?;
+        if payment.invoice_id() != invoice_id
+            || payment.amount_requested() != amount_due
+            || payment.amount_paid() != amount_paid
+            || payment.currency() != currency
+        {
+            return Err(StripeReadError::Observation(
+                StripeContractError::UnsupportedSettlement("invoice and payment amounts differ"),
+            ));
+        }
+        let mut normalized_lines = Vec::with_capacity(lines.len());
+        for line in lines {
+            if line.parent_type.as_deref() != Some("subscription_item_details")
+                || line.pricing_type.as_deref() != Some("price_details")
+                || line.livemode != Some(matches!(self.environment, ProviderEnvironment::Live))
+                || line.subscription_id.as_deref() != Some(subscription_id)
+            {
+                return Err(StripeReadError::Observation(
+                    StripeContractError::ContextMismatch,
+                ));
+            }
+            let quantity = line.quantity.filter(|quantity| *quantity > 0).ok_or(
+                StripeReadError::Observation(StripeContractError::UnsupportedQuantity),
+            )? as u64;
+            normalized_lines.push(
+                SponsoredInvoiceLine::new(
+                    line.id,
+                    line.subscription_item_id
+                        .ok_or(StripeReadError::MalformedResponse("line.subscription_item"))?,
+                    line.price_id
+                        .ok_or(StripeReadError::MalformedResponse("line.price"))?,
+                    line.period_start
+                        .ok_or(StripeReadError::MalformedResponse("line.period.start"))?,
+                    line.period_end
+                        .ok_or(StripeReadError::MalformedResponse("line.period.end"))?,
+                    quantity,
+                    line.proration
+                        .ok_or(StripeReadError::MalformedResponse("line.proration"))?,
+                )
+                .map_err(|_| StripeReadError::MalformedResponse("sponsored invoice line"))?,
+            );
+        }
+        SponsoredInvoiceSettlement::new(
+            invoice.id,
+            customer_id,
+            subscription_id,
+            period_start,
+            period_end,
+            currency,
+            amount_due,
+            amount_paid,
+            format!(
+                "stripe:invoice:{invoice_id}:payment:{}",
+                payment.payment_intent_id()
+            ),
+            normalized_lines,
+        )
+        .map_err(|_| StripeReadError::MalformedResponse("sponsored invoice settlement"))
     }
 
     /// Enumerate every refund Stripe returns for one PaymentIntent, whatever its status.

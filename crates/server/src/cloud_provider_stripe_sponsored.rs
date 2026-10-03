@@ -9,7 +9,7 @@
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::cloud_coverage::ConfirmedPaidInterval;
+use crate::cloud_coverage::{ConfirmedPaidInterval, PersonCoverage};
 use crate::cloud_provider::{PayerKind, ProviderEnvironment};
 
 const SEMANTIC_DOMAIN: &[u8] = b"sotto-stripe-sponsored-coverage-v1\0";
@@ -526,6 +526,22 @@ impl SponsoredCoverageCandidate {
     pub fn semantic_reference(&self) -> &str {
         &self.semantic_reference
     }
+
+    /// Convert the complete sponsored snapshot into the provider-neutral per-person input used
+    /// by the coverage evaluator. The allocation source id remains attached to every interval.
+    pub fn person_coverages(&self) -> Vec<PersonCoverage> {
+        self.beneficiaries
+            .iter()
+            .map(|beneficiary| PersonCoverage {
+                beneficiary_id: beneficiary.beneficiary_id.clone(),
+                paid_intervals: beneficiary
+                    .paid_terms
+                    .iter()
+                    .map(|term| term.interval.clone())
+                    .collect(),
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -876,6 +892,10 @@ mod tests {
                 .paid_until,
             200
         );
+        let coverages = candidate.person_coverages();
+        assert_eq!(coverages.len(), 2);
+        assert_eq!(coverages[0].beneficiary_id, "user_1");
+        assert_eq!(coverages[0].paid_intervals.len(), 1);
     }
 
     #[test]

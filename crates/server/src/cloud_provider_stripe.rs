@@ -109,6 +109,32 @@ pub struct StripePaymentSettlement {
     livemode: bool,
 }
 
+impl StripePaymentSettlement {
+    pub fn invoice_id(&self) -> &str {
+        &self.invoice_id
+    }
+
+    pub fn payment_intent_id(&self) -> &str {
+        &self.payment_intent_id
+    }
+
+    pub const fn amount_paid(&self) -> i64 {
+        self.amount_paid
+    }
+
+    pub const fn amount_requested(&self) -> i64 {
+        self.amount_requested
+    }
+
+    pub fn currency(&self) -> &str {
+        &self.currency
+    }
+
+    pub const fn livemode(&self) -> bool {
+        self.livemode
+    }
+}
+
 /// A validated personal invoice observation assembled from authenticated Stripe resources.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StripePersonalInvoiceObservation {
