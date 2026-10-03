@@ -358,8 +358,9 @@ pub enum StripeAccountProvenance {
 /// Durable personal ownership resolved by the caller before evidence can authorise coverage.
 ///
 /// The value copied from invoice metadata is only a claim. It must match this trusted binding;
-/// metadata alone never establishes a beneficiary or allocation. Sponsor allocations are rejected
-/// until their quantity and multi-beneficiary receipt contract is implemented.
+/// metadata alone never establishes a beneficiary or allocation. Sponsored allocations use the
+/// grouped, named manifest contract in [`crate::cloud_provider_stripe_sponsored`] rather than this
+/// personal-seat binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StripeAllocationBinding {
     allocation_reference: String,
