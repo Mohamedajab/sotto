@@ -139,6 +139,18 @@ async fn sponsored_terms_are_immutable_and_load_as_a_complete_manifest() {
         allocation,
     } = fixture;
 
+    assert!(matches!(
+        load_sponsored_allocation_manifest(
+            &database.pool,
+            &context,
+            &allocation.provider_customer_id,
+            &allocation.subscription_id,
+            SponsoredManifestLoadLimits::default(),
+        )
+        .await,
+        Err(SponsoredManifestLoadError::Corrupt(_))
+    ));
+
     let mut tx = database.pool.begin().await.expect("begin");
     let first =
         record_sponsored_allocation_term(&mut tx, &context, &allocation, "price_sponsored_monthly")

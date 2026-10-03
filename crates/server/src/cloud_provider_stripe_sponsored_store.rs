@@ -202,6 +202,34 @@ pub async fn load_sponsored_allocation_manifest(
         .execute(&mut *tx)
         .await?;
 
+    let missing_terms = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) \
+         FROM cloud_provider_allocations AS allocation \
+         JOIN cloud_provider_payers AS payer ON payer.payer_id = allocation.payer_id \
+         LEFT JOIN cloud_provider_sponsored_allocation_terms AS term \
+           ON term.allocation_id = allocation.allocation_id \
+         WHERE allocation.provider_namespace = $1 \
+           AND allocation.provider_account_id = $2 \
+           AND allocation.provider_environment = $3 \
+           AND allocation.provider_subscription_id = $4 \
+           AND allocation.payer_kind = 'sponsor' \
+           AND payer.provider_customer_id = $5 \
+           AND payer.payer_kind = 'sponsor' \
+           AND term.allocation_id IS NULL",
+    )
+    .bind(&context.namespace)
+    .bind(&context.account_id)
+    .bind(context.environment.as_str())
+    .bind(subscription_id)
+    .bind(customer_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if missing_terms > 0 {
+        return Err(SponsoredManifestLoadError::Corrupt(
+            "registered sponsored allocation has no persisted term".into(),
+        ));
+    }
+
     let preflight = sqlx::query(
         "WITH candidates AS ( \
          SELECT allocation.allocation_id, allocation.beneficiary_id, allocation.provider_item_id, \
