@@ -14,11 +14,11 @@ BEGIN
             con.conname AS constraint_name,
             ARRAY(
                 SELECT attribute.attname
-                FROM unnest(con.conkey) WITH ORDINALITY AS key(attnum, position)
+                FROM unnest(con.conkey) WITH ORDINALITY AS column_key(attnum, position)
                 JOIN pg_attribute AS attribute
                   ON attribute.attrelid = con.conrelid
-                 AND attribute.attnum = key.attnum
-                ORDER BY key.position
+                 AND attribute.attnum = column_key.attnum
+                ORDER BY column_key.position
             ) AS columns
         FROM pg_constraint AS con
         WHERE con.conrelid = 'cloud_provider_allocations'::regclass
