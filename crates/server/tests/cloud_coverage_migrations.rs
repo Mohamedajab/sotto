@@ -814,7 +814,7 @@ async fn migration_0038_allows_named_allocations_to_share_a_provider_item() {
         ),
     ] {
         sqlx::query(
-            "INSERT INTO cloud_provider_allocations (allocation_id, payer_id, beneficiary_id, provider_namespace, provider_account_id, provider_environment, provider_subscription_id, provider_item_id, external_allocation_reference, coverage_source_id, effective_from, state, ownership_evidence_reference) VALUES ($1, 'sponsored-payer', $2, 'stripe', 'acct_sponsored', 'test', 'sub_sponsored', 'si_grouped', $3, $4, 0, 'active', 'sponsored-ownership')",
+            "INSERT INTO cloud_provider_allocations (allocation_id, payer_id, payer_kind, beneficiary_id, provider_namespace, provider_account_id, provider_environment, provider_subscription_id, provider_item_id, external_allocation_reference, coverage_source_id, effective_from, state, ownership_evidence_reference) VALUES ($1, 'sponsored-payer', 'sponsor', $2, 'stripe', 'acct_sponsored', 'test', 'sub_sponsored', 'si_grouped', $3, $4, 0, 'active', 'sponsored-ownership')",
         )
         .bind(allocation)
         .bind(beneficiary)

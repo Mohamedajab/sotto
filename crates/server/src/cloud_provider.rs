@@ -1238,7 +1238,8 @@ async fn validate_registered_allocation(
     allocation: &VerifiedAllocation,
 ) -> Result<(), ProviderAdapterError> {
     let row = sqlx::query(
-        "SELECT allocation.payer_id, allocation.beneficiary_id, allocation.provider_namespace, \
+        "SELECT allocation.payer_id, allocation.payer_kind AS allocation_payer_kind, \
+                allocation.beneficiary_id, allocation.provider_namespace, \
                 allocation.provider_account_id, allocation.provider_environment, \
                 allocation.provider_subscription_id, allocation.provider_item_id, \
                 allocation.external_allocation_reference, allocation.coverage_source_id, \
@@ -1260,6 +1261,7 @@ async fn validate_registered_allocation(
         && row.try_get::<String, _>("provider_environment")? == context.environment.as_str()
         && row.try_get::<String, _>("provider_customer_id")? == allocation.provider_customer_id
         && row.try_get::<String, _>("payer_kind")? == allocation.payer_kind.as_str()
+        && row.try_get::<String, _>("allocation_payer_kind")? == allocation.payer_kind.as_str()
         && row.try_get::<String, _>("provider_subscription_id")? == allocation.subscription_id
         && row.try_get::<String, _>("provider_item_id")? == allocation.provider_item_id
         && row.try_get::<String, _>("external_allocation_reference")?
@@ -1339,15 +1341,16 @@ async fn ensure_allocation(
 ) -> Result<(), ProviderAdapterError> {
     let result = sqlx::query(
         "INSERT INTO cloud_provider_allocations \
-         (allocation_id, payer_id, beneficiary_id, provider_namespace, provider_account_id, \
+         (allocation_id, payer_id, payer_kind, beneficiary_id, provider_namespace, provider_account_id, \
           provider_environment, provider_subscription_id, provider_item_id, \
           external_allocation_reference, coverage_source_id, effective_from, effective_until, \
           state, ownership_evidence_reference) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
          ON CONFLICT (allocation_id) DO NOTHING",
     )
     .bind(&allocation.allocation_id)
     .bind(&allocation.payer_id)
+    .bind(allocation.payer_kind.as_str())
     .bind(&allocation.beneficiary_id)
     .bind(&context.namespace)
     .bind(&context.account_id)
@@ -1366,7 +1369,7 @@ async fn ensure_allocation(
         Ok(result) if result.rows_affected() == 1 => Ok(()),
         Ok(_) => {
             let row = sqlx::query(
-                "SELECT payer_id, beneficiary_id, provider_namespace, provider_account_id, \
+                "SELECT payer_id, payer_kind, beneficiary_id, provider_namespace, provider_account_id, \
                         provider_environment, provider_subscription_id, provider_item_id, \
                         external_allocation_reference, coverage_source_id, effective_from, \
                         effective_until, state, ownership_evidence_reference \
@@ -1377,6 +1380,7 @@ async fn ensure_allocation(
             .await?
             .ok_or(ProviderAdapterError::AllocationConflict)?;
             let same = row.try_get::<String, _>("payer_id")? == allocation.payer_id
+                && row.try_get::<String, _>("payer_kind")? == allocation.payer_kind.as_str()
                 && row.try_get::<String, _>("beneficiary_id")? == allocation.beneficiary_id
                 && row.try_get::<String, _>("provider_namespace")? == context.namespace
                 && row.try_get::<String, _>("provider_account_id")? == context.account_id

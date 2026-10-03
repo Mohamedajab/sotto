@@ -1,6 +1,18 @@
 -- A sponsored Stripe subscription item can cover several named beneficiaries at once.
 -- Allocation references and coverage sources remain unique; the provider item itself is not.
 
+-- Keep payer kind on the allocation row so PostgreSQL can enforce the personal-item invariant
+-- with a partial unique index. The default preserves direct legacy fixture inserts; existing
+-- sponsor rows are backfilled from their payer before the index is created.
+ALTER TABLE cloud_provider_allocations
+    ADD COLUMN payer_kind TEXT NOT NULL DEFAULT 'personal'
+        CHECK (payer_kind IN ('personal', 'sponsor'));
+
+UPDATE cloud_provider_allocations AS allocation
+SET payer_kind = payer.payer_kind
+FROM cloud_provider_payers AS payer
+WHERE payer.payer_id = allocation.payer_id;
+
 -- PostgreSQL truncates generated identifiers to 63 bytes (and may suffix collisions), so resolve
 -- the old constraint by its exact ordered column set rather than guessing its generated name.
 DO $$
