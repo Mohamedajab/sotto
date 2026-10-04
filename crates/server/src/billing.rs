@@ -1443,6 +1443,85 @@ async fn sponsored_provider_items(
         .collect()
 }
 
+/// Build the complete future seat schedule from Sotto's interval ledger. Stripe's current
+/// quantities describe only the provider's present phase; rebuilding a schedule from them loses
+/// an earlier removal or a later finite seat boundary whenever two changes are pending together.
+async fn sponsored_provider_phases(
+    pool: &sqlx::PgPool,
+    organization_id: &str,
+    catalogue: &BillingPriceIds,
+    operation: &sponsored_billing::SponsoredOperation,
+    now_epoch: i64,
+) -> Result<Vec<SponsoredSubscriptionPhase>> {
+    let mut rows: Vec<(String, String, i64, Option<i64>)> = sqlx::query_as(
+        "SELECT beneficiary_id, offer, effective_from, effective_until \
+         FROM billing_sponsored_seats \
+         WHERE organization_id = $1 AND state IN ('active', 'pending', 'scheduled_removal') \
+         ORDER BY effective_from, seat_id",
+    )
+    .bind(organization_id)
+    .fetch_all(pool)
+    .await?;
+
+    // The removal/replacement row is not marked scheduled_removal until the provider accepts the
+    // schedule. Apply the pending operation in memory so the phases sent to Stripe are atomic
+    // with the operation the caller just requested.
+    if matches!(
+        operation.action,
+        SponsoredSeatAction::Remove | SponsoredSeatAction::Replace
+    ) {
+        for row in &mut rows {
+            if row.0 == operation.beneficiary_id {
+                row.3 = operation.effective_until;
+            }
+        }
+    }
+
+    let mut boundaries = std::collections::BTreeSet::from([now_epoch]);
+    for (_, _, effective_from, effective_until) in &rows {
+        if *effective_from > now_epoch {
+            boundaries.insert(*effective_from);
+        }
+        if let Some(effective_until) = effective_until.filter(|until| *until > now_epoch) {
+            boundaries.insert(effective_until);
+        }
+    }
+    let boundaries: Vec<i64> = boundaries.into_iter().collect();
+    let mut phases = Vec::with_capacity(boundaries.len());
+    for (index, start_at_epoch) in boundaries.iter().copied().enumerate() {
+        let end_at_epoch = boundaries.get(index + 1).copied();
+        let mut quantities = std::collections::BTreeMap::<String, i64>::new();
+        for (_, offer, effective_from, effective_until) in &rows {
+            if *effective_from <= start_at_epoch
+                && effective_until
+                    .map(|effective_until| start_at_epoch < effective_until)
+                    .unwrap_or(true)
+            {
+                let quantity = quantities.entry(offer.clone()).or_default();
+                *quantity = quantity
+                    .checked_add(1)
+                    .ok_or_else(|| Error::BadRequest("sponsored seat count is too large".into()))?;
+            }
+        }
+        let items = quantities
+            .into_iter()
+            .map(|(offer, quantity)| {
+                let offer = billing_offer(&offer)?;
+                Ok(SponsoredSubscriptionItemRequest {
+                    provider_price_id: catalogue.id_for(offer).to_string(),
+                    quantity,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        phases.push(SponsoredSubscriptionPhase {
+            start_at_epoch,
+            end_at_epoch,
+            items,
+        });
+    }
+    Ok(phases)
+}
+
 fn billing_epoch() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2358,6 +2437,7 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
             observation,
             &subscription_id,
             event_org_hint(&event),
+            event_is_sponsored_subscription(&event),
         )
         .await?;
         update_subscription_watermark(&mut tx, &event, &subscription_id).await?;
@@ -2575,11 +2655,21 @@ fn event_org_hint(event: &Event) -> Option<&str> {
         "checkout.session.completed" | "checkout.session.async_payment_succeeded" => {
             event.data.object["client_reference_id"].as_str()
         }
-        "customer.subscription.updated" | "customer.subscription.deleted" => {
-            event.data.object["metadata"]["org_id"].as_str()
-        }
+        "customer.subscription.updated" | "customer.subscription.deleted" => event.data.object
+            ["metadata"]["organization_id"]
+            .as_str()
+            .or_else(|| event.data.object["metadata"]["org_id"].as_str()),
         _ => None,
     }
+}
+
+fn event_is_sponsored_subscription(event: &Event) -> bool {
+    matches!(
+        event.kind.as_str(),
+        "customer.subscription.updated" | "customer.subscription.deleted"
+    ) && event.data.object["metadata"]["organization_id"]
+        .as_str()
+        .is_some()
 }
 
 fn is_personal_checkout_event(event: &Event) -> bool {
@@ -2846,6 +2936,138 @@ async fn personal_checkout_completed(
 
 /// A subscription lifecycle change: the status decides the tier. Handles late/failed payments
 /// (`unpaid` → free) and recoveries (`active` again → team).
+fn sponsored_subscription_status(status: SubscriptionStatus) -> Option<(&'static str, bool)> {
+    match status {
+        SubscriptionStatus::Active | SubscriptionStatus::Trialing => Some(("active", false)),
+        SubscriptionStatus::PastDue | SubscriptionStatus::Paused => Some(("past_due", false)),
+        SubscriptionStatus::Incomplete => Some(("pending", false)),
+        SubscriptionStatus::Unpaid
+        | SubscriptionStatus::Canceled
+        | SubscriptionStatus::IncompleteExpired => Some(("canceled", true)),
+        SubscriptionStatus::Unknown(_) => None,
+    }
+}
+
+async fn sponsored_subscription_organization(
+    tx: &mut Transaction<'_, Postgres>,
+    object: &serde_json::Value,
+) -> Result<Option<String>> {
+    let Some(subscription_id) = object["id"].as_str() else {
+        return Ok(None);
+    };
+    let metadata_organization = object["metadata"]["organization_id"].as_str();
+    let stored_organization: Option<String> = sqlx::query_scalar(
+        "SELECT organization_id FROM billing_sponsored_subscriptions \
+         WHERE provider_subscription_id = $1",
+    )
+    .bind(subscription_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(stored_organization) = stored_organization {
+        return Ok(Some(stored_organization));
+    }
+    let Some(metadata_organization) = metadata_organization else {
+        return Ok(None);
+    };
+    Ok(sqlx::query_scalar(
+        "SELECT organization_id FROM billing_sponsored_subscriptions \
+         WHERE organization_id = $1",
+    )
+    .bind(metadata_organization)
+    .fetch_optional(&mut **tx)
+    .await?)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_sponsored_subscription_state(
+    tx: &mut Transaction<'_, Postgres>,
+    organization_id: &str,
+    subscription_id: &str,
+    status: &str,
+    terminal: bool,
+    customer_id: Option<&str>,
+    schedule_id: Option<&str>,
+    period_start: Option<i64>,
+    period_end: Option<i64>,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE billing_sponsored_subscriptions SET \
+           provider_customer_id = COALESCE($2, provider_customer_id), \
+           provider_subscription_id = CASE WHEN $3 THEN NULL ELSE $4 END, \
+           provider_schedule_id = CASE WHEN $3 THEN NULL ELSE COALESCE($5, provider_schedule_id) END, \
+           status = $6, current_period_start = COALESCE($7, current_period_start), \
+           current_period_end = COALESCE($8, current_period_end), updated_at = now() \
+         WHERE organization_id = $1",
+    )
+    .bind(organization_id)
+    .bind(customer_id)
+    .bind(terminal)
+    .bind(subscription_id)
+    .bind(schedule_id)
+    .bind(status)
+    .bind(period_start)
+    .bind(period_end)
+    .execute(&mut **tx)
+    .await?;
+    if terminal {
+        sqlx::query(
+            "UPDATE billing_sponsored_seats SET state = 'canceled', \
+             effective_until = COALESCE(effective_until, $2, floor(extract(epoch FROM now()))::BIGINT), \
+             updated_at = now() \
+             WHERE organization_id = $1 AND state IN ('active', 'pending', 'scheduled_removal')",
+        )
+        .bind(organization_id)
+        .bind(period_end)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn sponsored_subscription_updated(
+    tx: &mut Transaction<'_, Postgres>,
+    object: &serde_json::Value,
+) -> Result<bool> {
+    let Some(organization_id) = sponsored_subscription_organization(tx, object).await? else {
+        return Ok(false);
+    };
+    let Some(subscription_id) = object["id"].as_str() else {
+        return Ok(false);
+    };
+    let Some(status) = object["status"].as_str() else {
+        return Ok(true);
+    };
+    let Some((mapped_status, terminal)) =
+        sponsored_subscription_status(SubscriptionStatus::parse(status))
+    else {
+        return Ok(true);
+    };
+    apply_sponsored_subscription_state(
+        tx,
+        &organization_id,
+        subscription_id,
+        mapped_status,
+        terminal,
+        object["customer"].as_str(),
+        object["schedule"].as_str(),
+        subscription_period_start(object),
+        subscription_period_end(object),
+    )
+    .await?;
+    audit::record_tx(
+        &mut *tx,
+        &organization_id,
+        "stripe",
+        "billing.sponsored_updated",
+        audit::Context {
+            detail: Some("sponsored subscription lifecycle state updated"),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(true)
+}
+
 async fn subscription_updated(
     tx: &mut Transaction<'_, Postgres>,
     object: &serde_json::Value,
@@ -2881,6 +3103,9 @@ async fn subscription_updated(
         .bind(subscription_id)
         .execute(&mut **tx)
         .await?;
+        return Ok(());
+    }
+    if sponsored_subscription_updated(tx, object).await? {
         return Ok(());
     }
     let Some(org_id) = org_for_subscription(tx, object).await? else {
@@ -3146,6 +3371,35 @@ async fn subscription_deleted(
         .await?;
         return Ok(());
     }
+    if let Some(organization_id) = sponsored_subscription_organization(tx, object).await? {
+        let subscription_id = object["id"].as_str().ok_or_else(|| {
+            Error::Config("sponsored subscription event has no subscription id".into())
+        })?;
+        apply_sponsored_subscription_state(
+            tx,
+            &organization_id,
+            subscription_id,
+            "canceled",
+            true,
+            object["customer"].as_str(),
+            None,
+            subscription_period_start(object),
+            subscription_period_end(object),
+        )
+        .await?;
+        audit::record_tx(
+            &mut *tx,
+            &organization_id,
+            "stripe",
+            "billing.sponsored_cancelled",
+            audit::Context {
+                detail: Some("sponsored subscription ended"),
+                ..Default::default()
+            },
+        )
+        .await?;
+        return Ok(());
+    }
     let Some(org_id) = org_for_subscription(tx, object).await? else {
         return Ok(());
     };
@@ -3181,7 +3435,35 @@ async fn reconcile_subscription(
     observation: SubscriptionObservation,
     subscription_id: &str,
     org_hint: Option<&str>,
+    sponsored_hint: bool,
 ) -> Result<()> {
+    if sponsored_hint {
+        let Some(organization_id) = org_hint else {
+            return Ok(());
+        };
+        let (status, terminal) = match observation {
+            SubscriptionObservation::Current(snapshot) => {
+                let Some(mapped) = sponsored_subscription_status(snapshot.status) else {
+                    return Ok(());
+                };
+                mapped
+            }
+            SubscriptionObservation::Missing => ("canceled", true),
+        };
+        apply_sponsored_subscription_state(
+            tx,
+            organization_id,
+            subscription_id,
+            status,
+            terminal,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
+        return Ok(());
+    }
     let org_id = match org_hint {
         Some(org_id) => Some(org_id.to_string()),
         None => {
@@ -3233,18 +3515,24 @@ async fn org_for_subscription(
     tx: &mut Transaction<'_, Postgres>,
     object: &serde_json::Value,
 ) -> Result<Option<String>> {
-    if let Some(org_id) = object["metadata"]["org_id"].as_str() {
+    if let Some(org_id) = object["metadata"]["organization_id"]
+        .as_str()
+        .or_else(|| object["metadata"]["org_id"].as_str())
+    {
         return Ok(Some(org_id.to_string()));
     }
     let Some(subscription_id) = object["id"].as_str() else {
         return Ok(None);
     };
-    Ok(
-        sqlx::query_scalar("SELECT id FROM organizations WHERE stripe_subscription_id = $1")
-            .bind(subscription_id)
-            .fetch_optional(&mut **tx)
-            .await?,
+    Ok(sqlx::query_scalar(
+        "SELECT id FROM organizations WHERE stripe_subscription_id = $1 \
+         UNION ALL \
+         SELECT organization_id FROM billing_sponsored_subscriptions \
+         WHERE provider_subscription_id = $1 LIMIT 1",
     )
+    .bind(subscription_id)
+    .fetch_optional(&mut **tx)
+    .await?)
 }
 
 async fn personal_user_for_subscription(
@@ -3510,6 +3798,26 @@ mod tests {
         assert_eq!(
             SubscriptionStatus::parse("past_due").entitlement_tier(),
             "team"
+        );
+    }
+
+    #[test]
+    fn sponsored_subscription_terminal_states_clear_the_provider_link() {
+        assert_eq!(
+            sponsored_subscription_status(SubscriptionStatus::Active),
+            Some(("active", false))
+        );
+        assert_eq!(
+            sponsored_subscription_status(SubscriptionStatus::PastDue),
+            Some(("past_due", false))
+        );
+        assert_eq!(
+            sponsored_subscription_status(SubscriptionStatus::Unpaid),
+            Some(("canceled", true))
+        );
+        assert_eq!(
+            sponsored_subscription_status(SubscriptionStatus::Canceled),
+            Some(("canceled", true))
         );
     }
 
