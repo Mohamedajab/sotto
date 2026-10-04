@@ -26,7 +26,7 @@ async fn pool_or_skip() -> Option<PgPool> {
 
 fn app(pool: PgPool) -> Router {
     let state = AppState {
-        deployment_mode: sotto_server::config::DeploymentMode::SelfHosted,
+        deployment_mode: sotto_server::config::DeploymentMode::Cloud,
         telemetry_ingest: false,
         pool,
         oauth: None,
