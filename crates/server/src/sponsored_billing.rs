@@ -304,19 +304,42 @@ pub fn request_hash(
     actor_user_id: &str,
     request: &SponsoredSeatRequest,
 ) -> String {
-    let value = format!(
-        "sponsored-v1|{organization_id}|{actor_user_id}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
-        request.action.as_str(),
-        request.beneficiary_id,
-        request.replacement_beneficiary_id.as_deref().unwrap_or(""),
-        request.offer.as_str(),
-        request.quote_version,
-        request.quote_expires_at_epoch,
-        request.effective_from,
-        request.effective_until.unwrap_or_default(),
-        request.idempotency_key,
+    let mut preimage = Vec::new();
+    append_hash_field(&mut preimage, "sponsored-v2");
+    append_hash_field(&mut preimage, organization_id);
+    append_hash_field(&mut preimage, actor_user_id);
+    append_hash_field(&mut preimage, request.action.as_str());
+    append_hash_field(&mut preimage, &request.beneficiary_id);
+    append_optional_hash_field(&mut preimage, request.replacement_beneficiary_id.as_deref());
+    append_hash_field(&mut preimage, request.offer.as_str());
+    append_hash_field(&mut preimage, &request.quote_version.to_string());
+    append_hash_field(&mut preimage, &request.quote_expires_at_epoch.to_string());
+    append_hash_field(&mut preimage, &request.effective_from.to_string());
+    append_optional_hash_field(
+        &mut preimage,
+        request
+            .effective_until
+            .map(|value| value.to_string())
+            .as_deref(),
     );
-    format!("{:x}", Sha256::digest(value.as_bytes()))
+    append_hash_field(&mut preimage, &request.idempotency_key);
+    digest_hex(&Sha256::digest(preimage))
+}
+
+fn append_hash_field(preimage: &mut Vec<u8>, value: &str) {
+    let bytes = value.as_bytes();
+    preimage.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+    preimage.extend_from_slice(bytes);
+}
+
+fn append_optional_hash_field(preimage: &mut Vec<u8>, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            preimage.push(1);
+            append_hash_field(preimage, value);
+        }
+        None => preimage.push(0),
+    }
 }
 
 pub async fn list_seats(
@@ -757,5 +780,29 @@ mod tests {
         let mut same = request.clone();
         same.replacement_beneficiary_id = Some("a".into());
         assert!(same.validate(100).is_err());
+    }
+
+    #[test]
+    fn request_hash_distinguishes_delimited_identifiers() {
+        let first = SponsoredSeatRequest {
+            action: SponsoredSeatAction::Replace,
+            beneficiary_id: "a|b".into(),
+            replacement_beneficiary_id: Some("c".into()),
+            offer: BillingOffer::StandardMonthly,
+            quote_version: 1,
+            quote_expires_at_epoch: 200,
+            effective_from: 100,
+            effective_until: Some(200),
+            idempotency_key: "request".into(),
+        };
+        let second = SponsoredSeatRequest {
+            beneficiary_id: "a".into(),
+            replacement_beneficiary_id: Some("b|c".into()),
+            ..first.clone()
+        };
+        assert_ne!(
+            request_hash("org", "actor", &first),
+            request_hash("org", "actor", &second)
+        );
     }
 }
