@@ -1061,6 +1061,14 @@ pub fn router() -> Router<AppState> {
             "/billing/personal/refunds/{request_id}/confirm-early",
             post(personal_refund_confirm_early),
         )
+        .route(
+            "/billing/refunds/{request_id}/review",
+            post(operator_review_refund),
+        )
+        .route(
+            "/billing/refunds/{request_id}/process",
+            post(operator_process_refund),
+        )
         .route("/billing/webhook", post(webhook));
 
     #[cfg(feature = "e2e-mock-billing")]
@@ -1080,6 +1088,7 @@ fn billing_config(state: &AppState) -> Result<&BillingState> {
 
 const SPONSORED_BILLING_ENABLED_ENV: &str = "SOTTO_SPONSORED_BILLING_ENABLED";
 const BILLING_CORRECTIONS_ENABLED_ENV: &str = "SOTTO_BILLING_CORRECTIONS_ENABLED";
+const BILLING_OPERATOR_TOKEN_ENV: &str = "SOTTO_BILLING_OPERATOR_TOKEN";
 const BILLING_CORRECTION_POLICY_VERSION: &str = "2026-10-04";
 
 fn sponsored_billing_enabled() -> bool {
@@ -1884,6 +1893,12 @@ struct PersonalRefundEarlyConfirmation {
     effective_at_epoch: i64,
 }
 
+#[derive(Debug, Deserialize)]
+struct BillingRefundReviewRequest {
+    approve: bool,
+    result_code: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct PersonalRefundView {
     request_id: String,
@@ -1931,6 +1946,25 @@ fn require_billing_corrections() -> Result<()> {
             "billing corrections are not enabled".into(),
         ))
     }
+}
+
+fn require_billing_operator(headers: &HeaderMap) -> Result<()> {
+    let configured = std::env::var(BILLING_OPERATOR_TOKEN_ENV)
+        .ok()
+        .filter(|token| !token.trim().is_empty())
+        .ok_or_else(|| {
+            Error::NotConfigured("billing operator controls are not configured".into())
+        })?;
+    let provided = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    if provided != Some(configured.as_str()) {
+        return Err(Error::Forbidden(
+            "billing operator authorisation failed".into(),
+        ));
+    }
+    Ok(())
 }
 
 async fn personal_refund_request(
@@ -2010,6 +2044,92 @@ async fn personal_refund_confirm_early(
     )
     .await
     .map_err(Error::from)?;
+    tx.commit().await?;
+    Ok(Json(personal_refund_view(request)))
+}
+
+async fn operator_review_refund(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(request_id): Path<String>,
+    Json(review): Json<BillingRefundReviewRequest>,
+) -> Result<Json<PersonalRefundView>> {
+    require_billing_corrections()?;
+    require_billing_operator(&headers)?;
+    let mut tx = state.pool.begin().await?;
+    let request = billing_refunds::review_request(
+        &mut tx,
+        &request_id,
+        review.approve,
+        review.result_code.as_deref(),
+    )
+    .await
+    .map_err(Error::from)?;
+    tx.commit().await?;
+    Ok(Json(personal_refund_view(request)))
+}
+
+async fn operator_process_refund(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(request_id): Path<String>,
+) -> Result<Json<PersonalRefundView>> {
+    require_billing_corrections()?;
+    require_billing_operator(&headers)?;
+    let billing = billing_config(&state)?;
+    let mut tx = state.pool.begin().await?;
+    let current = billing_refunds::load_for_operator(&mut tx, &request_id)
+        .await
+        .map_err(Error::from)?;
+    let current = if current.state == billing_refunds::CorrectionState::Approved {
+        let next = billing_refunds::begin_provider_refund(&mut tx, &request_id)
+            .await
+            .map_err(Error::from)?;
+        tx.commit().await?;
+        next
+    } else {
+        tx.rollback().await?;
+        current
+    };
+    if current.state != billing_refunds::CorrectionState::ProviderPending {
+        return Ok(Json(personal_refund_view(current)));
+    }
+    let provider_key = format!("sotto-refund:{request_id}");
+    let receipt = billing
+        .provider
+        .create_refund(
+            &current.payment_reference,
+            current.amount_pence,
+            &provider_key,
+        )
+        .await
+        .map_err(ProviderError::into_error)?;
+    let mut tx = state.pool.begin().await?;
+    let request = match receipt.status.as_str() {
+        "succeeded" => billing_refunds::record_provider_refund(
+            &mut tx,
+            &request_id,
+            &receipt.refund_id,
+            true,
+            None,
+        )
+        .await
+        .map_err(Error::from)?,
+        "pending" | "requires_action" => {
+            billing_refunds::record_provider_pending(&mut tx, &request_id, &receipt.refund_id)
+                .await
+                .map_err(Error::from)?
+        }
+        status => billing_refunds::record_provider_refund(
+            &mut tx,
+            &request_id,
+            &receipt.refund_id,
+            false,
+            Some(status),
+        )
+        .await
+        .map_err(Error::from)?,
+    };
     tx.commit().await?;
     Ok(Json(personal_refund_view(request)))
 }

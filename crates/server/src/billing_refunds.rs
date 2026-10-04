@@ -334,6 +334,37 @@ pub async fn begin_provider_refund(
     load_request(tx, request_id).await
 }
 
+pub async fn record_provider_pending(
+    tx: &mut Transaction<'_, Postgres>,
+    request_id: &str,
+    provider_refund_id: &str,
+) -> Result<BillingRefundRequest, BillingRefundError> {
+    if provider_refund_id.trim().is_empty() {
+        return Err(BillingRefundError::InvalidField("provider_refund_id"));
+    }
+    let current = load_request_for_update(tx, request_id).await?;
+    if !matches!(
+        current.state,
+        CorrectionState::Approved | CorrectionState::ProviderPending
+    ) {
+        if current.state == CorrectionState::ProviderPending
+            && current.provider_refund_id.as_deref() == Some(provider_refund_id)
+        {
+            return Ok(current);
+        }
+        return Err(BillingRefundError::InvalidTransition);
+    }
+    sqlx::query(
+        "UPDATE billing_correction_requests SET state = 'provider_pending', \
+         provider_refund_id = $2, updated_at = now() WHERE request_id = $1",
+    )
+    .bind(request_id)
+    .bind(provider_refund_id)
+    .execute(&mut **tx)
+    .await?;
+    load_request(tx, request_id).await
+}
+
 pub async fn record_provider_refund(
     tx: &mut Transaction<'_, Postgres>,
     request_id: &str,
@@ -415,6 +446,13 @@ pub async fn load_for_requester(
     .fetch_optional(&mut **tx)
     .await?;
     row.map(|row| request_from_row(&row)).transpose()
+}
+
+pub async fn load_for_operator(
+    tx: &mut Transaction<'_, Postgres>,
+    request_id: &str,
+) -> Result<BillingRefundRequest, BillingRefundError> {
+    load_request(tx, request_id).await
 }
 
 async fn load_by_idempotency(
