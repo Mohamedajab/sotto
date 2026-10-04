@@ -95,7 +95,7 @@ fn request(user: &str, key: &str, full_refund_requested: bool) -> CorrectionRequ
         payer_kind: PayerKind::Personal,
         payment_reference: format!("pi_{user}"),
         subscription_id: format!("sub_{user}"),
-        amount_pence: Some(299),
+        amount_pence: (!full_refund_requested).then_some(299),
         reason: CorrectionReason::BillingError,
         policy_version: "2026-10-04".into(),
         idempotency_key: key.into(),

@@ -30,6 +30,7 @@ CREATE TABLE billing_correction_requests (
     CHECK (btrim(idempotency_key) <> ''),
     CHECK (btrim(request_hash) <> ''),
     CHECK (amount_pence IS NULL OR amount_pence > 0),
+    CHECK (NOT full_refund_requested OR amount_pence IS NULL),
     CHECK ((payer_kind = 'personal') = (organization_id IS NULL)),
     CHECK ((early_termination_confirmed_at_epoch IS NULL) = (effective_at_epoch IS NULL)),
     CHECK (state IN ('requested', 'approved', 'provider_pending', 'unknown') OR result_code IS NOT NULL),

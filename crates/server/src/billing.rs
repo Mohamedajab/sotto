@@ -31,6 +31,7 @@ use url::Url;
 use crate::auth::AuthUser;
 use crate::billing_catalogue::{BillingOffer, BillingPriceIds};
 use crate::billing_operations::{self, BeginOperation, BillingOperationState};
+use crate::billing_refunds::{self, CorrectionReason, PayerKind};
 use crate::config::BillingConfig;
 use crate::error::{Error, Result};
 use crate::founding_allocator::{self, FoundingOffer};
@@ -265,6 +266,14 @@ pub struct SponsoredCheckoutSession {
     pub subscription_id: Option<String>,
 }
 
+/// Provider evidence for a refund request. A refund response is not an access decision; the
+/// durable correction state decides whether the paid term remains or ends early.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefundReceipt {
+    pub refund_id: String,
+    pub status: String,
+}
+
 impl SubscriptionObservation {
     pub fn purge_gate(&self) -> PurgeGate {
         match self {
@@ -365,6 +374,18 @@ pub trait SubscriptionProvider: Send + Sync {
     }
 
     async fn create_portal(&self, customer: &str, return_url: &str) -> ProviderResult<String>;
+
+    /// Create a refund against a verified payment reference. The caller owns the durable
+    /// correction transaction and must record the receipt before changing any entitlement.
+    async fn create_refund(
+        &self,
+        payment_reference: &str,
+        amount_pence: Option<i64>,
+        idempotency_key: &str,
+    ) -> ProviderResult<RefundReceipt> {
+        let _ = (payment_reference, amount_pence, idempotency_key);
+        Err(ProviderError::unsupported("refund"))
+    }
 
     async fn get_subscription(
         &self,
@@ -829,6 +850,38 @@ impl SubscriptionProvider for StripeBilling {
             .ok_or_else(ProviderError::malformed_response)
     }
 
+    async fn create_refund(
+        &self,
+        payment_reference: &str,
+        amount_pence: Option<i64>,
+        idempotency_key: &str,
+    ) -> ProviderResult<RefundReceipt> {
+        if payment_reference.trim().is_empty() || idempotency_key.trim().is_empty() {
+            return Err(ProviderError::malformed_response());
+        }
+        if amount_pence.is_some_and(|amount| amount <= 0) {
+            return Err(ProviderError::malformed_response());
+        }
+        let mut form = vec![("payment_intent".to_string(), payment_reference.to_string())];
+        if let Some(amount) = amount_pence {
+            form.push(("amount".to_string(), amount.to_string()));
+        }
+        let value =
+            stripe_post_with_idempotency(&self.api_key, "refunds", &form, idempotency_key).await?;
+        let refund_id = value["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(ProviderError::malformed_response)?;
+        let status = value["status"]
+            .as_str()
+            .filter(|status| !status.is_empty())
+            .ok_or_else(ProviderError::malformed_response)?;
+        Ok(RefundReceipt {
+            refund_id: refund_id.to_string(),
+            status: status.to_string(),
+        })
+    }
+
     async fn get_subscription(
         &self,
         subscription_id: &str,
@@ -999,6 +1052,15 @@ pub fn router() -> Router<AppState> {
         )
         .route("/billing/personal/portal", post(personal_portal))
         .route("/billing/personal/cancel", post(personal_cancel))
+        .route("/billing/personal/refunds", post(personal_refund_request))
+        .route(
+            "/billing/personal/refunds/{request_id}",
+            get(personal_refund_status),
+        )
+        .route(
+            "/billing/personal/refunds/{request_id}/confirm-early",
+            post(personal_refund_confirm_early),
+        )
         .route("/billing/webhook", post(webhook));
 
     #[cfg(feature = "e2e-mock-billing")]
@@ -1017,9 +1079,15 @@ fn billing_config(state: &AppState) -> Result<&BillingState> {
 }
 
 const SPONSORED_BILLING_ENABLED_ENV: &str = "SOTTO_SPONSORED_BILLING_ENABLED";
+const BILLING_CORRECTIONS_ENABLED_ENV: &str = "SOTTO_BILLING_CORRECTIONS_ENABLED";
+const BILLING_CORRECTION_POLICY_VERSION: &str = "2026-10-04";
 
 fn sponsored_billing_enabled() -> bool {
     std::env::var(SPONSORED_BILLING_ENABLED_ENV).as_deref() == Ok("1")
+}
+
+fn billing_corrections_enabled() -> bool {
+    std::env::var(BILLING_CORRECTIONS_ENABLED_ENV).as_deref() == Ok("1")
 }
 
 fn sponsored_billing_config(state: &AppState) -> Result<&BillingState> {
@@ -1801,6 +1869,149 @@ struct PersonalLifecycleView {
 #[derive(Debug, Deserialize)]
 struct PersonalCancelRequest {
     idempotency_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PersonalRefundRequest {
+    reason: String,
+    amount_pence: Option<i64>,
+    full_refund: bool,
+    idempotency_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PersonalRefundEarlyConfirmation {
+    effective_at_epoch: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct PersonalRefundView {
+    request_id: String,
+    state: String,
+    reason: String,
+    amount_pence: Option<i64>,
+    full_refund_requested: bool,
+    preserve_paid_term: bool,
+    early_termination_confirmed_at_epoch: Option<i64>,
+    effective_at_epoch: Option<i64>,
+    result_code: Option<String>,
+}
+
+fn correction_reason(value: &str) -> Result<CorrectionReason> {
+    match value {
+        "duplicate_charge" => Ok(CorrectionReason::DuplicateCharge),
+        "billing_error" => Ok(CorrectionReason::BillingError),
+        "accidental_renewal" => Ok(CorrectionReason::AccidentalRenewal),
+        "legal_requirement" => Ok(CorrectionReason::LegalRequirement),
+        _ => Err(Error::BadRequest(
+            "unsupported billing correction reason".into(),
+        )),
+    }
+}
+
+fn personal_refund_view(request: billing_refunds::BillingRefundRequest) -> PersonalRefundView {
+    PersonalRefundView {
+        request_id: request.request_id,
+        state: request.state.as_str().into(),
+        reason: request.reason,
+        amount_pence: request.amount_pence,
+        full_refund_requested: request.full_refund_requested,
+        preserve_paid_term: request.preserve_paid_term,
+        early_termination_confirmed_at_epoch: request.early_termination_confirmed_at_epoch,
+        effective_at_epoch: request.effective_at_epoch,
+        result_code: request.result_code,
+    }
+}
+
+fn require_billing_corrections() -> Result<()> {
+    if billing_corrections_enabled() {
+        Ok(())
+    } else {
+        Err(Error::NotConfigured(
+            "billing corrections are not enabled".into(),
+        ))
+    }
+}
+
+async fn personal_refund_request(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(request): Json<PersonalRefundRequest>,
+) -> Result<Json<PersonalRefundView>> {
+    require_billing_corrections()?;
+    billing_config(&state)?;
+    if request.idempotency_key.trim().is_empty() {
+        return Err(Error::BadRequest(
+            "idempotency_key must not be empty".into(),
+        ));
+    }
+    let reason = correction_reason(&request.reason)?;
+    let mut tx = state.pool.begin().await?;
+    let account = personal_billing::load_account(&mut tx, &user.user_id)
+        .await
+        .map_err(personal_billing_error)?
+        .ok_or_else(|| Error::NotFound("personal billing account not found".into()))?;
+    let payment_reference = account.payment_reference.ok_or_else(|| {
+        Error::Conflict("personal billing has no settled payment to correct".into())
+    })?;
+    let subscription_id = account.stripe_subscription_id.ok_or_else(|| {
+        Error::Conflict("personal billing has no settled subscription to correct".into())
+    })?;
+    let (_, correction) = billing_refunds::create_request(
+        &mut tx,
+        &billing_refunds::CorrectionRequest {
+            requester_user_id: user.user_id.clone(),
+            beneficiary_id: user.user_id,
+            organization_id: None,
+            payer_kind: PayerKind::Personal,
+            payment_reference,
+            subscription_id,
+            amount_pence: request.amount_pence,
+            reason,
+            policy_version: BILLING_CORRECTION_POLICY_VERSION.into(),
+            idempotency_key: request.idempotency_key,
+            full_refund_requested: request.full_refund,
+        },
+    )
+    .await
+    .map_err(Error::from)?;
+    tx.commit().await?;
+    Ok(Json(personal_refund_view(correction)))
+}
+
+async fn personal_refund_status(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(request_id): Path<String>,
+) -> Result<Json<PersonalRefundView>> {
+    require_billing_corrections()?;
+    let mut tx = state.pool.begin().await?;
+    let request = billing_refunds::load_for_requester(&mut tx, &request_id, &user.user_id)
+        .await
+        .map_err(Error::from)?
+        .ok_or_else(|| Error::NotFound("billing correction request not found".into()))?;
+    tx.rollback().await?;
+    Ok(Json(personal_refund_view(request)))
+}
+
+async fn personal_refund_confirm_early(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(request_id): Path<String>,
+    Json(request): Json<PersonalRefundEarlyConfirmation>,
+) -> Result<Json<PersonalRefundView>> {
+    require_billing_corrections()?;
+    let mut tx = state.pool.begin().await?;
+    let request = billing_refunds::confirm_early_termination(
+        &mut tx,
+        &request_id,
+        &user.user_id,
+        request.effective_at_epoch,
+    )
+    .await
+    .map_err(Error::from)?;
+    tx.commit().await?;
+    Ok(Json(personal_refund_view(request)))
 }
 
 async fn personal_portal(

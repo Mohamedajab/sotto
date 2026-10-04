@@ -119,6 +119,9 @@ impl CorrectionRequest {
         if self.amount_pence.is_some_and(|amount| amount <= 0) {
             return Err(BillingRefundError::InvalidField("amount_pence"));
         }
+        if self.full_refund_requested && self.amount_pence.is_some() {
+            return Err(BillingRefundError::InvalidField("amount_pence"));
+        }
         Ok(())
     }
 
