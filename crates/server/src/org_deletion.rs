@@ -211,7 +211,9 @@ pub async fn request_with_retention(
 
     let mut tx = pool.begin().await?;
     let row: Option<(String, Option<String>)> = sqlx::query_as(
-        "SELECT lifecycle_state, stripe_subscription_id FROM organizations \
+        "SELECT lifecycle_state, COALESCE(organizations.stripe_subscription_id, \
+             (SELECT provider_subscription_id FROM billing_sponsored_subscriptions \
+              WHERE organization_id = organizations.id)) FROM organizations \
          WHERE id = $1 FOR UPDATE",
     )
     .bind(org_id)
@@ -1360,7 +1362,9 @@ async fn purge(pool: &PgPool, lease: &DeletionLease) -> Result<Option<DeletionVi
                 (d.billing_checked_at >= now() - ($1 * interval '1 second') \
                  AND d.billing_observation_source IN ('provider', 'operator')), \
                 d.purge_after <= now(), \
-                o.lifecycle_state, o.stripe_subscription_id \
+                o.lifecycle_state, COALESCE(o.stripe_subscription_id, \
+                    (SELECT provider_subscription_id FROM billing_sponsored_subscriptions \
+                     WHERE organization_id = o.id)) \
          FROM organization_deletions d JOIN organizations o ON o.id = d.org_id \
          WHERE d.id = $2::uuid AND d.state_version = $3 AND d.lease_owner = $4 \
          FOR UPDATE OF d, o",
