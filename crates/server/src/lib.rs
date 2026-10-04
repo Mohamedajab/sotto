@@ -90,6 +90,8 @@ pub mod org_deletion_metrics;
 pub mod org_deletion_ops;
 pub mod server_info;
 pub mod share;
+#[doc(hidden)]
+pub mod sponsored_billing;
 pub mod state;
 pub mod sync;
 pub mod telemetry;
