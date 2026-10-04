@@ -387,6 +387,12 @@ pub trait SubscriptionProvider: Send + Sync {
         Err(ProviderError::unsupported("refund"))
     }
 
+    /// Read a previously created refund. A stored provider refund ID must be reconciled with a
+    /// read before another create call is attempted.
+    async fn get_refund(&self, _provider_refund_id: &str) -> ProviderResult<RefundReceipt> {
+        Err(ProviderError::unsupported("refund_lookup"))
+    }
+
     async fn get_subscription(
         &self,
         subscription_id: &str,
@@ -885,6 +891,25 @@ impl SubscriptionProvider for StripeBilling {
         let refund_id = value["id"]
             .as_str()
             .filter(|id| !id.is_empty())
+            .ok_or_else(ProviderError::malformed_response)?;
+        let status = value["status"]
+            .as_str()
+            .filter(|status| !status.is_empty())
+            .ok_or_else(ProviderError::malformed_response)?;
+        Ok(RefundReceipt {
+            refund_id: refund_id.to_string(),
+            status: status.to_string(),
+        })
+    }
+
+    async fn get_refund(&self, provider_refund_id: &str) -> ProviderResult<RefundReceipt> {
+        if !provider_refund_id.starts_with("re_") {
+            return Err(ProviderError::malformed_response());
+        }
+        let value = stripe_get(&self.api_key, &format!("refunds/{provider_refund_id}")).await?;
+        let refund_id = value["id"]
+            .as_str()
+            .filter(|id| *id == provider_refund_id)
             .ok_or_else(ProviderError::malformed_response)?;
         let status = value["status"]
             .as_str()
@@ -2137,30 +2162,45 @@ async fn operator_process_refund(
         tx.rollback().await?;
         current
     };
-    if current.state != billing_refunds::CorrectionState::ProviderPending {
-        return Ok(Json(personal_refund_view(current)));
-    }
-    let provider_key = format!("sotto-refund:{request_id}");
-    if current.payer_kind == billing_refunds::PayerKind::Personal && !current.preserve_paid_term {
+    if current.state == billing_refunds::CorrectionState::TerminationPending {
+        let provider_key = format!("sotto-refund:{request_id}:terminate");
         billing
             .provider
             .terminate_personal_subscription(
                 &current.subscription_id,
-                &format!("{provider_key}:terminate"),
+                &provider_key,
                 &current.beneficiary_id,
             )
             .await
             .map_err(ProviderError::into_error)?;
+        let mut tx = state.pool.begin().await?;
+        let request = billing_refunds::record_provider_termination(&mut tx, &request_id)
+            .await
+            .map_err(Error::from)?;
+        tx.commit().await?;
+        return Ok(Json(personal_refund_view(request)));
     }
-    let receipt = billing
-        .provider
-        .create_refund(
-            &current.payment_reference,
-            current.amount_pence,
-            &provider_key,
-        )
-        .await
-        .map_err(ProviderError::into_error)?;
+    if current.state != billing_refunds::CorrectionState::ProviderPending {
+        return Ok(Json(personal_refund_view(current)));
+    }
+    let provider_key = format!("sotto-refund:{request_id}");
+    let receipt = if let Some(provider_refund_id) = current.provider_refund_id.as_deref() {
+        billing
+            .provider
+            .get_refund(provider_refund_id)
+            .await
+            .map_err(ProviderError::into_error)?
+    } else {
+        billing
+            .provider
+            .create_refund(
+                &current.payment_reference,
+                current.amount_pence,
+                &provider_key,
+            )
+            .await
+            .map_err(ProviderError::into_error)?
+    };
     let mut tx = state.pool.begin().await?;
     let request = match receipt.status.as_str() {
         "succeeded" => billing_refunds::record_provider_refund(
@@ -2188,6 +2228,23 @@ async fn operator_process_refund(
         .map_err(Error::from)?,
     };
     tx.commit().await?;
+    if request.state == billing_refunds::CorrectionState::TerminationPending {
+        billing
+            .provider
+            .terminate_personal_subscription(
+                &request.subscription_id,
+                &format!("{provider_key}:terminate"),
+                &request.beneficiary_id,
+            )
+            .await
+            .map_err(ProviderError::into_error)?;
+        let mut tx = state.pool.begin().await?;
+        let request = billing_refunds::record_provider_termination(&mut tx, &request_id)
+            .await
+            .map_err(Error::from)?;
+        tx.commit().await?;
+        return Ok(Json(personal_refund_view(request)));
+    }
     Ok(Json(personal_refund_view(request)))
 }
 

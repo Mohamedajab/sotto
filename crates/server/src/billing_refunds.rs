@@ -51,6 +51,7 @@ pub enum CorrectionState {
     Requested,
     Approved,
     ProviderPending,
+    TerminationPending,
     Refunded,
     Denied,
     Failed,
@@ -63,6 +64,7 @@ impl CorrectionState {
             Self::Requested => "requested",
             Self::Approved => "approved",
             Self::ProviderPending => "provider_pending",
+            Self::TerminationPending => "termination_pending",
             Self::Refunded => "refunded",
             Self::Denied => "denied",
             Self::Failed => "failed",
@@ -75,6 +77,7 @@ impl CorrectionState {
             "requested" => Ok(Self::Requested),
             "approved" => Ok(Self::Approved),
             "provider_pending" => Ok(Self::ProviderPending),
+            "termination_pending" => Ok(Self::TerminationPending),
             "refunded" => Ok(Self::Refunded),
             "denied" => Ok(Self::Denied),
             "failed" => Ok(Self::Failed),
@@ -395,7 +398,11 @@ pub async fn record_provider_refund(
     {
         return Err(BillingRefundError::RequestConflict);
     }
-    let target_state = if succeeded {
+    let early_termination =
+        succeeded && current.payer_kind == PayerKind::Personal && !current.preserve_paid_term;
+    let target_state = if early_termination {
+        CorrectionState::TerminationPending
+    } else if succeeded {
         CorrectionState::Refunded
     } else {
         CorrectionState::Failed
@@ -429,23 +436,48 @@ pub async fn record_provider_refund(
     .bind(stored_result_code)
     .execute(&mut **tx)
     .await?;
-    if succeeded && current.payer_kind == PayerKind::Personal && !current.preserve_paid_term {
-        let effective_at = current
-            .effective_at_epoch
-            .ok_or(BillingRefundError::CorruptState)?;
-        sqlx::query(
-            "UPDATE billing_personal_accounts SET state = 'canceled', \
-             paid_through_epoch = LEAST(COALESCE(paid_through_epoch, $2), $2), \
-             paid_through_date = to_char(to_timestamp($2), 'YYYY-MM-DD'), \
-             cancel_at_period_end = TRUE, updated_at = now() \
-             WHERE user_id = $1 AND stripe_subscription_id = $3",
-        )
-        .bind(&current.beneficiary_id)
-        .bind(effective_at)
-        .bind(&current.subscription_id)
-        .execute(&mut **tx)
-        .await?;
+    load_request(tx, request_id).await
+}
+
+/// Record the durable completion of the provider cancellation after a successful full refund.
+/// Keeping this separate from `record_provider_refund` leaves the request retryable when the
+/// refund succeeds but the subscription termination is temporarily unavailable.
+pub async fn record_provider_termination(
+    tx: &mut Transaction<'_, Postgres>,
+    request_id: &str,
+) -> Result<BillingRefundRequest, BillingRefundError> {
+    let current = load_request_for_update(tx, request_id).await?;
+    if current.state == CorrectionState::Refunded {
+        return Ok(current);
     }
+    if current.state != CorrectionState::TerminationPending
+        || current.payer_kind != PayerKind::Personal
+        || current.preserve_paid_term
+    {
+        return Err(BillingRefundError::InvalidTransition);
+    }
+    let effective_at = current
+        .effective_at_epoch
+        .ok_or(BillingRefundError::CorruptState)?;
+    sqlx::query(
+        "UPDATE billing_correction_requests SET state = 'refunded', updated_at = now() \
+         WHERE request_id = $1 AND state = 'termination_pending'",
+    )
+    .bind(request_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE billing_personal_accounts SET state = 'canceled', \
+         paid_through_epoch = LEAST(COALESCE(paid_through_epoch, $2), $2), \
+         paid_through_date = to_char(to_timestamp($2), 'YYYY-MM-DD'), \
+         cancel_at_period_end = TRUE, updated_at = now() \
+         WHERE user_id = $1 AND stripe_subscription_id = $3",
+    )
+    .bind(&current.beneficiary_id)
+    .bind(effective_at)
+    .bind(&current.subscription_id)
+    .execute(&mut **tx)
+    .await?;
     load_request(tx, request_id).await
 }
 

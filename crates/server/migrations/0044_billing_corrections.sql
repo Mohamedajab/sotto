@@ -15,7 +15,7 @@ CREATE TABLE billing_correction_requests (
     request_hash TEXT NOT NULL,
     full_refund_requested BOOLEAN NOT NULL DEFAULT FALSE,
     state TEXT NOT NULL DEFAULT 'requested'
-        CHECK (state IN ('requested', 'approved', 'provider_pending', 'refunded', 'denied', 'failed', 'unknown')),
+        CHECK (state IN ('requested', 'approved', 'provider_pending', 'termination_pending', 'refunded', 'denied', 'failed', 'unknown')),
     preserve_paid_term BOOLEAN NOT NULL DEFAULT TRUE,
     early_termination_confirmed_at_epoch BIGINT,
     effective_at_epoch BIGINT,

@@ -5,8 +5,8 @@ use uuid::Uuid;
 
 use sotto_server::billing_refunds::{
     begin_provider_refund, confirm_early_termination, create_request, record_provider_pending,
-    record_provider_refund, review_request, BillingRefundError, CorrectionReason,
-    CorrectionRequest, CorrectionState, PayerKind, RequestDisposition,
+    record_provider_refund, record_provider_termination, review_request, BillingRefundError,
+    CorrectionReason, CorrectionRequest, CorrectionState, PayerKind, RequestDisposition,
 };
 use sotto_server::db;
 
@@ -189,12 +189,16 @@ async fn correction_replays_preserve_terms_until_confirmed_refund_and_early_end(
     let early = record_provider_refund(&mut tx, &early.request_id, "re_early", true, None)
         .await
         .expect("record early refund");
-    assert_eq!(early.state, CorrectionState::Refunded);
+    assert_eq!(early.state, CorrectionState::TerminationPending);
     assert!(!early.preserve_paid_term);
     let replay = record_provider_refund(&mut tx, &early.request_id, "re_early", true, None)
         .await
         .expect("replay early refund");
     assert_eq!(replay.request_id, early.request_id);
+    let early = record_provider_termination(&mut tx, &early.request_id)
+        .await
+        .expect("record early termination");
+    assert_eq!(early.state, CorrectionState::Refunded);
     tx.commit().await.expect("commit early correction");
 
     let account: (String, i64) = sqlx::query_as(
