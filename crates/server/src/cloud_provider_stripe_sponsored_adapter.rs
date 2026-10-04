@@ -112,7 +112,19 @@ fn validate_context(
     if candidate.payer_kind() != PayerKind::Sponsor {
         return Err(SponsoredAdapterError::UnsupportedPayer);
     }
-    if ticket.beneficiary_id.trim().is_empty()
+    if ticket.attempt_id.trim().is_empty()
+        || ticket.collection_epoch <= 0
+        || ticket.source_set_generation <= 0
+        || ticket
+            .provider_invalidation_generation
+            .is_some_and(|generation| generation < 0)
+        || ticket
+            .expected_projection_revision
+            .is_some_and(|revision| revision <= 0)
+        || ticket
+            .completed_revision
+            .is_some_and(|revision| revision <= 0)
+        || ticket.beneficiary_id.trim().is_empty()
         || ticket.source_bindings.iter().any(|binding| {
             binding.provider_namespace != STRIPE_NAMESPACE
                 || binding.beneficiary_id.trim().is_empty()
@@ -276,6 +288,23 @@ mod tests {
             collection_for_ticket(&wrong_context, &ticket("source_a", "user_1"), &candidate())
                 .unwrap_err(),
             SponsoredAdapterError::ContextMismatch
+        );
+    }
+
+    #[test]
+    fn impossible_reconciliation_ticket_values_are_rejected() {
+        let mut invalid_epoch = ticket("source_a", "user_1");
+        invalid_epoch.collection_epoch = 0;
+        assert_eq!(
+            collection_for_ticket(&context(), &invalid_epoch, &candidate()).unwrap_err(),
+            SponsoredAdapterError::InvalidTicket
+        );
+
+        let mut invalid_revision = ticket("source_a", "user_1");
+        invalid_revision.expected_projection_revision = Some(0);
+        assert_eq!(
+            collection_for_ticket(&context(), &invalid_revision, &candidate()).unwrap_err(),
+            SponsoredAdapterError::InvalidTicket
         );
     }
 }
