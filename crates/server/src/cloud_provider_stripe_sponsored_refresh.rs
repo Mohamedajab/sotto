@@ -6,7 +6,7 @@
 //! sources represented by several invoices, so collection reads the bounded subscription history,
 //! composes one candidate per relevant invoice, and only then crosses the reconciliation adapter.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
 use sqlx::PgPool;
@@ -24,7 +24,7 @@ use crate::cloud_provider_stripe_sponsored::{
     compose_sponsored_coverage, SponsoredCoverageError, SponsoredCoverageResult,
     SponsoredNeedsEvidence, SponsoredStripeCoverageConfig,
 };
-use crate::cloud_provider_stripe_sponsored_adapter::collection_for_ticket;
+use crate::cloud_provider_stripe_sponsored_adapter::collection_for_ticket_by_source;
 use crate::cloud_provider_stripe_sponsored_store::{
     load_sponsored_allocation_manifest, SponsoredManifestLoadError, SponsoredManifestLoadLimits,
 };
@@ -64,8 +64,6 @@ pub enum SponsoredRefreshError {
     InvalidConfig(&'static str),
     #[error("sponsored refresh invoice history did not contain the triggering invoice")]
     TriggerInvoiceMissing,
-    #[error("sponsored refresh invoice history exceeded its configured bound of {0}")]
-    InvoiceBoundExceeded(usize),
     #[error("sponsored Stripe read failed: {0}")]
     Stripe(#[source] StripeReadError),
     #[error("sponsored allocation manifest load failed: {0}")]
@@ -215,8 +213,7 @@ impl RefreshJobExecutor for SponsoredRefreshExecutor {
                 let code = match error {
                     SponsoredRefreshError::InvalidInput(_)
                     | SponsoredRefreshError::InvalidConfig(_)
-                    | SponsoredRefreshError::TriggerInvoiceMissing
-                    | SponsoredRefreshError::InvoiceBoundExceeded(_) => "sponsored_refresh_invalid",
+                    | SponsoredRefreshError::TriggerInvoiceMissing => "sponsored_refresh_invalid",
                     SponsoredRefreshError::Stripe(_) => "sponsored_refresh_stripe",
                     SponsoredRefreshError::Manifest(_) => "sponsored_refresh_manifest",
                     SponsoredRefreshError::NeedsEvidence(_)
@@ -303,12 +300,7 @@ pub async fn collect_sponsored_collection(
             limits.max_invoices,
         )
         .await
-        .map_err(|error| match error {
-            StripeReadError::RecordBoundExceeded => {
-                SponsoredRefreshError::InvoiceBoundExceeded(limits.max_invoices)
-            }
-            other => SponsoredRefreshError::Stripe(other),
-        })?;
+        .map_err(SponsoredRefreshError::Stripe)?;
     let Some(trigger) = invoices.iter().find(|invoice| invoice.id == invoice_id) else {
         return Err(SponsoredRefreshError::TriggerInvoiceMissing);
     };
@@ -324,7 +316,31 @@ pub async fn collect_sponsored_collection(
         .filter(|binding| binding.beneficiary_id == ticket.beneficiary_id)
         .map(|binding| binding.source_id.as_str())
         .collect::<BTreeSet<_>>();
+    #[derive(Debug)]
+    enum SourceSelection {
+        Candidate {
+            period_end: i64,
+            invoice_id: String,
+            candidate_index: usize,
+        },
+        NeedsEvidence {
+            period_end: i64,
+            invoice_id: String,
+            reason: SponsoredNeedsEvidence,
+        },
+    }
+
+    fn is_newer(
+        period_end: i64,
+        invoice_id: &str,
+        previous_period_end: i64,
+        previous_invoice_id: &str,
+    ) -> bool {
+        (period_end, invoice_id) > (previous_period_end, previous_invoice_id)
+    }
+
     let mut candidates = Vec::new();
+    let mut selections = BTreeMap::<String, SourceSelection>::new();
     for invoice in invoices {
         if invoice.status.as_deref() != Some("paid") {
             continue;
@@ -350,24 +366,117 @@ pub async fn collect_sponsored_collection(
         )
         .await
         .map_err(SponsoredRefreshError::Manifest)?;
-        if !manifest
+        let relevant_sources = manifest
             .allocations()
             .iter()
-            .any(|interval| expected_sources.contains(interval.source_id()))
-        {
+            .filter(|interval| expected_sources.contains(interval.source_id()))
+            .map(|interval| interval.source_id().to_owned())
+            .collect::<BTreeSet<_>>();
+        if relevant_sources.is_empty() {
             continue;
         }
         match compose_sponsored_coverage(coverage, &manifest, &settlement)
             .map_err(SponsoredRefreshError::Composition)?
         {
-            SponsoredCoverageResult::Candidate(candidate) => candidates.push(candidate),
+            SponsoredCoverageResult::Candidate(candidate) => {
+                let candidate_index = candidates.len();
+                let source_ids = candidate
+                    .source_observations()
+                    .into_iter()
+                    .map(|observation| match observation {
+                        crate::cloud_coverage_reconciliation::SourceObservation::Complete {
+                            source_id,
+                            ..
+                        }
+                        | crate::cloud_coverage_reconciliation::SourceObservation::Unavailable {
+                            source_id,
+                            ..
+                        } => source_id,
+                    })
+                    .filter(|source_id| expected_sources.contains(source_id.as_str()))
+                    .collect::<BTreeSet<_>>();
+                candidates.push(candidate);
+                for source_id in source_ids {
+                    let replace = match selections.get(&source_id) {
+                        Some(SourceSelection::Candidate {
+                            period_end,
+                            invoice_id: previous_invoice_id,
+                            ..
+                        })
+                        | Some(SourceSelection::NeedsEvidence {
+                            period_end,
+                            invoice_id: previous_invoice_id,
+                            ..
+                        }) => is_newer(
+                            settlement.period_end(),
+                            &invoice.id,
+                            *period_end,
+                            previous_invoice_id,
+                        ),
+                        None => true,
+                    };
+                    if replace {
+                        selections.insert(
+                            source_id,
+                            SourceSelection::Candidate {
+                                period_end: settlement.period_end(),
+                                invoice_id: invoice.id.clone(),
+                                candidate_index,
+                            },
+                        );
+                    }
+                }
+            }
             SponsoredCoverageResult::NeedsEvidence(reason) => {
-                return Err(SponsoredRefreshError::NeedsEvidence(reason));
+                for source_id in relevant_sources {
+                    let replace = match selections.get(&source_id) {
+                        Some(SourceSelection::Candidate {
+                            period_end,
+                            invoice_id: previous_invoice_id,
+                            ..
+                        })
+                        | Some(SourceSelection::NeedsEvidence {
+                            period_end,
+                            invoice_id: previous_invoice_id,
+                            ..
+                        }) => is_newer(
+                            settlement.period_end(),
+                            &invoice.id,
+                            *period_end,
+                            previous_invoice_id,
+                        ),
+                        None => true,
+                    };
+                    if replace {
+                        selections.insert(
+                            source_id,
+                            SourceSelection::NeedsEvidence {
+                                period_end: settlement.period_end(),
+                                invoice_id: invoice.id.clone(),
+                                reason: reason.clone(),
+                            },
+                        );
+                    }
+                }
             }
         }
     }
-    let references = candidates.iter().collect::<Vec<_>>();
-    collection_for_ticket(context, ticket, &references)
+
+    let mut selected_candidates = BTreeMap::new();
+    for source_id in expected_sources {
+        match selections.get(source_id) {
+            Some(SourceSelection::Candidate {
+                candidate_index, ..
+            }) => {
+                selected_candidates.insert(source_id.to_owned(), &candidates[*candidate_index]);
+            }
+            Some(SourceSelection::NeedsEvidence { reason, .. }) => {
+                return Err(SponsoredRefreshError::NeedsEvidence(reason.clone()));
+            }
+            None => {}
+        }
+    }
+    collection_for_ticket_by_source(context, ticket, &selected_candidates)
         .map_err(|error| SponsoredRefreshError::Adapter(error.to_string()))
 }
 

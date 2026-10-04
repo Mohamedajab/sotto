@@ -129,6 +129,95 @@ pub(crate) fn collection_for_ticket(
     })
 }
 
+/// Build a collection when each registered source has already selected its newest candidate.
+///
+/// A candidate can contain observations for several beneficiaries and sources. The source map is
+/// therefore explicit: it prevents a candidate selected for one source from re-introducing a
+/// duplicate observation for another source while retaining the same context and allocation
+/// checks as [`collection_for_ticket`].
+pub(crate) fn collection_for_ticket_by_source(
+    context: &ProviderContext,
+    ticket: &CollectionTicket,
+    candidates: &BTreeMap<String, &SponsoredCoverageCandidate>,
+) -> Result<VerifiedCollection, SponsoredAdapterError> {
+    if ticket.status != CollectionStatus::Pending || ticket.completed_revision.is_some() {
+        return Err(SponsoredAdapterError::InvalidTicket);
+    }
+    if ticket.source_bindings.is_empty() || ticket.beneficiary_id.trim().is_empty() {
+        return Err(SponsoredAdapterError::InvalidTicket);
+    }
+
+    let expected_sources = ticket
+        .source_bindings
+        .iter()
+        .filter(|binding| binding.beneficiary_id == ticket.beneficiary_id)
+        .map(|binding| binding.source_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if expected_sources.len() != ticket.source_bindings.len()
+        || candidates.len() != expected_sources.len()
+        || candidates
+            .keys()
+            .any(|source_id| !expected_sources.contains(source_id.as_str()))
+    {
+        return Err(SponsoredAdapterError::SourceSetMismatch);
+    }
+
+    let mut observations = Vec::with_capacity(expected_sources.len());
+    let mut candidate_references = BTreeSet::new();
+    for source_id in expected_sources {
+        let candidate = candidates
+            .get(source_id)
+            .ok_or(SponsoredAdapterError::MissingObservation)?;
+        validate_context(context, ticket, candidate)?;
+        candidate_references.insert(candidate.semantic_reference().to_owned());
+
+        let beneficiary = candidate
+            .beneficiaries()
+            .iter()
+            .find(|beneficiary| beneficiary.beneficiary_id() == ticket.beneficiary_id)
+            .ok_or(SponsoredAdapterError::MissingObservation)?;
+        let mut allocation_reference = None;
+        for term in beneficiary.paid_terms() {
+            if term.interval().source_id != source_id {
+                continue;
+            }
+            if let Some(existing) = allocation_reference.replace(term.allocation_reference()) {
+                if existing != term.allocation_reference() {
+                    return Err(SponsoredAdapterError::AllocationReferenceMismatch);
+                }
+            }
+        }
+        let allocation_reference =
+            allocation_reference.ok_or(SponsoredAdapterError::MissingObservation)?;
+        let binding = ticket
+            .source_bindings
+            .iter()
+            .find(|binding| binding.source_id == source_id)
+            .ok_or(SponsoredAdapterError::MissingObservation)?;
+        if allocation_reference != binding.external_allocation_reference {
+            return Err(SponsoredAdapterError::AllocationReferenceMismatch);
+        }
+        let observation = candidate
+            .source_observations()
+            .into_iter()
+            .find(|observation| observation_source_id(observation) == source_id)
+            .ok_or(SponsoredAdapterError::MissingObservation)?;
+        observations.push(observation);
+    }
+
+    Ok(VerifiedCollection {
+        aggregate_evidence_reference: format!(
+            "stripe-sponsored-collection-v1:{}:{}",
+            candidate_references
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(","),
+            ticket.beneficiary_id
+        ),
+        observations,
+    })
+}
+
 fn observation_source_id(observation: &SourceObservation) -> &str {
     match observation {
         SourceObservation::Complete { source_id, .. }
@@ -380,6 +469,17 @@ mod tests {
         assert!(collection
             .aggregate_evidence_reference
             .starts_with("stripe-sponsored-collection-v1:"));
+    }
+
+    #[test]
+    fn source_selection_uses_one_candidate_without_duplicate_observations() {
+        let candidate = candidate();
+        let mut selected = BTreeMap::new();
+        selected.insert("source_a".into(), &candidate);
+        let collection =
+            collection_for_ticket_by_source(&context(), &ticket("source_a", "user_1"), &selected)
+                .unwrap();
+        assert_eq!(collection.observations.len(), 1);
     }
 
     #[test]

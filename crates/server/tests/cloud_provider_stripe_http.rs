@@ -1462,12 +1462,14 @@ async fn bounded_subscription_invoice_reads_stop_before_fetching_unbounded_histo
         StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
     let mut session = client.session();
 
-    assert!(matches!(
+    assert_eq!(
         client
             .subscription_invoices_bounded(&mut session, "sub_1", Some("cus_1"), 1)
-            .await,
-        Err(StripeReadError::RecordBoundExceeded)
-    ));
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
     let invoice_calls = server
         .state
         .calls

@@ -396,19 +396,25 @@ impl StripeReadClient {
         subscription_id: &str,
         customer_id: Option<&str>,
     ) -> Result<Vec<StripeInvoiceResource>, StripeReadError> {
-        self.subscription_invoices_bounded(
-            session,
-            subscription_id,
-            customer_id,
-            self.limits.max_records,
-        )
-        .await
+        self.ensure_account(session).await?;
+        validate_identifier(subscription_id)?;
+        if let Some(customer_id) = customer_id {
+            validate_identifier(customer_id)?;
+        }
+        let mut query = vec![("subscription".to_owned(), subscription_id.to_owned())];
+        if let Some(customer_id) = customer_id {
+            query.push(("customer".to_owned(), customer_id.to_owned()));
+        }
+        let invoices = self
+            .list(session, "v1/invoices", query, parse_invoice)
+            .await?;
+        self.validate_subscription_invoices(&invoices, subscription_id, customer_id)
     }
 
     /// Enumerate subscription invoices with a caller-owned record bound.
     ///
-    /// The bound is enforced while pagination is happening. Reaching it with another page still
-    /// available fails closed instead of fetching the rest of a long-lived subscription first.
+    /// The bound is enforced while pagination is happening. The result is a recent prefix when
+    /// more invoices exist, so a long-lived subscription does not force an unbounded history read.
     #[doc(hidden)]
     pub async fn subscription_invoices_bounded(
         &self,
@@ -434,7 +440,16 @@ impl StripeReadClient {
         let invoices = self
             .list_bounded(session, "v1/invoices", query, parse_invoice, max_invoices)
             .await?;
-        for invoice in &invoices {
+        self.validate_subscription_invoices(&invoices, subscription_id, customer_id)
+    }
+
+    fn validate_subscription_invoices(
+        &self,
+        invoices: &[StripeInvoiceResource],
+        subscription_id: &str,
+        customer_id: Option<&str>,
+    ) -> Result<Vec<StripeInvoiceResource>, StripeReadError> {
+        for invoice in invoices {
             if invoice
                 .subscription_id
                 .as_deref()
@@ -452,7 +467,7 @@ impl StripeReadClient {
             }
             validate_mode(invoice.livemode, self.environment)?;
         }
-        Ok(invoices)
+        Ok(invoices.to_vec())
     }
 
     pub async fn invoice_lines(
@@ -1271,12 +1286,10 @@ impl StripeReadClient {
                 ));
             }
             let remaining = max_records.saturating_sub(output.len());
-            if data.len() > remaining {
-                return Err(StripeReadError::RecordBoundExceeded);
-            }
-            session.add_records(data.len(), self.limits.max_records)?;
-            let mut parsed = Vec::with_capacity(data.len());
-            for item in data {
+            let page_data = &data[..data.len().min(remaining)];
+            session.add_records(page_data.len(), self.limits.max_records)?;
+            let mut parsed = Vec::with_capacity(page_data.len());
+            for item in page_data {
                 let id = required_id(item, "list.data.id")?;
                 if !ids.insert(id.clone()) {
                     return Err(StripeReadError::InvalidPagination("duplicate record id"));
@@ -1285,11 +1298,8 @@ impl StripeReadClient {
             }
             let last_id = parsed.last().map(|(id, _)| id.clone());
             output.extend(parsed.into_iter().map(|(_, value)| value));
-            if !has_more {
+            if !has_more || output.len() >= max_records {
                 return Ok(output);
-            }
-            if output.len() >= max_records {
-                return Err(StripeReadError::RecordBoundExceeded);
             }
             let Some(last_id) = last_id else {
                 return Err(StripeReadError::InvalidPagination(
