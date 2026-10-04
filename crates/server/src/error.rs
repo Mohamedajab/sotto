@@ -36,9 +36,13 @@ pub enum Error {
     #[error("forbidden: {0}")]
     Forbidden(String),
 
-    /// A plan quota or Team-feature gate blocked the request (upgrade to proceed).
+    /// A plan quota or Team-feature gate blocked the request.
     #[error("quota: {0}")]
     Quota(String),
+
+    /// A hosted Cloud action requires an eligible person-level account.
+    #[error("cloud eligibility: {0}")]
+    CloudEligibility(String),
 
     /// The request was malformed (bad/expired login state, non-loopback redirect, …).
     #[error("bad request: {0}")]
@@ -74,7 +78,9 @@ impl IntoResponse for Error {
         let (status, message) = match &self {
             Error::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorised".to_string()),
             Error::Forbidden(m) => (StatusCode::FORBIDDEN, m.clone()),
-            Error::Quota(m) => (StatusCode::PAYMENT_REQUIRED, m.clone()),
+            Error::Quota(m) | Error::CloudEligibility(m) => {
+                (StatusCode::PAYMENT_REQUIRED, m.clone())
+            }
             Error::BadRequest(m) => (StatusCode::BAD_REQUEST, m.clone()),
             Error::NotFound(m) => (StatusCode::NOT_FOUND, m.clone()),
             Error::Conflict(m) => (StatusCode::CONFLICT, m.clone()),
@@ -116,7 +122,8 @@ impl Error {
         match self {
             Self::Unauthorized => "unauthorized",
             Self::Forbidden(_) => "forbidden",
-            Self::Quota(_) => "cloud_eligibility_required",
+            Self::Quota(_) => "quota",
+            Self::CloudEligibility(_) => "cloud_eligibility_required",
             Self::BadRequest(_) => "bad_request",
             Self::NotFound(_) => "not_found",
             Self::Conflict(_) => "conflict",
@@ -138,8 +145,9 @@ mod tests {
     #[test]
     fn error_codes_are_stable_and_old_clients_keep_plain_messages() {
         assert_eq!(Error::Unauthorized.code(), "unauthorized");
+        assert_eq!(Error::Quota("limit".into()).code(), "quota");
         assert_eq!(
-            Error::Quota("upgrade".into()).code(),
+            Error::CloudEligibility("upgrade".into()).code(),
             "cloud_eligibility_required"
         );
         assert_eq!(Error::RateLimited("retry".into()).code(), "rate_limited");
