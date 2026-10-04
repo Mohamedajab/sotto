@@ -296,18 +296,19 @@ pub async fn collect_sponsored_collection(
             ))?;
     let mut session = stripe.session();
     let invoices = stripe
-        .subscription_invoices(
+        .subscription_invoices_bounded(
             &mut session,
             &allocation.subscription_id,
             Some(&allocation.provider_customer_id),
+            limits.max_invoices,
         )
         .await
-        .map_err(SponsoredRefreshError::Stripe)?;
-    if invoices.len() > limits.max_invoices {
-        return Err(SponsoredRefreshError::InvoiceBoundExceeded(
-            limits.max_invoices,
-        ));
-    }
+        .map_err(|error| match error {
+            StripeReadError::RecordBoundExceeded => {
+                SponsoredRefreshError::InvoiceBoundExceeded(limits.max_invoices)
+            }
+            other => SponsoredRefreshError::Stripe(other),
+        })?;
     let Some(trigger) = invoices.iter().find(|invoice| invoice.id == invoice_id) else {
         return Err(SponsoredRefreshError::TriggerInvoiceMissing);
     };

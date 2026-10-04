@@ -1445,6 +1445,41 @@ async fn reads_resources_with_authentication_and_complete_pagination() {
 }
 
 #[tokio::test]
+async fn bounded_subscription_invoice_reads_stop_before_fetching_unbounded_history() {
+    let mut second = paid_invoice();
+    second["id"] = json!("in_2");
+    let mut responses = HashMap::new();
+    responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
+    responses.insert(
+        "/v1/invoices".into(),
+        vec![
+            MockResponse::json(list(vec![paid_invoice()], true)),
+            MockResponse::json(list(vec![second], false)),
+        ],
+    );
+    let server = mock_server(responses).await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+
+    assert!(matches!(
+        client
+            .subscription_invoices_bounded(&mut session, "sub_1", Some("cus_1"), 1)
+            .await,
+        Err(StripeReadError::RecordBoundExceeded)
+    ));
+    let invoice_calls = server
+        .state
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|call| call.path_and_query.starts_with("/v1/invoices?"))
+        .count();
+    assert_eq!(invoice_calls, 1);
+}
+
+#[tokio::test]
 async fn collects_all_personal_invoices_under_one_session_and_keeps_non_paid_states() {
     let mut responses = HashMap::new();
     responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
