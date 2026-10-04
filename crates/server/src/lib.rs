@@ -60,6 +60,8 @@ pub mod cloud_provider_stripe_sponsored;
 #[doc(hidden)]
 pub mod cloud_provider_stripe_sponsored_adapter;
 #[doc(hidden)]
+pub mod cloud_provider_stripe_sponsored_refresh;
+#[doc(hidden)]
 pub mod cloud_provider_stripe_sponsored_store;
 pub mod community;
 pub mod config;

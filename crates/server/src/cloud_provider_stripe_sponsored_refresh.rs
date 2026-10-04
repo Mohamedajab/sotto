@@ -1,0 +1,371 @@
+//! Sponsored Stripe refresh execution for durable provider jobs.
+//!
+//! This module is the provider-specific executor behind the generic refresh queue. It deliberately
+//! remains dormant until the runtime wires it into the worker: the implementation is complete and
+//! testable, but enabling it is a separate rollout decision. A sponsored beneficiary can have
+//! sources represented by several invoices, so collection reads the bounded subscription history,
+//! composes one candidate per relevant invoice, and only then crosses the reconciliation adapter.
+
+use std::collections::BTreeSet;
+
+use async_trait::async_trait;
+use sqlx::PgPool;
+use thiserror::Error;
+use uuid::Uuid;
+
+use crate::cloud_provider::{
+    complete_verified_event, prepare_verified_event, ApplyReceipt, ProviderAdapterError,
+    ProviderContext, VerifiedAllocation, VerifiedCollection, VerifiedProviderEvent,
+};
+use crate::cloud_provider_refresh_inputs::RefreshJobInputs;
+use crate::cloud_provider_refresh_worker::{RefreshExecutionError, RefreshJobExecutor};
+use crate::cloud_provider_stripe_http::{StripeReadClient, StripeReadError};
+use crate::cloud_provider_stripe_sponsored::{
+    compose_sponsored_coverage, SponsoredCoverageError, SponsoredCoverageResult,
+    SponsoredNeedsEvidence, SponsoredStripeCoverageConfig,
+};
+use crate::cloud_provider_stripe_sponsored_adapter::collection_for_ticket;
+use crate::cloud_provider_stripe_sponsored_store::{
+    load_sponsored_allocation_manifest, SponsoredManifestLoadError, SponsoredManifestLoadLimits,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SponsoredRefreshLimits {
+    /// Maximum number of paid invoices considered for one subscription refresh.
+    pub max_invoices: usize,
+    pub manifest: SponsoredManifestLoadLimits,
+}
+
+impl Default for SponsoredRefreshLimits {
+    fn default() -> Self {
+        Self {
+            max_invoices: 64,
+            manifest: SponsoredManifestLoadLimits::default(),
+        }
+    }
+}
+
+impl SponsoredRefreshLimits {
+    fn validate(self) -> Result<Self, SponsoredRefreshError> {
+        if self.max_invoices == 0 {
+            return Err(SponsoredRefreshError::InvalidConfig(
+                "maximum invoice count must be nonzero",
+            ));
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum SponsoredRefreshError {
+    #[error("sponsored refresh inputs are invalid: {0}")]
+    InvalidInput(&'static str),
+    #[error("sponsored refresh configuration is invalid: {0}")]
+    InvalidConfig(&'static str),
+    #[error("sponsored refresh invoice history did not contain the triggering invoice")]
+    TriggerInvoiceMissing,
+    #[error("sponsored refresh invoice history exceeded its configured bound of {0}")]
+    InvoiceBoundExceeded(usize),
+    #[error("sponsored Stripe read failed: {0}")]
+    Stripe(#[source] StripeReadError),
+    #[error("sponsored allocation manifest load failed: {0}")]
+    Manifest(#[source] SponsoredManifestLoadError),
+    #[error("sponsored invoice composition needs more evidence: {0:?}")]
+    NeedsEvidence(SponsoredNeedsEvidence),
+    #[error("sponsored invoice composition failed: {0}")]
+    Composition(#[source] SponsoredCoverageError),
+    #[error("sponsored collection adapter failed: {0}")]
+    Adapter(String),
+    #[error("sponsored refresh preparation failed: {0}")]
+    Preparation(#[source] ProviderAdapterError),
+    #[error("sponsored refresh preparation rollback failed after {error}: {rollback}")]
+    PreparationRollback {
+        error: ProviderAdapterError,
+        rollback: sqlx::Error,
+    },
+    #[error("sponsored refresh preparation commit failed: {0}")]
+    PreparationCommit(#[source] sqlx::Error),
+    #[error("sponsored refresh completion failed: {0}")]
+    Completion(#[source] ProviderAdapterError),
+    #[error("sponsored refresh completion rollback failed after {error}: {rollback}")]
+    CompletionRollback {
+        error: ProviderAdapterError,
+        rollback: sqlx::Error,
+    },
+    #[error("sponsored refresh completion commit failed: {0}")]
+    CompletionCommit(#[source] sqlx::Error),
+    #[error("sponsored refresh database transaction could not start: {0}")]
+    Transaction(#[source] sqlx::Error),
+}
+
+/// Executor configuration owned by the future refresh worker wiring.
+#[derive(Clone)]
+pub struct SponsoredRefreshExecutor {
+    pool: PgPool,
+    stripe: StripeReadClient,
+    coverage: SponsoredStripeCoverageConfig,
+    limits: SponsoredRefreshLimits,
+}
+
+impl SponsoredRefreshExecutor {
+    pub fn new(
+        pool: PgPool,
+        stripe: StripeReadClient,
+        coverage: SponsoredStripeCoverageConfig,
+        limits: SponsoredRefreshLimits,
+    ) -> Result<Self, SponsoredRefreshError> {
+        let limits = limits.validate()?;
+        Ok(Self {
+            pool,
+            stripe,
+            coverage,
+            limits,
+        })
+    }
+
+    async fn execute_inner(
+        &self,
+        inputs: &RefreshJobInputs,
+    ) -> Result<ApplyReceipt, SponsoredRefreshError> {
+        validate_inputs(inputs, &self.coverage)?;
+        let run_id = format!("sponsored-refresh:{}", Uuid::new_v4());
+        let mut preparation_tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(SponsoredRefreshError::Transaction)?;
+        let preparation = match prepare_verified_event(
+            &mut preparation_tx,
+            &inputs.lease.context,
+            &inputs.event,
+            &inputs.allocation,
+            &run_id,
+        )
+        .await
+        {
+            Ok(preparation) => preparation,
+            Err(error) => {
+                return match preparation_tx.rollback().await {
+                    Ok(()) => Err(SponsoredRefreshError::Preparation(error)),
+                    Err(rollback) => {
+                        Err(SponsoredRefreshError::PreparationRollback { error, rollback })
+                    }
+                };
+            }
+        };
+        preparation_tx
+            .commit()
+            .await
+            .map_err(SponsoredRefreshError::PreparationCommit)?;
+
+        let collection = collect_sponsored_collection(
+            &self.pool,
+            &self.stripe,
+            &self.coverage,
+            &inputs.lease.context,
+            &inputs.event,
+            &inputs.allocation,
+            &preparation.ticket,
+            self.limits,
+        )
+        .await?;
+
+        let mut completion_tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(SponsoredRefreshError::Transaction)?;
+        let receipt = match complete_verified_event(
+            &mut completion_tx,
+            &inputs.lease.context,
+            &inputs.event,
+            &inputs.allocation,
+            &preparation,
+            &collection,
+        )
+        .await
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                return match completion_tx.rollback().await {
+                    Ok(()) => Err(SponsoredRefreshError::Completion(error)),
+                    Err(rollback) => {
+                        Err(SponsoredRefreshError::CompletionRollback { error, rollback })
+                    }
+                };
+            }
+        };
+        completion_tx
+            .commit()
+            .await
+            .map_err(SponsoredRefreshError::CompletionCommit)?;
+        Ok(receipt)
+    }
+}
+
+#[async_trait]
+impl RefreshJobExecutor for SponsoredRefreshExecutor {
+    async fn execute(&mut self, inputs: &RefreshJobInputs) -> Result<(), RefreshExecutionError> {
+        self.execute_inner(inputs)
+            .await
+            .map(|_| ())
+            .map_err(|error| {
+                // Queue rows intentionally retain a stable, non-sensitive category rather than a
+                // provider identifier or database error string.
+                let code = match error {
+                    SponsoredRefreshError::InvalidInput(_)
+                    | SponsoredRefreshError::InvalidConfig(_)
+                    | SponsoredRefreshError::TriggerInvoiceMissing
+                    | SponsoredRefreshError::InvoiceBoundExceeded(_) => "sponsored_refresh_invalid",
+                    SponsoredRefreshError::Stripe(_) => "sponsored_refresh_stripe",
+                    SponsoredRefreshError::Manifest(_) => "sponsored_refresh_manifest",
+                    SponsoredRefreshError::NeedsEvidence(_)
+                    | SponsoredRefreshError::Composition(_) => "sponsored_refresh_evidence",
+                    SponsoredRefreshError::Adapter(_) => "sponsored_refresh_adapter",
+                    SponsoredRefreshError::Preparation(_)
+                    | SponsoredRefreshError::PreparationRollback { .. }
+                    | SponsoredRefreshError::PreparationCommit(_)
+                    | SponsoredRefreshError::Completion(_)
+                    | SponsoredRefreshError::CompletionRollback { .. }
+                    | SponsoredRefreshError::CompletionCommit(_)
+                    | SponsoredRefreshError::Transaction(_) => "sponsored_refresh_database",
+                };
+                RefreshExecutionError::new(code).expect("static refresh error codes are nonempty")
+            })
+    }
+}
+
+fn validate_inputs(
+    inputs: &RefreshJobInputs,
+    coverage: &SponsoredStripeCoverageConfig,
+) -> Result<(), SponsoredRefreshError> {
+    if inputs.event.event_type != "invoice.paid" {
+        return Err(SponsoredRefreshError::InvalidInput(
+            "sponsored refresh requires invoice.paid",
+        ));
+    }
+    if inputs
+        .event
+        .provider_object_id
+        .as_deref()
+        .is_none_or(str::is_empty)
+    {
+        return Err(SponsoredRefreshError::InvalidInput(
+            "sponsored refresh requires the triggering invoice id",
+        ));
+    }
+    if inputs.allocation.payer_kind != crate::cloud_provider::PayerKind::Sponsor {
+        return Err(SponsoredRefreshError::InvalidInput(
+            "sponsored refresh requires a sponsor allocation",
+        ));
+    }
+    if inputs.lease.context.namespace != crate::cloud_provider_stripe::STRIPE_NAMESPACE
+        || inputs.lease.context.account_id != coverage.account_id()
+        || inputs.lease.context.environment != coverage.environment()
+    {
+        return Err(SponsoredRefreshError::InvalidInput(
+            "sponsored refresh context does not match Stripe coverage",
+        ));
+    }
+    Ok(())
+}
+
+/// Collect one provider-neutral collection from every relevant paid invoice in the subscription.
+#[allow(clippy::too_many_arguments)]
+///
+/// A manifest is loaded for each invoice period, so ended and replacement seats are evaluated at
+/// the dates they were actually paid. Invoices that have no registered source in their period are
+/// ignored; an invoice that could explain a registered source but cannot be composed fails closed.
+pub async fn collect_sponsored_collection(
+    pool: &PgPool,
+    stripe: &StripeReadClient,
+    coverage: &SponsoredStripeCoverageConfig,
+    context: &ProviderContext,
+    event: &VerifiedProviderEvent,
+    allocation: &VerifiedAllocation,
+    ticket: &crate::cloud_coverage_reconciliation::CollectionTicket,
+    limits: SponsoredRefreshLimits,
+) -> Result<VerifiedCollection, SponsoredRefreshError> {
+    let limits = limits.validate()?;
+    let invoice_id =
+        event
+            .provider_object_id
+            .as_deref()
+            .ok_or(SponsoredRefreshError::InvalidInput(
+                "triggering invoice id is required",
+            ))?;
+    let mut session = stripe.session();
+    let invoices = stripe
+        .subscription_invoices(
+            &mut session,
+            &allocation.subscription_id,
+            Some(&allocation.provider_customer_id),
+        )
+        .await
+        .map_err(SponsoredRefreshError::Stripe)?;
+    if invoices.len() > limits.max_invoices {
+        return Err(SponsoredRefreshError::InvoiceBoundExceeded(
+            limits.max_invoices,
+        ));
+    }
+    let Some(trigger) = invoices.iter().find(|invoice| invoice.id == invoice_id) else {
+        return Err(SponsoredRefreshError::TriggerInvoiceMissing);
+    };
+    if trigger.status.as_deref() != Some("paid") {
+        return Err(SponsoredRefreshError::InvalidInput(
+            "triggering invoice is not paid",
+        ));
+    }
+
+    let expected_sources = ticket
+        .source_bindings
+        .iter()
+        .filter(|binding| binding.beneficiary_id == ticket.beneficiary_id)
+        .map(|binding| binding.source_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut candidates = Vec::new();
+    for invoice in invoices {
+        if invoice.status.as_deref() != Some("paid") {
+            continue;
+        }
+        let settlement = stripe
+            .sponsored_invoice_settlement(
+                &mut session,
+                &invoice.id,
+                &allocation.provider_customer_id,
+                &allocation.subscription_id,
+                coverage,
+            )
+            .await
+            .map_err(SponsoredRefreshError::Stripe)?;
+        let manifest = load_sponsored_allocation_manifest(
+            pool,
+            context,
+            &allocation.provider_customer_id,
+            &allocation.subscription_id,
+            settlement.period_start(),
+            settlement.period_end(),
+            limits.manifest,
+        )
+        .await
+        .map_err(SponsoredRefreshError::Manifest)?;
+        if !manifest
+            .allocations()
+            .iter()
+            .any(|interval| expected_sources.contains(interval.source_id()))
+        {
+            continue;
+        }
+        match compose_sponsored_coverage(coverage, &manifest, &settlement)
+            .map_err(SponsoredRefreshError::Composition)?
+        {
+            SponsoredCoverageResult::Candidate(candidate) => candidates.push(candidate),
+            SponsoredCoverageResult::NeedsEvidence(reason) => {
+                return Err(SponsoredRefreshError::NeedsEvidence(reason));
+            }
+        }
+    }
+    let references = candidates.iter().collect::<Vec<_>>();
+    collection_for_ticket(context, ticket, &references)
+        .map_err(|error| SponsoredRefreshError::Adapter(error.to_string()))
+}
