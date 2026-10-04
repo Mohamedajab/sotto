@@ -471,6 +471,11 @@ pub async fn begin_operation(
             .replacement_beneficiary_id
             .as_deref()
             .unwrap_or(&request.beneficiary_id);
+        let seat_effective_until = match request.action {
+            SponsoredSeatAction::Replace => None,
+            SponsoredSeatAction::Add => request.effective_until,
+            SponsoredSeatAction::Remove => unreachable!("remove does not create a seat"),
+        };
         sqlx::query(
             "INSERT INTO billing_sponsored_seats \
              (seat_id, organization_id, beneficiary_id, offer, effective_from, effective_until, state, operation_id) \
@@ -481,7 +486,7 @@ pub async fn begin_operation(
         .bind(beneficiary)
         .bind(request.offer.as_str())
         .bind(request.effective_from)
-        .bind(request.effective_until)
+        .bind(seat_effective_until)
         .bind(&operation_id)
         .execute(&mut **tx)
         .await?;
