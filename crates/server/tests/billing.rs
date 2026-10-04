@@ -1051,6 +1051,72 @@ async fn sponsored_subscription_deleted_cancels_named_seats_without_downgrading_
 }
 
 #[tokio::test]
+async fn unmatched_sponsored_lifecycle_events_never_change_legacy_billing() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let free_org = "billing-org-sponsored-early-free";
+    let team_org = "billing-org-sponsored-early-team";
+    let free_owner = "billing-user-sponsored-early-free";
+    let team_owner = "billing-user-sponsored-early-team";
+    seed_user(&pool, free_owner).await;
+    seed_user(&pool, team_owner).await;
+    seed_org(&pool, free_org, "free", free_owner, "owner").await;
+    seed_org(&pool, team_org, "team", team_owner, "owner").await;
+    sqlx::query(
+        "UPDATE organizations SET stripe_subscription_id = 'sub_legacy_early' WHERE id = $1",
+    )
+    .bind(team_org)
+    .execute(&pool)
+    .await
+    .expect("seed legacy subscription link");
+    let app = app_with_provider(
+        pool.clone(),
+        Arc::new(TestProvider {
+            observation: SubscriptionObservation::Missing,
+            personal_period_end: None,
+        }),
+    );
+    let updated = serde_json::json!({
+        "id": "evt_sponsored_early_updated",
+        "created": 1_800_000_000,
+        "api_version": STRIPE_API_VERSION,
+        "type": "customer.subscription.updated",
+        "data": { "object": {
+            "id": "sub_sponsored_early",
+            "status": "active",
+            "cancel_at_period_end": false,
+            "metadata": {"organization_id": free_org}
+        }}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(&app, &updated, Some(&stripe_signature(&updated))).await,
+        StatusCode::OK
+    );
+    assert_eq!(org_billing_state(&pool, free_org).await.0, "free");
+
+    let deleted = serde_json::json!({
+        "id": "evt_sponsored_early_deleted",
+        "created": 1_800_000_001,
+        "api_version": STRIPE_API_VERSION,
+        "type": "customer.subscription.deleted",
+        "data": { "object": {
+            "id": "sub_sponsored_early_deleted",
+            "metadata": {"organization_id": team_org}
+        }}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(&app, &deleted, Some(&stripe_signature(&deleted))).await,
+        StatusCode::OK
+    );
+    let team_state = org_billing_state(&pool, team_org).await;
+    assert_eq!(team_state.0, "team");
+    assert_eq!(team_state.2.as_deref(), Some("sub_legacy_early"));
+}
+
+#[tokio::test]
 async fn webhooks_cannot_change_deleting_or_deleted_organisations() {
     let Some(pool) = pool_or_skip().await else {
         return;

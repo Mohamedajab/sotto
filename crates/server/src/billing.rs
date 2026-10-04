@@ -3112,6 +3112,11 @@ async fn subscription_updated(
     if sponsored_subscription_updated(tx, object).await? {
         return Ok(());
     }
+    // A sponsored subscription can emit lifecycle events before its paid checkout creates the
+    // durable row. It is not a legacy subscription, so never let this event change the Team tier.
+    if object["metadata"]["organization_id"].as_str().is_some() {
+        return Ok(());
+    }
     let Some(org_id) = org_for_subscription(tx, object).await? else {
         return Ok(());
     };
@@ -3404,6 +3409,9 @@ async fn subscription_deleted(
         .await?;
         return Ok(());
     }
+    if object["metadata"]["organization_id"].as_str().is_some() {
+        return Ok(());
+    }
     let Some(org_id) = org_for_subscription(tx, object).await? else {
         return Ok(());
     };
@@ -3519,24 +3527,18 @@ async fn org_for_subscription(
     tx: &mut Transaction<'_, Postgres>,
     object: &serde_json::Value,
 ) -> Result<Option<String>> {
-    if let Some(org_id) = object["metadata"]["organization_id"]
-        .as_str()
-        .or_else(|| object["metadata"]["org_id"].as_str())
-    {
+    if let Some(org_id) = object["metadata"]["org_id"].as_str() {
         return Ok(Some(org_id.to_string()));
     }
     let Some(subscription_id) = object["id"].as_str() else {
         return Ok(None);
     };
-    Ok(sqlx::query_scalar(
-        "SELECT id FROM organizations WHERE stripe_subscription_id = $1 \
-         UNION ALL \
-         SELECT organization_id FROM billing_sponsored_subscriptions \
-         WHERE provider_subscription_id = $1 LIMIT 1",
+    Ok(
+        sqlx::query_scalar("SELECT id FROM organizations WHERE stripe_subscription_id = $1")
+            .bind(subscription_id)
+            .fetch_optional(&mut **tx)
+            .await?,
     )
-    .bind(subscription_id)
-    .fetch_optional(&mut **tx)
-    .await?)
 }
 
 async fn personal_user_for_subscription(
