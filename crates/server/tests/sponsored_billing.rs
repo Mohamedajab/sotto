@@ -9,7 +9,8 @@ use uuid::Uuid;
 use sotto_server::billing_catalogue::BillingOffer;
 use sotto_server::db;
 use sotto_server::sponsored_billing::{
-    begin_operation, complete_paid_checkout, SponsoredSeatAction, SponsoredSeatRequest,
+    begin_operation, complete_paid_checkout, record_checkout, SponsoredSeatAction,
+    SponsoredSeatRequest,
 };
 
 async fn pool() -> Option<PgPool> {
@@ -88,6 +89,12 @@ async fn named_seat_operation_is_idempotent_and_activates_after_paid_result() {
         .expect("replay operation");
     tx.commit().await.expect("commit replay");
     assert_eq!(first.operation_id, replay.operation_id);
+
+    let mut tx = pool.begin().await.expect("begin checkout transaction");
+    record_checkout(&mut tx, &first.operation_id, "https://stripe.test/checkout")
+        .await
+        .expect("record checkout");
+    tx.commit().await.expect("commit checkout");
 
     let mut tx = pool.begin().await.expect("begin settlement transaction");
     let settled = complete_paid_checkout(&mut tx, &first.operation_id, "pi_sponsored_test")
