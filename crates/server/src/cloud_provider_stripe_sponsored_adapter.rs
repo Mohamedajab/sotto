@@ -47,6 +47,7 @@ pub(crate) fn collection_for_ticket(
     }
 
     let mut beneficiary_sources = BTreeSet::<String>::new();
+    let mut allocation_references = BTreeMap::new();
     for coverage in candidate.person_coverages() {
         if coverage.beneficiary_id == ticket.beneficiary_id {
             beneficiary_sources.extend(
@@ -55,6 +56,21 @@ pub(crate) fn collection_for_ticket(
                     .into_iter()
                     .map(|interval| interval.source_id),
             );
+        }
+    }
+    if let Some(beneficiary) = candidate
+        .beneficiaries()
+        .iter()
+        .find(|beneficiary| beneficiary.beneficiary_id() == ticket.beneficiary_id)
+    {
+        for term in beneficiary.paid_terms() {
+            let source_id = term.interval().source_id.clone();
+            if allocation_references
+                .insert(source_id, term.allocation_reference().to_owned())
+                .is_some()
+            {
+                return Err(SponsoredAdapterError::DuplicateObservation);
+            }
         }
     }
     if beneficiary_sources
@@ -82,6 +98,14 @@ pub(crate) fn collection_for_ticket(
 
     let mut observations = Vec::with_capacity(expected_sources.len());
     for source_id in expected_sources {
+        let binding = ticket
+            .source_bindings
+            .iter()
+            .find(|binding| binding.source_id == source_id)
+            .ok_or(SponsoredAdapterError::MissingObservation)?;
+        if allocation_references.get(source_id) != Some(&binding.external_allocation_reference) {
+            return Err(SponsoredAdapterError::AllocationReferenceMismatch);
+        }
         let observation = observations_by_source
             .remove(source_id)
             .ok_or(SponsoredAdapterError::MissingObservation)?;
@@ -150,6 +174,8 @@ pub(crate) enum SponsoredAdapterError {
     MissingObservation,
     #[error("sponsored candidate contains duplicate source observations")]
     DuplicateObservation,
+    #[error("sponsored candidate allocation reference does not match the ticket")]
+    AllocationReferenceMismatch,
 }
 
 #[cfg(test)]
@@ -247,7 +273,10 @@ mod tests {
                 beneficiary_id: beneficiary_id.into(),
                 source_id: source_id.into(),
                 provider_namespace: STRIPE_NAMESPACE.into(),
-                external_allocation_reference: format!("allocation_{}", source_id),
+                external_allocation_reference: format!(
+                    "allocation_{}",
+                    source_id.strip_prefix("source_").unwrap_or(source_id)
+                ),
                 ownership_evidence_reference: "ownership".into(),
             }],
             status: CollectionStatus::Pending,
@@ -278,6 +307,14 @@ mod tests {
         let error = collection_for_ticket(&context(), &ticket("source_b", "user_1"), &candidate())
             .unwrap_err();
         assert_eq!(error, SponsoredAdapterError::SourceSetMismatch);
+    }
+
+    #[test]
+    fn allocation_reference_must_match_the_ticket_binding() {
+        let mut ticket = ticket("source_a", "user_1");
+        ticket.source_bindings[0].external_allocation_reference = "allocation_forged".into();
+        let error = collection_for_ticket(&context(), &ticket, &candidate()).unwrap_err();
+        assert_eq!(error, SponsoredAdapterError::AllocationReferenceMismatch);
     }
 
     #[test]

@@ -513,11 +513,16 @@ impl SponsoredBeneficiaryCoverage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SponsoredBeneficiaryPaidTerm {
+    allocation_reference: String,
     price_class: SponsoredPriceClass,
     interval: ConfirmedPaidInterval,
 }
 
 impl SponsoredBeneficiaryPaidTerm {
+    pub fn allocation_reference(&self) -> &str {
+        &self.allocation_reference
+    }
+
     pub const fn price_class(&self) -> SponsoredPriceClass {
         self.price_class
     }
@@ -760,6 +765,7 @@ pub fn compose_sponsored_coverage(
                     failed_renewal_id: None,
                 };
                 let term = SponsoredBeneficiaryPaidTerm {
+                    allocation_reference: allocation.allocation_reference().to_owned(),
                     price_class,
                     interval,
                 };
