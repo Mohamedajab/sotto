@@ -11,8 +11,8 @@ use uuid::Uuid;
 use sotto_server::billing_catalogue::BillingOffer;
 use sotto_server::db;
 use sotto_server::sponsored_billing::{
-    begin_operation, complete_paid_checkout, record_checkout, SponsoredBillingError,
-    SponsoredProviderEvidence, SponsoredSeatAction, SponsoredSeatRequest,
+    begin_operation, complete_paid_checkout, record_checkout, record_provider_update,
+    SponsoredBillingError, SponsoredProviderEvidence, SponsoredSeatAction, SponsoredSeatRequest,
 };
 
 async fn pool() -> Option<PgPool> {
@@ -157,6 +157,52 @@ async fn named_seat_operation_is_idempotent_and_activates_after_paid_result() {
     .expect("load sponsored subscription");
     assert_eq!(stored_provider_ids.0.as_deref(), Some("cus_sponsored_test"));
     assert_eq!(stored_provider_ids.1.as_deref(), Some("sub_sponsored_test"));
+
+    let removal_request = SponsoredSeatRequest {
+        action: SponsoredSeatAction::Remove,
+        beneficiary_id: beneficiary.clone(),
+        replacement_beneficiary_id: None,
+        offer: BillingOffer::StandardMonthly,
+        quote_version: 1,
+        quote_expires_at_epoch: 4_000_000_000,
+        effective_from: 1_800_000_000,
+        effective_until: Some(1_800_000_000 + 1),
+        idempotency_key: "seat-remove-1".into(),
+    };
+    let mut tx = pool.begin().await.expect("begin removal transaction");
+    let removal = begin_operation(&mut tx, &org_id, &owner, &removal_request, 1_700_000_001)
+        .await
+        .expect("create removal operation");
+    tx.commit().await.expect("commit removal operation");
+    let mut tx = pool.begin().await.expect("begin provider update");
+    record_provider_update(
+        &mut tx,
+        &removal.operation_id,
+        Some("cus_sponsored_test"),
+        "sub_sponsored_test",
+        Some("sch_sponsored_test"),
+        None,
+    )
+    .await
+    .expect("record provider update");
+    tx.commit().await.expect("commit provider update");
+    let removal_state: (String, Option<i64>) = sqlx::query_as(
+        "SELECT state, effective_until FROM billing_sponsored_seats WHERE operation_id = $1",
+    )
+    .bind(&first.operation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load scheduled removal");
+    assert_eq!(removal_state.0, "scheduled_removal");
+    assert_eq!(removal_state.1, Some(1_800_000_001));
+    let schedule_id: Option<String> = sqlx::query_scalar(
+        "SELECT provider_schedule_id FROM billing_sponsored_subscriptions WHERE organization_id = $1",
+    )
+    .bind(&org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load stored schedule");
+    assert_eq!(schedule_id.as_deref(), Some("sch_sponsored_test"));
 
     let mut tx = pool.begin().await.expect("begin conflicting settlement");
     let mut conflicting_evidence = evidence.clone();

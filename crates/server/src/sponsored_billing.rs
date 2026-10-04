@@ -429,7 +429,7 @@ pub async fn begin_operation(
     }
     request.ensure_unexpired(now_epoch)?;
     let existing_live: Option<String> = sqlx::query_scalar(
-        "SELECT beneficiary_id FROM billing_sponsored_seats WHERE organization_id = $1 \
+        "SELECT state FROM billing_sponsored_seats WHERE organization_id = $1 \
          AND beneficiary_id = $2 AND state IN ('pending','active','scheduled_removal') FOR UPDATE",
     )
     .bind(organization_id)
@@ -548,7 +548,7 @@ pub async fn record_checkout(
         }
     }
     sqlx::query(
-        "UPDATE billing_sponsored_seats SET state = 'scheduled_removal', effective_until = operation.effective_until, updated_at = now() \
+        "UPDATE billing_sponsored_seats SET state = 'scheduled_removal', effective_until = COALESCE(operation.effective_until, operation.effective_from), updated_at = now() \
          FROM billing_sponsored_operations AS operation \
          WHERE operation.operation_id = $1 AND operation.action IN ('remove', 'replace') \
            AND billing_sponsored_seats.organization_id = operation.organization_id \
@@ -608,6 +608,18 @@ pub async fn record_provider_update(
     .bind(customer_id)
     .bind(subscription_id)
     .bind(schedule_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE billing_sponsored_seats SET state = 'scheduled_removal', \
+         effective_until = COALESCE(operation.effective_until, operation.effective_from), updated_at = now() \
+         FROM billing_sponsored_operations AS operation \
+         WHERE operation.operation_id = $1 AND operation.action IN ('remove', 'replace') \
+           AND billing_sponsored_seats.organization_id = operation.organization_id \
+           AND billing_sponsored_seats.beneficiary_id = operation.beneficiary_id \
+           AND billing_sponsored_seats.state = 'active'",
+    )
+    .bind(operation_id)
     .execute(&mut **tx)
     .await?;
     load_operation(tx, operation_id).await
