@@ -393,7 +393,9 @@ pub async fn begin_operation(
         SponsoredSeatAction::Add if existing_live.is_some() => {
             return Err(SponsoredBillingError::BeneficiaryAlreadyCovered)
         }
-        SponsoredSeatAction::Remove | SponsoredSeatAction::Replace if existing_live.is_none() => {
+        SponsoredSeatAction::Remove | SponsoredSeatAction::Replace
+            if existing_live.as_deref() != Some("active") =>
+        {
             return Err(SponsoredBillingError::SeatMissing)
         }
         _ => {}
