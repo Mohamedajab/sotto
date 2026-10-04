@@ -79,7 +79,10 @@ pub fn evaluate_input(input: &EligibilityInput) -> EligibilityView {
     }
 
     let state = match input.personal_billing_state {
-        Some(PersonalBillingState::Pending) => EligibilityState::PendingInitialPayment,
+        Some(PersonalBillingState::Pending) => match input.coverage {
+            CoverageInput::Decision(_) => EligibilityState::PendingInitialPayment,
+            CoverageInput::Missing | CoverageInput::Unavailable => EligibilityState::Unavailable,
+        },
         Some(PersonalBillingState::Active | PersonalBillingState::PastDue) => {
             coverage_state(input.coverage)
         }
@@ -268,12 +271,27 @@ mod tests {
     }
 
     #[test]
-    fn pending_payment_is_distinct_from_free() {
+    fn pending_payment_is_distinct_from_free_when_evidence_is_available() {
         let result = evaluate_input(&input(
             Some(PersonalBillingState::Pending),
-            CoverageInput::Missing,
+            CoverageInput::Decision(CoverageDecision {
+                state: CoverageState::Free,
+                active_until: None,
+                recovery_until: None,
+                export_until: None,
+            }),
         ));
         assert_eq!(result.state, EligibilityState::PendingInitialPayment);
+        assert!(!result.actions.billing);
+    }
+
+    #[test]
+    fn pending_payment_with_unavailable_evidence_fails_closed() {
+        let result = evaluate_input(&input(
+            Some(PersonalBillingState::Pending),
+            CoverageInput::Unavailable,
+        ));
+        assert_eq!(result.state, EligibilityState::Unavailable);
         assert!(!result.actions.billing);
     }
 
