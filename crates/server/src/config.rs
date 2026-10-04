@@ -72,7 +72,7 @@ pub struct Config {
     pub deployment_mode: DeploymentMode,
     /// GitHub OAuth configuration, present only when credentials are set in the environment.
     pub oauth: Option<OAuthConfig>,
-    /// Stripe billing configuration, present only when the `STRIPE_*` variables are set.
+    /// Stripe billing configuration, present only for Cloud deployments when the `STRIPE_*` variables are set.
     pub billing: Option<BillingConfig>,
     /// Anonymous version-ping telemetry (see [`crate::telemetry`] and the README).
     pub telemetry: TelemetryConfig,
@@ -161,7 +161,7 @@ impl Config {
     /// Load configuration from the environment.
     ///
     /// `DATABASE_URL` is required. OAuth is enabled only when both `GITHUB_CLIENT_ID` and
-    /// `GITHUB_CLIENT_SECRET` are set, and legacy billing only when all three legacy `STRIPE_*`
+    /// `GITHUB_CLIENT_SECRET` are set, and Cloud billing only when all three legacy `STRIPE_*`
     /// variables are present, so the server still boots (health, migrations) without them. Empty
     /// values count as unset - docker compose interpolation (`${VAR:-}`) exports empties for every
     /// blank `.env` line.
@@ -187,21 +187,32 @@ impl Config {
             _ => None,
         };
 
-        let billing_price_catalogue = billing_price_catalogue_from_env()?;
+        // Self-hosted deployments deliberately ignore all Stripe configuration. This keeps a
+        // copied .env file from turning a local instance into a hosted billing client or making
+        // ordinary self-hosted operations depend on Sotto's credentials.
+        let billing_price_catalogue = if deployment_mode == DeploymentMode::Cloud {
+            billing_price_catalogue_from_env()?
+        } else {
+            None
+        };
         let hosted_catalogue_configured = billing_price_catalogue.is_some();
-        let billing = match (
-            env_nonempty("STRIPE_API_KEY"),
-            env_nonempty("STRIPE_WEBHOOK_SECRET"),
-            env_nonempty("STRIPE_PRICE_ID"),
-        ) {
-            (Some(api_key), Some(webhook_secret), Some(price_id)) => Some(BillingConfig {
-                api_key,
-                webhook_secret,
-                price_id,
-                price_catalogue: billing_price_catalogue,
-                return_url: billing_return_url(&public_base_url, web_origin.as_deref()),
-            }),
-            _ => None,
+        let billing = if deployment_mode == DeploymentMode::Cloud {
+            match (
+                env_nonempty("STRIPE_API_KEY"),
+                env_nonempty("STRIPE_WEBHOOK_SECRET"),
+                env_nonempty("STRIPE_PRICE_ID"),
+            ) {
+                (Some(api_key), Some(webhook_secret), Some(price_id)) => Some(BillingConfig {
+                    api_key,
+                    webhook_secret,
+                    price_id,
+                    price_catalogue: billing_price_catalogue,
+                    return_url: billing_return_url(&public_base_url, web_origin.as_deref()),
+                }),
+                _ => None,
+            }
+        } else {
+            None
         };
         if hosted_catalogue_configured && billing.is_none() {
             // The hosted catalogue is dormant until the hosted billing route lands. Keep one
