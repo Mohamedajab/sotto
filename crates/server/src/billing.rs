@@ -236,6 +236,14 @@ pub struct SponsoredSubscriptionItemRequest {
     pub quantity: i64,
 }
 
+/// A bounded or open-ended future phase for the organisation's sponsored subscription.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SponsoredSubscriptionPhase {
+    pub start_at_epoch: i64,
+    pub end_at_epoch: Option<i64>,
+    pub items: Vec<SponsoredSubscriptionItemRequest>,
+}
+
 /// Provider state needed to reconcile a sponsored subscription mutation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SponsoredSubscriptionSnapshot {
@@ -322,9 +330,7 @@ pub trait SubscriptionProvider: Send + Sync {
         &self,
         _organization_id: &str,
         _subscription_id: &str,
-        _items: &[SponsoredSubscriptionItemRequest],
-        _effective_at_epoch: i64,
-        _revert_at_epoch: Option<i64>,
+        _phases: &[SponsoredSubscriptionPhase],
         _idempotency_key: &str,
     ) -> ProviderResult<SponsoredSubscriptionSnapshot> {
         Err(ProviderError::unsupported("sponsored_subscription_update"))
@@ -620,12 +626,28 @@ impl SubscriptionProvider for StripeBilling {
         &self,
         organization_id: &str,
         subscription_id: &str,
-        items: &[SponsoredSubscriptionItemRequest],
-        effective_at_epoch: i64,
-        revert_at_epoch: Option<i64>,
+        phases: &[SponsoredSubscriptionPhase],
         idempotency_key: &str,
     ) -> ProviderResult<SponsoredSubscriptionSnapshot> {
-        if subscription_id.is_empty() || items.iter().any(|item| item.quantity < 0) {
+        if subscription_id.is_empty()
+            || phases.is_empty()
+            || phases.iter().any(|phase| {
+                phase.start_at_epoch < 0
+                    || phase
+                        .end_at_epoch
+                        .is_some_and(|end| end <= phase.start_at_epoch)
+                    || phase
+                        .items
+                        .iter()
+                        .any(|item| item.provider_price_id.is_empty() || item.quantity < 0)
+            })
+            || phases.windows(2).any(|window| {
+                window[0]
+                    .end_at_epoch
+                    .map(|end| window[1].start_at_epoch < end)
+                    .unwrap_or(true)
+            })
+        {
             return Err(ProviderError::malformed_response());
         }
         let current = self.get_sponsored_subscription(subscription_id).await?;
@@ -651,24 +673,63 @@ impl SubscriptionProvider for StripeBilling {
         let current_end = current
             .current_period_end
             .ok_or_else(ProviderError::malformed_response)?;
-        let effective_at_epoch = effective_at_epoch.max(current_end);
-        if revert_at_epoch.is_some_and(|revert_at| revert_at <= effective_at_epoch) {
+        let phase_at_end = phases
+            .iter()
+            .find(|phase| {
+                phase.start_at_epoch <= current_end
+                    && phase.end_at_epoch.is_none_or(|end| current_end < end)
+            })
+            .or_else(|| {
+                phases
+                    .iter()
+                    .find(|phase| phase.start_at_epoch == current_end)
+            })
+            .ok_or_else(ProviderError::malformed_response)?;
+        let mut normalized = Vec::with_capacity(phases.len());
+        normalized.push(SponsoredSubscriptionPhase {
+            start_at_epoch: current_end,
+            end_at_epoch: phase_at_end.end_at_epoch,
+            items: phase_at_end.items.clone(),
+        });
+        normalized.extend(
+            phases
+                .iter()
+                .filter(|phase| phase.start_at_epoch > current_end)
+                .cloned(),
+        );
+        if normalized.windows(2).any(|window| {
+            window[0]
+                .end_at_epoch
+                .is_some_and(|end| end != window[1].start_at_epoch)
+        }) {
             return Err(ProviderError::malformed_response());
+        }
+        let final_empty = normalized
+            .last()
+            .is_some_and(|phase| phase.items.is_empty());
+        if normalized
+            .iter()
+            .take(if final_empty {
+                normalized.len().saturating_sub(1)
+            } else {
+                normalized.len()
+            })
+            .any(|phase| phase.items.is_empty())
+        {
+            return Err(ProviderError::malformed_response());
+        }
+        if final_empty {
+            normalized.pop();
         }
         let mut form = vec![
             (
                 "end_behavior".into(),
-                if items.is_empty() {
-                    "cancel"
-                } else {
-                    "release"
-                }
-                .into(),
+                if final_empty { "cancel" } else { "release" }.into(),
             ),
             ("proration_behavior".into(), "none".into()),
             ("metadata[organization_id]".into(), organization_id.into()),
             ("phases[0][start_date]".into(), current_start.to_string()),
-            ("phases[0][end_date]".into(), effective_at_epoch.to_string()),
+            ("phases[0][end_date]".into(), current_end.to_string()),
         ];
         for (index, item) in current.items.iter().enumerate() {
             form.push((
@@ -680,36 +741,24 @@ impl SubscriptionProvider for StripeBilling {
                 item.quantity.to_string(),
             ));
         }
-        if !items.is_empty() {
+        for (phase_index, phase) in normalized.iter().enumerate() {
+            let index = phase_index + 1;
             form.push((
-                "phases[1][start_date]".into(),
-                effective_at_epoch.to_string(),
+                format!("phases[{index}][start_date]"),
+                phase.start_at_epoch.to_string(),
             ));
-            if let Some(revert_at_epoch) = revert_at_epoch {
-                form.push(("phases[1][end_date]".into(), revert_at_epoch.to_string()));
+            if let Some(end) = phase.end_at_epoch {
+                form.push((format!("phases[{index}][end_date]"), end.to_string()));
             }
-            for (index, item) in items.iter().enumerate() {
+            for (item_index, item) in phase.items.iter().enumerate() {
                 form.push((
-                    format!("phases[1][items][{index}][price]"),
+                    format!("phases[{index}][items][{item_index}][price]"),
                     item.provider_price_id.clone(),
                 ));
                 form.push((
-                    format!("phases[1][items][{index}][quantity]"),
+                    format!("phases[{index}][items][{item_index}][quantity]"),
                     item.quantity.to_string(),
                 ));
-            }
-            if let Some(revert_at_epoch) = revert_at_epoch {
-                form.push(("phases[2][start_date]".into(), revert_at_epoch.to_string()));
-                for (index, item) in current.items.iter().enumerate() {
-                    form.push((
-                        format!("phases[2][items][{index}][price]"),
-                        item.provider_price_id.clone(),
-                    ));
-                    form.push((
-                        format!("phases[2][items][{index}][quantity]"),
-                        item.quantity.to_string(),
-                    ));
-                }
             }
         }
         stripe_post_with_idempotency(
@@ -1230,7 +1279,9 @@ async fn sponsored_checkout(
     }
     let existing_subscription: Option<(Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT provider_customer_id, provider_subscription_id \
-         FROM billing_sponsored_subscriptions WHERE organization_id = $1 FOR UPDATE",
+         FROM billing_sponsored_subscriptions \
+         WHERE organization_id = $1 AND provider_subscription_id IS NOT NULL \
+           AND status IN ('pending', 'active', 'past_due') FOR UPDATE",
     )
     .bind(&org_id)
     .fetch_optional(&mut *tx)
@@ -1242,24 +1293,22 @@ async fn sponsored_checkout(
             .await?;
     tx.commit().await?;
 
-    let items = sponsored_provider_items(&state.pool, &org_id, catalogue, &operation).await?;
     let (success_url, cancel_url) = checkout_return_urls(&billing.return_url);
     let result = if let Some((customer_id, Some(subscription_id))) = existing_subscription {
+        let phases = sponsored_provider_phases(
+            &state.pool,
+            &org_id,
+            catalogue,
+            &operation,
+            sponsored_billing::current_epoch(),
+        )
+        .await?;
         let snapshot = billing
             .provider
             .update_sponsored_subscription(
                 &org_id,
                 &subscription_id,
-                &items,
-                match action {
-                    SponsoredSeatAction::Add => operation.effective_from,
-                    SponsoredSeatAction::Remove | SponsoredSeatAction::Replace => operation
-                        .effective_until
-                        .unwrap_or(operation.effective_from),
-                },
-                (action == SponsoredSeatAction::Add)
-                    .then_some(operation.effective_until)
-                    .flatten(),
+                &phases,
                 &operation.provider_idempotency_key,
             )
             .await
@@ -1284,6 +1333,7 @@ async fn sponsored_checkout(
             provider_checkout_url: operation.provider_checkout_url,
         }
     } else if existing_subscription.is_none() && action == SponsoredSeatAction::Add {
+        let items = sponsored_provider_items(&state.pool, &org_id, catalogue, &operation).await?;
         let checkout = billing
             .provider
             .create_sponsored_checkout(
