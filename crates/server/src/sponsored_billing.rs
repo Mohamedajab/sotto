@@ -509,6 +509,20 @@ pub async fn complete_paid_checkout(
     operation_id: &str,
     provider_operation_id: &str,
 ) -> Result<SponsoredOperation, SponsoredBillingError> {
+    let organization_id: String = sqlx::query_scalar(
+        "SELECT organization_id FROM billing_sponsored_operations WHERE operation_id = $1",
+    )
+    .bind(operation_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let lifecycle_state: Option<String> =
+        sqlx::query_scalar("SELECT lifecycle_state FROM organizations WHERE id = $1 FOR UPDATE")
+            .bind(&organization_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    if lifecycle_state.as_deref() != Some("active") {
+        return Err(SponsoredBillingError::OrganisationNotActive);
+    }
     let updated = sqlx::query(
         "UPDATE billing_sponsored_operations SET state = 'active', provider_operation_id = $2, result_code = 'paid', updated_at = now() \
          WHERE operation_id = $1 AND state IN ('checkout_created','active') RETURNING operation_id",
