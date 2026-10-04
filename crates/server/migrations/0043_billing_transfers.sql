@@ -11,6 +11,7 @@ ALTER TABLE billing_founding_awards
 CREATE TABLE billing_transfer_intents (
     transfer_id TEXT PRIMARY KEY,
     actor_user_id TEXT NOT NULL REFERENCES users (id) ON DELETE RESTRICT,
+    counterparty_user_id TEXT NOT NULL REFERENCES users (id) ON DELETE RESTRICT,
     beneficiary_id TEXT NOT NULL REFERENCES users (id) ON DELETE RESTRICT,
     source_kind TEXT NOT NULL CHECK (source_kind IN ('personal', 'sponsor')),
     source_organization_id TEXT REFERENCES organizations (id) ON DELETE RESTRICT,
@@ -38,6 +39,7 @@ CREATE TABLE billing_transfer_intents (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     CHECK (btrim(transfer_id) <> ''),
+    CHECK (btrim(counterparty_user_id) <> ''),
     CHECK (btrim(idempotency_key) <> ''),
     CHECK (btrim(request_hash) <> ''),
     CHECK (effective_until IS NULL OR effective_until > effective_from),

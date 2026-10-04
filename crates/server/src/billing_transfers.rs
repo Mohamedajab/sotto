@@ -3,8 +3,10 @@
 //! A transfer changes who pays for one beneficiary without changing the beneficiary's account,
 //! keys, membership, or founding identity. Provider execution is deliberately outside this module:
 //! callbacks record each verified step here, so a timeout can be reconciled without issuing a new
-//! financial identity. This is an internal, dormant seam until the payer-policy and provider
-//! activation decisions are approved; declaring an intent does not start a provider checkout.
+//! financial identity. Both payer sides must consent: the intent records the initiating user and
+//! the counterparty whose authority covers the other side. This is an internal, dormant seam until
+//! the payer-policy and provider activation decisions are approved; declaring an intent does not
+//! start a provider checkout.
 
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -84,6 +86,7 @@ impl TransferState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferRequest {
     pub actor_user_id: String,
+    pub counterparty_user_id: String,
     pub beneficiary_id: String,
     pub source_kind: TransferPayer,
     pub source_organization_id: Option<String>,
@@ -106,6 +109,7 @@ impl TransferRequest {
     fn validate_shape(&self) -> Result<(), TransferError> {
         for (value, field) in [
             (&self.actor_user_id, "actor_user_id"),
+            (&self.counterparty_user_id, "counterparty_user_id"),
             (&self.beneficiary_id, "beneficiary_id"),
             (&self.idempotency_key, "idempotency_key"),
         ] {
@@ -160,6 +164,7 @@ impl TransferRequest {
         let fields = [
             "sotto-transfer-v1",
             &self.actor_user_id,
+            &self.counterparty_user_id,
             &self.beneficiary_id,
             self.source_kind.as_str(),
             self.source_organization_id.as_deref().unwrap_or(""),
@@ -185,6 +190,7 @@ impl TransferRequest {
 pub struct TransferIntent {
     pub transfer_id: String,
     pub actor_user_id: String,
+    pub counterparty_user_id: String,
     pub beneficiary_id: String,
     pub source_kind: TransferPayer,
     pub source_organization_id: Option<String>,
@@ -276,34 +282,76 @@ pub async fn begin_transfer(
     now_epoch: i64,
 ) -> Result<BeginTransfer, TransferError> {
     request.validate_shape()?;
-    let beneficiary_exists: Option<String> =
-        sqlx::query_scalar("SELECT id FROM users WHERE id = $1 FOR UPDATE")
-            .bind(&request.beneficiary_id)
-            .fetch_optional(&mut **tx)
-            .await?;
-    if beneficiary_exists.is_none() {
-        return Err(TransferError::Unauthorised);
+    let user_ids = [
+        request.actor_user_id.as_str(),
+        request.counterparty_user_id.as_str(),
+        request.beneficiary_id.as_str(),
+    ]
+    .into_iter()
+    .collect::<std::collections::BTreeSet<_>>();
+    for user_id in user_ids {
+        let exists: Option<String> =
+            sqlx::query_scalar("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+                .bind(user_id)
+                .fetch_optional(&mut **tx)
+                .await?;
+        if exists.is_none() {
+            return Err(TransferError::Unauthorised);
+        }
     }
-    if (request.source_kind == TransferPayer::Personal
-        || request.destination_kind == TransferPayer::Personal)
-        && request.actor_user_id != request.beneficiary_id
-    {
-        return Err(TransferError::Unauthorised);
-    }
-    for organization_id in [
+    let organization_ids = [
         request.source_organization_id.as_deref(),
         request.destination_organization_id.as_deref(),
     ]
     .into_iter()
     .flatten()
-    .collect::<std::collections::BTreeSet<_>>()
-    {
-        let access = org::access_for_update(tx, organization_id, &request.actor_user_id)
-            .await
-            .map_err(|_| TransferError::Unauthorised)?;
-        if !access.role().can_manage_members() {
-            return Err(TransferError::Unauthorised);
+    .collect::<std::collections::BTreeSet<_>>();
+    let mut organization_authority = std::collections::BTreeMap::new();
+    for organization_id in organization_ids {
+        for user_id in [
+            request.actor_user_id.as_str(),
+            request.counterparty_user_id.as_str(),
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        {
+            let allowed = org::access_for_update(tx, organization_id, user_id)
+                .await
+                .map(|access| access.require_write().is_ok() && access.role().can_manage_members())
+                .unwrap_or(false);
+            organization_authority.insert((organization_id, user_id), allowed);
         }
+    }
+    let actor_source = payer_authorised(
+        request.source_kind,
+        request.source_organization_id.as_deref(),
+        &request.beneficiary_id,
+        &request.actor_user_id,
+        &organization_authority,
+    );
+    let actor_destination = payer_authorised(
+        request.destination_kind,
+        request.destination_organization_id.as_deref(),
+        &request.beneficiary_id,
+        &request.actor_user_id,
+        &organization_authority,
+    );
+    let counterparty_source = payer_authorised(
+        request.source_kind,
+        request.source_organization_id.as_deref(),
+        &request.beneficiary_id,
+        &request.counterparty_user_id,
+        &organization_authority,
+    );
+    let counterparty_destination = payer_authorised(
+        request.destination_kind,
+        request.destination_organization_id.as_deref(),
+        &request.beneficiary_id,
+        &request.counterparty_user_id,
+        &organization_authority,
+    );
+    if !((actor_source && counterparty_destination) || (actor_destination && counterparty_source)) {
+        return Err(TransferError::Unauthorised);
     }
     if let Some(existing) =
         load_by_idempotency(tx, &request.actor_user_id, &request.idempotency_key).await?
@@ -349,14 +397,15 @@ pub async fn begin_transfer(
     );
     sqlx::query(
         "INSERT INTO billing_transfer_intents \
-         (transfer_id, actor_user_id, beneficiary_id, source_kind, source_organization_id, \
+         (transfer_id, actor_user_id, counterparty_user_id, beneficiary_id, source_kind, source_organization_id, \
           destination_kind, destination_organization_id, offer, quote_version, quote_expires_at_epoch, \
           effective_from, effective_until, idempotency_key, request_hash, provider_idempotency_key, \
           founding_award_id) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)",
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)",
     )
     .bind(&transfer_id)
     .bind(&request.actor_user_id)
+    .bind(&request.counterparty_user_id)
     .bind(&request.beneficiary_id)
     .bind(request.source_kind.as_str())
     .bind(request.source_organization_id.as_deref())
@@ -693,6 +742,7 @@ fn transfer_from_row(row: &sqlx::postgres::PgRow) -> Result<TransferIntent, Tran
     Ok(TransferIntent {
         transfer_id: row.try_get("transfer_id")?,
         actor_user_id: row.try_get("actor_user_id")?,
+        counterparty_user_id: row.try_get("counterparty_user_id")?,
         beneficiary_id: row.try_get("beneficiary_id")?,
         source_kind: parse_payer(&row.try_get::<String, _>("source_kind")?)?,
         source_organization_id: row.try_get("source_organization_id")?,
@@ -732,6 +782,22 @@ fn parse_offer(value: &str) -> Result<BillingOffer, TransferError> {
         .into_iter()
         .find(|offer| offer.as_str() == value)
         .ok_or(TransferError::CorruptState)
+}
+
+fn payer_authorised(
+    payer: TransferPayer,
+    organization_id: Option<&str>,
+    beneficiary_id: &str,
+    user_id: &str,
+    organization_authority: &std::collections::BTreeMap<(&str, &str), bool>,
+) -> bool {
+    match payer {
+        TransferPayer::Personal => user_id == beneficiary_id,
+        TransferPayer::Sponsor => organization_id
+            .and_then(|organization_id| organization_authority.get(&(organization_id, user_id)))
+            .copied()
+            .unwrap_or(false),
+    }
 }
 
 fn payer_identity(
@@ -782,6 +848,7 @@ mod tests {
     fn request() -> TransferRequest {
         TransferRequest {
             actor_user_id: "user".into(),
+            counterparty_user_id: "user".into(),
             beneficiary_id: "user".into(),
             source_kind: TransferPayer::Personal,
             source_organization_id: None,

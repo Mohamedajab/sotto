@@ -91,6 +91,7 @@ fn personal_to_sponsor_request(
 ) -> TransferRequest {
     TransferRequest {
         actor_user_id: actor.into(),
+        counterparty_user_id: actor.into(),
         beneficiary_id: beneficiary.into(),
         source_kind: TransferPayer::Personal,
         source_organization_id: None,
@@ -305,8 +306,8 @@ async fn concurrent_live_transfer_is_rejected_and_personal_actor_is_required() {
          ($1, $2, 'owner'), ($1, $3, 'member')",
     )
     .bind(&org)
-    .bind(&user)
     .bind(&other)
+    .bind(&user)
     .execute(&pool)
     .await
     .expect("insert owner");
@@ -333,7 +334,8 @@ async fn concurrent_live_transfer_is_rejected_and_personal_actor_is_required() {
     .await
     .expect("insert active account");
 
-    let request = personal_to_sponsor_request(&user, &user, &org, "live-transfer");
+    let mut request = personal_to_sponsor_request(&user, &user, &org, "live-transfer");
+    request.counterparty_user_id = other.clone();
     let mut tx = pool.begin().await.expect("begin first transfer");
     begin_transfer(&mut tx, &request, 1_800_000_000)
         .await
@@ -350,7 +352,8 @@ async fn concurrent_live_transfer_is_rejected_and_personal_actor_is_required() {
     tx.rollback().await.expect("rollback second transfer");
 
     let mut unauthorised = request;
-    unauthorised.actor_user_id = other;
+    unauthorised.actor_user_id = other.clone();
+    unauthorised.counterparty_user_id = other;
     unauthorised.idempotency_key = "unauthorised-transfer".into();
     let mut tx = pool.begin().await.expect("begin unauthorised transfer");
     assert!(matches!(
@@ -359,5 +362,102 @@ async fn concurrent_live_transfer_is_rejected_and_personal_actor_is_required() {
     ));
     tx.rollback().await.expect("rollback unauthorised transfer");
 
+    cleanup(&pool, &fixture).await;
+}
+
+#[tokio::test]
+async fn sponsored_admin_and_beneficiary_can_authorise_leaving_a_sponsorship() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let fixture = Uuid::new_v4().to_string();
+    let beneficiary = format!("transfer-test-{fixture}-beneficiary");
+    let admin = format!("transfer-test-{fixture}-admin");
+    let org = format!("transfer-test-{fixture}-source-org");
+    let operation = format!("transfer-test-{fixture}-sponsored-operation");
+    cleanup(&pool, &fixture).await;
+
+    sqlx::query(
+        "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES
+         ($1, 'transfer-test', $1), ($2, 'transfer-test', $2)",
+    )
+    .bind(&beneficiary)
+    .bind(&admin)
+    .execute(&pool)
+    .await
+    .expect("insert transfer users");
+    sqlx::query(
+        "INSERT INTO organizations (id, enc_name, created_by) VALUES ($1, decode('6f7267', 'hex'), $2)",
+    )
+    .bind(&org)
+    .bind(&admin)
+    .execute(&pool)
+    .await
+    .expect("insert source organisation");
+    sqlx::query(
+        "INSERT INTO organization_memberships (org_id, user_id, role) VALUES
+         ($1, $2, 'owner'), ($1, $3, 'member')",
+    )
+    .bind(&org)
+    .bind(&admin)
+    .bind(&beneficiary)
+    .execute(&pool)
+    .await
+    .expect("insert source memberships");
+    sqlx::query(
+        "INSERT INTO billing_sponsored_operations
+         (operation_id, organization_id, actor_user_id, idempotency_key, request_hash, action,
+          beneficiary_id, offer, quote_version, quote_expires_at_epoch, effective_from,
+          provider_idempotency_key, state, result_code)
+         VALUES ($1, $2, $3, $1, $1, 'add', $4, 'standard_monthly', 1, 1800001000,
+                 1800000000, $1, 'active', 'active')",
+    )
+    .bind(&operation)
+    .bind(&org)
+    .bind(&admin)
+    .bind(&beneficiary)
+    .execute(&pool)
+    .await
+    .expect("insert source operation");
+    sqlx::query(
+        "INSERT INTO billing_sponsored_seats
+         (seat_id, organization_id, beneficiary_id, offer, effective_from, state, operation_id)
+         VALUES ($1, $2, $3, 'standard_monthly', 1800000000, 'active', $4)",
+    )
+    .bind(format!("transfer-test-{fixture}-seat"))
+    .bind(&org)
+    .bind(&beneficiary)
+    .bind(&operation)
+    .execute(&pool)
+    .await
+    .expect("insert active source seat");
+
+    let request = TransferRequest {
+        actor_user_id: admin.clone(),
+        counterparty_user_id: beneficiary.clone(),
+        beneficiary_id: beneficiary.clone(),
+        source_kind: TransferPayer::Sponsor,
+        source_organization_id: Some(org),
+        destination_kind: TransferPayer::Personal,
+        destination_organization_id: None,
+        offer: BillingOffer::StandardMonthly,
+        quote_version: 1,
+        quote_expires_at_epoch: 1_800_001_000,
+        effective_from: 1_800_000_000,
+        effective_until: None,
+        idempotency_key: "leave-sponsor".into(),
+    };
+    let mut tx = pool.begin().await.expect("begin sponsored transfer");
+    let outcome = begin_transfer(&mut tx, &request, 1_800_000_000)
+        .await
+        .expect("authorised sponsored-to-personal transfer");
+    let transfer_id = match outcome {
+        BeginTransfer::Created(intent) => intent.transfer_id,
+        BeginTransfer::AlreadyExists(_) => panic!("transfer unexpectedly existed"),
+    };
+    mark_failed(&mut tx, &transfer_id, "test_abort")
+        .await
+        .expect("abort uncommitted provider step");
+    tx.commit().await.expect("commit sponsored transfer");
     cleanup(&pool, &fixture).await;
 }
