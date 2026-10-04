@@ -191,11 +191,17 @@ pub struct TransferIntent {
     pub destination_kind: TransferPayer,
     pub destination_organization_id: Option<String>,
     pub offer: BillingOffer,
+    pub quote_version: i64,
+    pub quote_expires_at_epoch: i64,
     pub request_hash: String,
+    pub idempotency_key: String,
+    pub provider_idempotency_key: String,
     pub effective_from: i64,
     pub effective_until: Option<i64>,
     pub destination_operation_id: Option<String>,
     pub source_operation_id: Option<String>,
+    pub destination_provider_subscription_id: Option<String>,
+    pub source_provider_subscription_id: Option<String>,
     pub destination_payment_reference: Option<String>,
     pub source_adjustment_reference: Option<String>,
     pub founding_award_id: Option<String>,
@@ -331,7 +337,8 @@ pub async fn begin_transfer(
         let award = founding_allocator::load_award(tx, award_id)
             .await?
             .ok_or(TransferError::CorruptState)?;
-        if award.payer_id != payer_id(request, request.source_kind)? {
+        let (source_kind, source_id) = payer_identity(request, request.source_kind)?;
+        if award.payer_kind != source_kind || award.payer_id != source_id {
             return Err(TransferError::FoundingPayerConflict);
         }
     }
@@ -380,6 +387,9 @@ pub async fn record_destination_prepared(
     if destination_operation_id.trim().is_empty() {
         return Err(TransferError::InvalidField("destination_operation_id"));
     }
+    if provider_subscription_id.is_some_and(|value| value.trim().is_empty()) {
+        return Err(TransferError::InvalidField("provider_subscription_id"));
+    }
     let updated = sqlx::query(
         "UPDATE billing_transfer_intents SET state = 'destination_prepared', \
          destination_operation_id = $2, destination_provider_subscription_id = $3, updated_at = now() \
@@ -392,8 +402,14 @@ pub async fn record_destination_prepared(
     .await?;
     if updated.is_none() {
         let current = load_transfer(tx, transfer_id).await?;
-        if current.state != TransferState::DestinationPrepared
-            || current.destination_operation_id.as_deref() != Some(destination_operation_id)
+        if !matches!(
+            current.state,
+            TransferState::DestinationPrepared
+                | TransferState::DestinationPaid
+                | TransferState::SourceAdjustmentPending
+                | TransferState::Completed
+        ) || current.destination_operation_id.as_deref() != Some(destination_operation_id)
+            || current.destination_provider_subscription_id.as_deref() != provider_subscription_id
         {
             return Err(TransferError::ResultConflict);
         }
@@ -412,7 +428,7 @@ pub async fn record_destination_paid(
     let updated = sqlx::query(
         "UPDATE billing_transfer_intents SET state = 'destination_paid', \
          destination_payment_reference = $2, updated_at = now() \
-         WHERE transfer_id = $1 AND state IN ('destination_prepared','destination_paid') RETURNING transfer_id",
+         WHERE transfer_id = $1 AND state = 'destination_prepared' RETURNING transfer_id",
     )
     .bind(transfer_id)
     .bind(payment_reference)
@@ -422,7 +438,9 @@ pub async fn record_destination_paid(
         let current = load_transfer(tx, transfer_id).await?;
         if matches!(
             current.state,
-            TransferState::DestinationPaid | TransferState::SourceAdjustmentPending
+            TransferState::DestinationPaid
+                | TransferState::SourceAdjustmentPending
+                | TransferState::Completed
         ) && current.destination_payment_reference.as_deref() == Some(payment_reference)
         {
             return Ok(current);
@@ -495,15 +513,29 @@ pub async fn complete_source_adjustment(
         if award.beneficiary_id != transfer.beneficiary_id {
             return Err(TransferError::CorruptState);
         }
-        let source_payer = payer_id_for_transfer(
+        let (source_kind, source_payer) = payer_identity_for_transfer(
             transfer.source_kind,
             &transfer.beneficiary_id,
             transfer.source_organization_id.as_deref(),
         )?;
-        if award.payer_id != source_payer && award.payer_id != destination_payer {
+        let destination_kind = match transfer.destination_kind {
+            TransferPayer::Personal => founding_allocator::FoundingPayerKind::Personal,
+            TransferPayer::Sponsor => founding_allocator::FoundingPayerKind::Sponsor,
+        };
+        if (award.payer_kind != source_kind || award.payer_id != source_payer)
+            && (award.payer_kind != destination_kind || award.payer_id != destination_payer)
+        {
             return Err(TransferError::FoundingPayerConflict);
         }
-        founding_allocator::transfer_payer(tx, award_id, destination_payer).await?;
+        founding_allocator::transfer_payer_with_kind(
+            tx,
+            award_id,
+            source_kind,
+            source_payer,
+            destination_kind,
+            destination_payer,
+        )
+        .await?;
     }
     sqlx::query(
         "UPDATE billing_transfer_intents SET state = 'completed', \
@@ -527,18 +559,20 @@ pub async fn mark_failed(
     }
     let updated = sqlx::query(
         "UPDATE billing_transfer_intents SET state = 'failed', result_code = $2, updated_at = now() \
-         WHERE transfer_id = $1 AND state NOT IN ('completed','failed')",
+         WHERE transfer_id = $1 AND state IN ('pending','destination_prepared','unknown')",
     )
     .bind(transfer_id)
     .bind(result_code)
     .execute(&mut **tx)
     .await?;
     let current = load_transfer(tx, transfer_id).await?;
-    if current.state == TransferState::Failed
-        && current.result_code.as_deref() != Some(result_code)
-        && updated.rows_affected() == 0
-    {
-        return Err(TransferError::ResultConflict);
+    if updated.rows_affected() == 0 {
+        if current.state == TransferState::Failed
+            && current.result_code.as_deref() == Some(result_code)
+        {
+            return Ok(current);
+        }
+        return Err(TransferError::InvalidTransition);
     }
     Ok(current)
 }
@@ -586,7 +620,7 @@ async fn ensure_source_active(
             )
             .bind(organization_id)
             .bind(&request.beneficiary_id)
-            .fetch_one(&mut **tx)
+            .fetch_optional(&mut **tx)
             .await?;
             active.map(|_| ()).ok_or(TransferError::SourceInactive)
         }
@@ -665,11 +699,18 @@ fn transfer_from_row(row: &sqlx::postgres::PgRow) -> Result<TransferIntent, Tran
         destination_kind: parse_payer(&row.try_get::<String, _>("destination_kind")?)?,
         destination_organization_id: row.try_get("destination_organization_id")?,
         offer: parse_offer(&row.try_get::<String, _>("offer")?)?,
+        quote_version: row.try_get("quote_version")?,
+        quote_expires_at_epoch: row.try_get("quote_expires_at_epoch")?,
         request_hash: row.try_get("request_hash")?,
+        idempotency_key: row.try_get("idempotency_key")?,
+        provider_idempotency_key: row.try_get("provider_idempotency_key")?,
         effective_from: row.try_get("effective_from")?,
         effective_until: row.try_get("effective_until")?,
         destination_operation_id: row.try_get("destination_operation_id")?,
         source_operation_id: row.try_get("source_operation_id")?,
+        destination_provider_subscription_id: row
+            .try_get("destination_provider_subscription_id")?,
+        source_provider_subscription_id: row.try_get("source_provider_subscription_id")?,
         destination_payment_reference: row.try_get("destination_payment_reference")?,
         source_adjustment_reference: row.try_get("source_adjustment_reference")?,
         founding_award_id: row.try_get("founding_award_id")?,
@@ -693,24 +734,39 @@ fn parse_offer(value: &str) -> Result<BillingOffer, TransferError> {
         .ok_or(TransferError::CorruptState)
 }
 
-fn payer_id(request: &TransferRequest, payer: TransferPayer) -> Result<&str, TransferError> {
+fn payer_identity(
+    request: &TransferRequest,
+    payer: TransferPayer,
+) -> Result<(founding_allocator::FoundingPayerKind, &str), TransferError> {
     match payer {
-        TransferPayer::Personal => Ok(&request.beneficiary_id),
-        TransferPayer::Sponsor => request
-            .source_organization_id
-            .as_deref()
-            .ok_or(TransferError::CorruptState),
+        TransferPayer::Personal => Ok((
+            founding_allocator::FoundingPayerKind::Personal,
+            &request.beneficiary_id,
+        )),
+        TransferPayer::Sponsor => Ok((
+            founding_allocator::FoundingPayerKind::Sponsor,
+            request
+                .source_organization_id
+                .as_deref()
+                .ok_or(TransferError::CorruptState)?,
+        )),
     }
 }
 
-fn payer_id_for_transfer<'a>(
+fn payer_identity_for_transfer<'a>(
     payer: TransferPayer,
     beneficiary_id: &'a str,
     organization_id: Option<&'a str>,
-) -> Result<&'a str, TransferError> {
+) -> Result<(founding_allocator::FoundingPayerKind, &'a str), TransferError> {
     match payer {
-        TransferPayer::Personal => Ok(beneficiary_id),
-        TransferPayer::Sponsor => organization_id.ok_or(TransferError::CorruptState),
+        TransferPayer::Personal => Ok((
+            founding_allocator::FoundingPayerKind::Personal,
+            beneficiary_id,
+        )),
+        TransferPayer::Sponsor => Ok((
+            founding_allocator::FoundingPayerKind::Sponsor,
+            organization_id.ok_or(TransferError::CorruptState)?,
+        )),
     }
 }
 

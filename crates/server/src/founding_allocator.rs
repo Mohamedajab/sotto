@@ -205,10 +205,26 @@ pub enum CalendarError {
     InvalidDate,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoundingPayerKind {
+    Personal,
+    Sponsor,
+}
+
+impl FoundingPayerKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Personal => "personal",
+            Self::Sponsor => "sponsor",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FoundingAward {
     pub award_id: String,
     pub beneficiary_id: String,
+    pub payer_kind: FoundingPayerKind,
     pub payer_id: String,
     pub offer: FoundingOffer,
     pub cohort_ordinal: i64,
@@ -221,6 +237,7 @@ pub struct FoundingReservation {
     pub reservation_id: String,
     pub operation_id: String,
     pub beneficiary_id: String,
+    pub payer_kind: FoundingPayerKind,
     pub payer_id: String,
     pub offer: FoundingOffer,
     pub quote_version: i64,
@@ -259,6 +276,8 @@ pub enum FoundingAllocatorError {
     ReservationMissing,
     #[error("founding reservation cannot be confirmed twice with different evidence")]
     ConfirmationConflict,
+    #[error("founding award payer conflicts with stored identity")]
+    PayerConflict,
     #[error("founding allocator state is corrupt")]
     CorruptState,
     #[error("database error: {0}")]
@@ -277,6 +296,34 @@ pub async fn reserve(
     quote_expires_at_epoch: i64,
     now_epoch: i64,
 ) -> Result<ReservationOutcome, FoundingAllocatorError> {
+    reserve_with_payer_kind(
+        tx,
+        reservation_id,
+        operation_id,
+        beneficiary_id,
+        FoundingPayerKind::Personal,
+        payer_id,
+        offer,
+        quote_version,
+        quote_expires_at_epoch,
+        now_epoch,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn reserve_with_payer_kind(
+    tx: &mut Transaction<'_, Postgres>,
+    reservation_id: &str,
+    operation_id: &str,
+    beneficiary_id: &str,
+    payer_kind: FoundingPayerKind,
+    payer_id: &str,
+    offer: FoundingOffer,
+    quote_version: i64,
+    quote_expires_at_epoch: i64,
+    now_epoch: i64,
+) -> Result<ReservationOutcome, FoundingAllocatorError> {
     validate_identity(reservation_id, "reservation_id")?;
     validate_identity(operation_id, "operation_id")?;
     validate_identity(beneficiary_id, "beneficiary_id")?;
@@ -288,6 +335,7 @@ pub async fn reserve(
     lock_capacity(tx).await?;
     if let Some(existing) = load_reservation_by_operation(tx, operation_id).await? {
         if existing.beneficiary_id == beneficiary_id
+            && existing.payer_kind == payer_kind
             && existing.payer_id == payer_id
             && existing.offer == offer
             && existing.quote_version == quote_version
@@ -331,12 +379,13 @@ pub async fn reserve(
     }
     sqlx::query(
         "INSERT INTO billing_founding_reservations \
-         (reservation_id, operation_id, beneficiary_id, payer_id, offer, quote_version, \
-          quote_expires_at_epoch) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+         (reservation_id, operation_id, beneficiary_id, payer_kind, payer_id, offer, quote_version, \
+          quote_expires_at_epoch) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
     )
     .bind(reservation_id)
     .bind(operation_id)
     .bind(beneficiary_id)
+    .bind(payer_kind.as_str())
     .bind(payer_id)
     .bind(offer.as_str())
     .bind(quote_version)
@@ -347,6 +396,7 @@ pub async fn reserve(
         reservation_id: reservation_id.into(),
         operation_id: operation_id.into(),
         beneficiary_id: beneficiary_id.into(),
+        payer_kind,
         payer_id: payer_id.into(),
         offer,
         quote_version,
@@ -365,7 +415,7 @@ pub async fn confirm_payment(
     validate_identity(payment_reference, "payment_reference")?;
     lock_capacity(tx).await?;
     let row = sqlx::query(
-        "SELECT reservation_id, operation_id, beneficiary_id, payer_id, offer, quote_version, \
+        "SELECT reservation_id, operation_id, beneficiary_id, payer_kind, payer_id, offer, quote_version, \
          quote_expires_at_epoch, status, award_id, payment_reference \
          FROM billing_founding_reservations WHERE reservation_id = $1 FOR UPDATE",
     )
@@ -409,6 +459,7 @@ pub async fn confirm_payment(
         return Err(FoundingAllocatorError::PaymentConflict);
     }
     let beneficiary_id: String = row.try_get("beneficiary_id")?;
+    let payer_kind = parse_payer_kind(&row.try_get::<String, _>("payer_kind")?)?;
     let payer_id: String = row.try_get("payer_id")?;
     if load_award_by_beneficiary(tx, &beneficiary_id)
         .await?
@@ -461,11 +512,12 @@ pub async fn confirm_payment(
     let end = paid_on.anchored_term_end(offer, 1);
     sqlx::query(
         "INSERT INTO billing_founding_awards \
-         (award_id, beneficiary_id, payer_id, offer, cohort_ordinal, original_start_date, original_end_date) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7)",
+         (award_id, beneficiary_id, payer_kind, payer_id, offer, cohort_ordinal, original_start_date, original_end_date) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
     )
     .bind(&award_id)
     .bind(&beneficiary_id)
+    .bind(payer_kind.as_str())
     .bind(&payer_id)
     .bind(offer.as_str())
     .bind(ordinal)
@@ -485,6 +537,7 @@ pub async fn confirm_payment(
     let award = FoundingAward {
         award_id,
         beneficiary_id,
+        payer_kind,
         payer_id,
         offer,
         cohort_ordinal: ordinal,
@@ -499,16 +552,51 @@ pub async fn transfer_payer(
     award_id: &str,
     new_payer_id: &str,
 ) -> Result<FoundingAward, FoundingAllocatorError> {
-    validate_identity(award_id, "award_id")?;
-    validate_identity(new_payer_id, "payer_id")?;
-    sqlx::query("UPDATE billing_founding_awards SET payer_id = $2 WHERE award_id = $1")
-        .bind(award_id)
-        .bind(new_payer_id)
-        .execute(&mut **tx)
-        .await?;
-    load_award(tx, award_id)
+    let current = load_award(tx, award_id)
         .await?
-        .ok_or(FoundingAllocatorError::ReservationMissing)
+        .ok_or(FoundingAllocatorError::ReservationMissing)?;
+    transfer_payer_with_kind(
+        tx,
+        award_id,
+        current.payer_kind,
+        &current.payer_id,
+        FoundingPayerKind::Personal,
+        new_payer_id,
+    )
+    .await
+}
+
+pub async fn transfer_payer_with_kind(
+    tx: &mut Transaction<'_, Postgres>,
+    award_id: &str,
+    expected_payer_kind: FoundingPayerKind,
+    expected_payer_id: &str,
+    new_payer_kind: FoundingPayerKind,
+    new_payer_id: &str,
+) -> Result<FoundingAward, FoundingAllocatorError> {
+    validate_identity(award_id, "award_id")?;
+    validate_identity(expected_payer_id, "payer_id")?;
+    validate_identity(new_payer_id, "payer_id")?;
+    let updated = sqlx::query(
+        "UPDATE billing_founding_awards SET payer_kind = $4, payer_id = $5 \
+         WHERE award_id = $1 AND payer_kind = $2 AND payer_id = $3",
+    )
+    .bind(award_id)
+    .bind(expected_payer_kind.as_str())
+    .bind(expected_payer_id)
+    .bind(new_payer_kind.as_str())
+    .bind(new_payer_id)
+    .execute(&mut **tx)
+    .await?;
+    let award = load_award(tx, award_id)
+        .await?
+        .ok_or(FoundingAllocatorError::ReservationMissing)?;
+    if updated.rows_affected() == 0
+        && (award.payer_kind != new_payer_kind || award.payer_id != new_payer_id)
+    {
+        return Err(FoundingAllocatorError::PayerConflict);
+    }
+    Ok(award)
 }
 
 /// Return the public capacity and standard-price context used by a founding quote.
@@ -560,7 +648,7 @@ pub async fn load_award(
     award_id: &str,
 ) -> Result<Option<FoundingAward>, FoundingAllocatorError> {
     let row = sqlx::query(
-        "SELECT award_id, beneficiary_id, payer_id, offer, cohort_ordinal, original_start_date, \
+        "SELECT award_id, beneficiary_id, payer_kind, payer_id, offer, cohort_ordinal, original_start_date, \
          original_end_date FROM billing_founding_awards WHERE award_id = $1",
     )
     .bind(award_id)
@@ -600,7 +688,7 @@ async fn load_reservation_by_operation(
     operation_id: &str,
 ) -> Result<Option<FoundingReservation>, FoundingAllocatorError> {
     let row = sqlx::query(
-        "SELECT reservation_id, operation_id, beneficiary_id, payer_id, offer, quote_version, \
+        "SELECT reservation_id, operation_id, beneficiary_id, payer_kind, payer_id, offer, quote_version, \
          quote_expires_at_epoch FROM billing_founding_reservations WHERE operation_id = $1 FOR UPDATE",
     )
     .bind(operation_id)
@@ -614,7 +702,7 @@ async fn load_award_by_beneficiary(
     beneficiary_id: &str,
 ) -> Result<Option<FoundingAward>, FoundingAllocatorError> {
     let row = sqlx::query(
-        "SELECT award_id, beneficiary_id, payer_id, offer, cohort_ordinal, original_start_date, \
+        "SELECT award_id, beneficiary_id, payer_kind, payer_id, offer, cohort_ordinal, original_start_date, \
          original_end_date FROM billing_founding_awards WHERE beneficiary_id = $1",
     )
     .bind(beneficiary_id)
@@ -630,6 +718,7 @@ fn reservation_from_row(
         reservation_id: row.try_get("reservation_id")?,
         operation_id: row.try_get("operation_id")?,
         beneficiary_id: row.try_get("beneficiary_id")?,
+        payer_kind: parse_payer_kind(&row.try_get::<String, _>("payer_kind")?)?,
         payer_id: row.try_get("payer_id")?,
         offer: parse_offer(&row.try_get::<String, _>("offer")?)?,
         quote_version: row.try_get("quote_version")?,
@@ -641,6 +730,7 @@ fn award_from_row(row: sqlx::postgres::PgRow) -> Result<FoundingAward, FoundingA
     Ok(FoundingAward {
         award_id: row.try_get("award_id")?,
         beneficiary_id: row.try_get("beneficiary_id")?,
+        payer_kind: parse_payer_kind(&row.try_get::<String, _>("payer_kind")?)?,
         payer_id: row.try_get("payer_id")?,
         offer: parse_offer(&row.try_get::<String, _>("offer")?)?,
         cohort_ordinal: row.try_get("cohort_ordinal")?,
@@ -655,6 +745,14 @@ fn parse_offer(value: &str) -> Result<FoundingOffer, FoundingAllocatorError> {
     match value {
         "founding_monthly" => Ok(FoundingOffer::Monthly),
         "founding_annual" => Ok(FoundingOffer::Annual),
+        _ => Err(FoundingAllocatorError::CorruptState),
+    }
+}
+
+fn parse_payer_kind(value: &str) -> Result<FoundingPayerKind, FoundingAllocatorError> {
+    match value {
+        "personal" => Ok(FoundingPayerKind::Personal),
+        "sponsor" => Ok(FoundingPayerKind::Sponsor),
         _ => Err(FoundingAllocatorError::CorruptState),
     }
 }

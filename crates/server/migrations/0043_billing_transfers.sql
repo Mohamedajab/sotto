@@ -1,5 +1,13 @@
 -- A payer transfer is a durable, beneficiary-scoped intent. Provider calls happen outside the
 -- transaction and every callback records evidence against this row before the next step runs.
+ALTER TABLE billing_founding_reservations
+    ADD COLUMN payer_kind TEXT NOT NULL DEFAULT 'personal'
+        CHECK (payer_kind IN ('personal', 'sponsor'));
+
+ALTER TABLE billing_founding_awards
+    ADD COLUMN payer_kind TEXT NOT NULL DEFAULT 'personal'
+        CHECK (payer_kind IN ('personal', 'sponsor'));
+
 CREATE TABLE billing_transfer_intents (
     transfer_id TEXT PRIMARY KEY,
     actor_user_id TEXT NOT NULL REFERENCES users (id) ON DELETE RESTRICT,

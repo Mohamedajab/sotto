@@ -7,9 +7,9 @@ use uuid::Uuid;
 
 use sotto_server::billing_catalogue::BillingOffer;
 use sotto_server::billing_transfers::{
-    begin_source_adjustment, begin_transfer, complete_source_adjustment, record_destination_paid,
-    record_destination_prepared, BeginTransfer, TransferError, TransferPayer, TransferRequest,
-    TransferState,
+    begin_source_adjustment, begin_transfer, complete_source_adjustment, mark_failed,
+    record_destination_paid, record_destination_prepared, BeginTransfer, TransferError,
+    TransferPayer, TransferRequest, TransferState,
 };
 use sotto_server::db;
 
@@ -245,6 +245,28 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
             .await
             .expect("load founding payer");
     assert_eq!(payer, org);
+
+    let mut tx = pool.begin().await.expect("begin callback replay");
+    record_destination_prepared(
+        &mut tx,
+        &transfer.transfer_id,
+        "destination-operation",
+        Some("sub_destination"),
+    )
+    .await
+    .expect("matching preparation retry remains idempotent");
+    record_destination_paid(&mut tx, &transfer.transfer_id, "pi_destination")
+        .await
+        .expect("matching payment retry remains idempotent");
+    assert!(matches!(
+        record_destination_paid(&mut tx, &transfer.transfer_id, "pi_other").await,
+        Err(TransferError::ResultConflict)
+    ));
+    assert!(matches!(
+        mark_failed(&mut tx, &transfer.transfer_id, "late_failure").await,
+        Err(TransferError::InvalidTransition)
+    ));
+    tx.rollback().await.expect("rollback callback replay");
 
     cleanup(&pool, &fixture).await;
 }
