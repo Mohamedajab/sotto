@@ -2954,6 +2954,8 @@ async fn sponsored_invoice_paid(
         .as_str()
         .or_else(|| object["id"].as_str())
         .ok_or_else(|| Error::Config("paid sponsored invoice has no payment reference".into()))?;
+    let period_end = invoice_period_end(object)
+        .ok_or_else(|| Error::Config("paid sponsored invoice has no period end".into()))?;
     let customer_id = object["customer"].as_str().map(str::to_string);
     sqlx::query(
         "INSERT INTO billing_sponsored_subscriptions \
@@ -2988,9 +2990,11 @@ async fn sponsored_invoice_paid(
     let operations: Vec<(String, String)> = sqlx::query_as(
         "SELECT operation_id, offer FROM billing_sponsored_operations \
          WHERE organization_id = $1 AND state IN ('checkout_created', 'provider_pending') \
+           AND effective_from < $2 \
          ORDER BY created_at FOR UPDATE",
     )
     .bind(&organization_id)
+    .bind(period_end)
     .fetch_all(&mut **tx)
     .await?;
     for (operation_id, offer) in operations {
@@ -2999,6 +3003,9 @@ async fn sponsored_invoice_paid(
             .iter()
             .find(|(_, price_id, _)| price_id == catalogue.id_for(offer))
             .map(|(item_id, _, _)| item_id.clone());
+        if provider_item_id.is_none() {
+            continue;
+        }
         let evidence = sponsored_billing::SponsoredProviderEvidence {
             customer_id: customer_id.clone(),
             subscription_id: subscription_id.to_string(),
