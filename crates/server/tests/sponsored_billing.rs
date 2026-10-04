@@ -3,7 +3,9 @@
 //! These tests are opt-in like the other PostgreSQL integration targets. They use unique fixture
 //! identities and remove the operation rows explicitly because their foreign keys preserve history.
 
+use sqlx::postgres::PgConnectOptions;
 use sqlx::PgPool;
+use std::str::FromStr;
 use uuid::Uuid;
 
 use sotto_server::billing_catalogue::BillingOffer;
@@ -25,6 +27,12 @@ async fn pool() -> Option<PgPool> {
             return None;
         }
     };
+    let options = PgConnectOptions::from_str(&url).expect("parse DATABASE_URL");
+    assert!(
+        matches!(options.get_host(), "localhost" | "127.0.0.1" | "::1"),
+        "refusing sponsored billing tests against non-local host: {}",
+        options.get_host()
+    );
     let pool = db::connect(&url).await.expect("connect");
     db::migrate(&pool).await.expect("migrate");
     Some(pool)
