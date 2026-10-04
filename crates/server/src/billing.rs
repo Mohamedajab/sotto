@@ -324,6 +324,7 @@ pub trait SubscriptionProvider: Send + Sync {
         _subscription_id: &str,
         _items: &[SponsoredSubscriptionItemRequest],
         _effective_at_epoch: i64,
+        _revert_at_epoch: Option<i64>,
         _idempotency_key: &str,
     ) -> ProviderResult<SponsoredSubscriptionSnapshot> {
         Err(ProviderError::unsupported("sponsored_subscription_update"))
@@ -621,6 +622,7 @@ impl SubscriptionProvider for StripeBilling {
         subscription_id: &str,
         items: &[SponsoredSubscriptionItemRequest],
         effective_at_epoch: i64,
+        revert_at_epoch: Option<i64>,
         idempotency_key: &str,
     ) -> ProviderResult<SponsoredSubscriptionSnapshot> {
         if subscription_id.is_empty() || items.iter().any(|item| item.quantity < 0) {
@@ -649,7 +651,8 @@ impl SubscriptionProvider for StripeBilling {
         let current_end = current
             .current_period_end
             .ok_or_else(ProviderError::malformed_response)?;
-        if effective_at_epoch < current_end {
+        let effective_at_epoch = effective_at_epoch.max(current_end);
+        if revert_at_epoch.is_some_and(|revert_at| revert_at <= effective_at_epoch) {
             return Err(ProviderError::malformed_response());
         }
         let mut form = vec![
@@ -682,6 +685,9 @@ impl SubscriptionProvider for StripeBilling {
                 "phases[1][start_date]".into(),
                 effective_at_epoch.to_string(),
             ));
+            if let Some(revert_at_epoch) = revert_at_epoch {
+                form.push(("phases[1][end_date]".into(), revert_at_epoch.to_string()));
+            }
             for (index, item) in items.iter().enumerate() {
                 form.push((
                     format!("phases[1][items][{index}][price]"),
@@ -691,6 +697,19 @@ impl SubscriptionProvider for StripeBilling {
                     format!("phases[1][items][{index}][quantity]"),
                     item.quantity.to_string(),
                 ));
+            }
+            if let Some(revert_at_epoch) = revert_at_epoch {
+                form.push(("phases[2][start_date]".into(), revert_at_epoch.to_string()));
+                for (index, item) in current.items.iter().enumerate() {
+                    form.push((
+                        format!("phases[2][items][{index}][price]"),
+                        item.provider_price_id.clone(),
+                    ));
+                    form.push((
+                        format!("phases[2][items][{index}][quantity]"),
+                        item.quantity.to_string(),
+                    ));
+                }
             }
         }
         stripe_post_with_idempotency(
@@ -1232,9 +1251,15 @@ async fn sponsored_checkout(
                 &org_id,
                 &subscription_id,
                 &items,
-                operation
-                    .effective_until
-                    .unwrap_or(operation.effective_from),
+                match action {
+                    SponsoredSeatAction::Add => operation.effective_from,
+                    SponsoredSeatAction::Remove | SponsoredSeatAction::Replace => operation
+                        .effective_until
+                        .unwrap_or(operation.effective_from),
+                },
+                (action == SponsoredSeatAction::Add)
+                    .then_some(operation.effective_until)
+                    .flatten(),
                 &operation.provider_idempotency_key,
             )
             .await
@@ -1246,6 +1271,7 @@ async fn sponsored_checkout(
             customer_id.as_deref().or(snapshot.customer_id.as_deref()),
             &subscription_id,
             snapshot.schedule_id.as_deref(),
+            snapshot.current_period_end,
             None,
         )
         .await
@@ -2089,8 +2115,8 @@ fn sponsored_subscription_snapshot(
         customer_id: object["customer"].as_str().map(str::to_string),
         subscription_id: base.id,
         status: base.status,
-        current_period_start: object["current_period_start"].as_i64(),
-        current_period_end: object["current_period_end"].as_i64(),
+        current_period_start: subscription_period_start(object),
+        current_period_end: subscription_period_end(object),
         schedule_id: object["schedule"].as_str().map(str::to_string),
         items,
     })
@@ -2847,6 +2873,15 @@ async fn subscription_updated(
 /// Since Stripe API 2025-03-31.basil, subscription billing periods live on the subscription
 /// items rather than on the subscription object. Personal checkout creates one item, but taking
 /// the furthest item end keeps the stored term safe if that shape ever gains another item.
+fn subscription_period_start(object: &serde_json::Value) -> Option<i64> {
+    object["items"]["data"]
+        .as_array()?
+        .iter()
+        .filter_map(|item| item["current_period_start"].as_i64())
+        .filter(|start| *start >= 0)
+        .min()
+}
+
 fn subscription_period_end(object: &serde_json::Value) -> Option<i64> {
     object["items"]["data"]
         .as_array()?
@@ -3032,6 +3067,7 @@ fn sponsored_invoice_items(object: &serde_json::Value) -> Vec<(String, String, i
             })?;
             let price_id = line["price"]["id"]
                 .as_str()
+                .or_else(|| line["pricing"]["price_details"]["price"].as_str())
                 .or_else(|| line["parent"]["subscription_item_details"]["price"].as_str())?;
             let quantity = line["quantity"].as_i64().unwrap_or(1);
             Some((item_id.to_string(), price_id.to_string(), quantity))
@@ -3570,5 +3606,42 @@ mod tests {
         });
         assert_eq!(invoice_period_end(&invoice), Some(1_950_000_000));
         assert_eq!(invoice_subscription_id(&invoice), Some("sub-1"));
+    }
+
+    #[test]
+    fn sponsored_snapshot_and_invoice_items_use_pinned_nested_fields() {
+        let subscription = serde_json::json!({
+            "id": "sub-sponsored",
+            "customer": "cus-sponsored",
+            "status": "active",
+            "current_period_start": 1,
+            "current_period_end": 2,
+            "schedule": "sub_sched",
+            "items": {"data": [{
+                "id": "si-sponsored",
+                "price": {"id": "price-sponsored"},
+                "quantity": 3,
+                "current_period_start": 1_700_000_000,
+                "current_period_end": 1_702_678_400
+            }]}
+        });
+        let snapshot = sponsored_subscription_snapshot(&subscription, "sub-sponsored").unwrap();
+        assert_eq!(snapshot.current_period_start, Some(1_700_000_000));
+        assert_eq!(snapshot.current_period_end, Some(1_702_678_400));
+        assert_eq!(snapshot.schedule_id.as_deref(), Some("sub_sched"));
+
+        let invoice = serde_json::json!({
+            "lines": {"data": [{
+                "parent": {"subscription_item_details": {
+                    "subscription_item": "si-sponsored"
+                }},
+                "pricing": {"price_details": {"price": "price-sponsored"}},
+                "quantity": 3
+            }]}
+        });
+        assert_eq!(
+            sponsored_invoice_items(&invoice),
+            vec![("si-sponsored".into(), "price-sponsored".into(), 3)]
+        );
     }
 }

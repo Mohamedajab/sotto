@@ -495,6 +495,13 @@ pub async fn begin_operation(
             .replacement_beneficiary_id
             .as_deref()
             .unwrap_or(&request.beneficiary_id);
+        let seat_effective_from = match request.action {
+            SponsoredSeatAction::Replace => request
+                .effective_until
+                .expect("replacement validation requires an end boundary"),
+            SponsoredSeatAction::Add => request.effective_from,
+            SponsoredSeatAction::Remove => unreachable!("remove does not create a seat"),
+        };
         let seat_effective_until = match request.action {
             SponsoredSeatAction::Replace => None,
             SponsoredSeatAction::Add => request.effective_until,
@@ -509,7 +516,7 @@ pub async fn begin_operation(
         .bind(organization_id)
         .bind(beneficiary)
         .bind(request.offer.as_str())
-        .bind(request.effective_from)
+        .bind(seat_effective_from)
         .bind(seat_effective_until)
         .bind(&operation_id)
         .execute(&mut **tx)
@@ -567,6 +574,7 @@ pub async fn record_provider_update(
     customer_id: Option<&str>,
     subscription_id: &str,
     schedule_id: Option<&str>,
+    current_period_end: Option<i64>,
     provider_item_id: Option<&str>,
 ) -> Result<SponsoredOperation, SponsoredBillingError> {
     let updated = sqlx::query(
@@ -612,7 +620,10 @@ pub async fn record_provider_update(
     .await?;
     sqlx::query(
         "UPDATE billing_sponsored_seats SET state = 'scheduled_removal', \
-         effective_until = COALESCE(operation.effective_until, operation.effective_from), updated_at = now() \
+         effective_until = GREATEST(\
+             COALESCE(operation.effective_until, operation.effective_from),\
+             COALESCE($2, 0)\
+         ), updated_at = now() \
          FROM billing_sponsored_operations AS operation \
          WHERE operation.operation_id = $1 AND operation.action IN ('remove', 'replace') \
            AND billing_sponsored_seats.organization_id = operation.organization_id \
@@ -620,6 +631,17 @@ pub async fn record_provider_update(
            AND billing_sponsored_seats.state = 'active'",
     )
     .bind(operation_id)
+    .bind(current_period_end)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE billing_sponsored_seats SET effective_from = GREATEST(\
+             effective_from, COALESCE($2, 0)\
+         ), updated_at = now() \
+         WHERE operation_id = $1 AND state = 'pending'",
+    )
+    .bind(operation_id)
+    .bind(current_period_end)
     .execute(&mut **tx)
     .await?;
     load_operation(tx, operation_id).await

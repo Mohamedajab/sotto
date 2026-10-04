@@ -181,6 +181,7 @@ async fn named_seat_operation_is_idempotent_and_activates_after_paid_result() {
         Some("cus_sponsored_test"),
         "sub_sponsored_test",
         Some("sch_sponsored_test"),
+        Some(1_700_000_100),
         None,
     )
     .await
