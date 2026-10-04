@@ -1245,6 +1245,7 @@ async fn sponsored_checkout(
             &operation.operation_id,
             customer_id.as_deref().or(snapshot.customer_id.as_deref()),
             &subscription_id,
+            snapshot.schedule_id.as_deref(),
             None,
         )
         .await
@@ -2604,6 +2605,7 @@ async fn checkout_completed(
                 .map(str::to_string)
                 .or_else(|| sponsored_snapshot.and_then(|snapshot| snapshot.customer_id.clone())),
             subscription_id: subscription_id.to_string(),
+            schedule_id: sponsored_snapshot.and_then(|snapshot| snapshot.schedule_id.clone()),
             checkout_session_id: object["id"].as_str().map(str::to_string),
             payment_reference: payment_reference.to_string(),
             provider_item_id: sponsored_snapshot.and_then(|snapshot| {
@@ -3000,6 +3002,7 @@ async fn sponsored_invoice_paid(
         let evidence = sponsored_billing::SponsoredProviderEvidence {
             customer_id: customer_id.clone(),
             subscription_id: subscription_id.to_string(),
+            schedule_id: None,
             checkout_session_id: None,
             payment_reference: payment_reference.to_string(),
             provider_item_id,

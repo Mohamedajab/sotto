@@ -241,6 +241,7 @@ pub struct SponsoredOperation {
 pub struct SponsoredProviderEvidence {
     pub customer_id: Option<String>,
     pub subscription_id: String,
+    pub schedule_id: Option<String>,
     pub checkout_session_id: Option<String>,
     pub payment_reference: String,
     pub provider_item_id: Option<String>,
@@ -565,6 +566,7 @@ pub async fn record_provider_update(
     operation_id: &str,
     customer_id: Option<&str>,
     subscription_id: &str,
+    schedule_id: Option<&str>,
     provider_item_id: Option<&str>,
 ) -> Result<SponsoredOperation, SponsoredBillingError> {
     let updated = sqlx::query(
@@ -586,6 +588,28 @@ pub async fn record_provider_update(
             return Err(SponsoredBillingError::ResultConflict);
         }
     }
+    let organization_id: String = sqlx::query_scalar(
+        "SELECT organization_id FROM billing_sponsored_operations WHERE operation_id = $1",
+    )
+    .bind(operation_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO billing_sponsored_subscriptions \
+         (organization_id, provider_customer_id, provider_subscription_id, provider_schedule_id, status, updated_at) \
+         VALUES ($1, $2, $3, $4, 'active', now()) \
+         ON CONFLICT (organization_id) DO UPDATE SET \
+           provider_customer_id = COALESCE(EXCLUDED.provider_customer_id, billing_sponsored_subscriptions.provider_customer_id), \
+           provider_subscription_id = EXCLUDED.provider_subscription_id, \
+           provider_schedule_id = COALESCE(EXCLUDED.provider_schedule_id, billing_sponsored_subscriptions.provider_schedule_id), \
+           status = 'active', updated_at = now()",
+    )
+    .bind(&organization_id)
+    .bind(customer_id)
+    .bind(subscription_id)
+    .bind(schedule_id)
+    .execute(&mut **tx)
+    .await?;
     load_operation(tx, operation_id).await
 }
 
@@ -672,14 +696,17 @@ pub async fn complete_paid_checkout(
     .await?;
     sqlx::query(
         "INSERT INTO billing_sponsored_subscriptions \
-         (organization_id, provider_customer_id, provider_subscription_id, status, updated_at) \
-         VALUES ($1, $2, $3, 'active', now()) \
+         (organization_id, provider_customer_id, provider_subscription_id, provider_schedule_id, status, updated_at) \
+         VALUES ($1, $2, $3, $4, 'active', now()) \
          ON CONFLICT (organization_id) DO UPDATE SET provider_customer_id = COALESCE(EXCLUDED.provider_customer_id, billing_sponsored_subscriptions.provider_customer_id), \
-           provider_subscription_id = EXCLUDED.provider_subscription_id, status = 'active', updated_at = now()",
+           provider_subscription_id = EXCLUDED.provider_subscription_id, \
+           provider_schedule_id = COALESCE(EXCLUDED.provider_schedule_id, billing_sponsored_subscriptions.provider_schedule_id), \
+           status = 'active', updated_at = now()",
     )
     .bind(&organization_id)
     .bind(evidence.customer_id.as_deref())
     .bind(&evidence.subscription_id)
+    .bind(evidence.schedule_id.as_deref())
     .execute(&mut **tx)
     .await?;
     load_operation(tx, operation_id).await

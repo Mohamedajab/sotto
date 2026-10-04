@@ -122,6 +122,7 @@ async fn named_seat_operation_is_idempotent_and_activates_after_paid_result() {
     let evidence = SponsoredProviderEvidence {
         customer_id: Some("cus_sponsored_test".into()),
         subscription_id: "sub_sponsored_test".into(),
+        schedule_id: None,
         checkout_session_id: Some("cs_sponsored_test".into()),
         payment_reference: "pi_sponsored_test".into(),
         provider_item_id: Some("si_sponsored_test".into()),
