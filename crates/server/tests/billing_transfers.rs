@@ -112,7 +112,9 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
     };
     let fixture = Uuid::new_v4().to_string();
     let user = format!("transfer-test-{fixture}-user");
-    let org = format!("transfer-test-{fixture}-org");
+    // Deliberately reuse the user text as the organisation text: the typed payer column must
+    // distinguish these otherwise-colliding namespaces.
+    let org = user.clone();
     let operation = format!("transfer-test-{fixture}-personal-operation");
     let award = format!("transfer-test-{fixture}-award");
     cleanup(&pool, &fixture).await;
@@ -238,13 +240,14 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
             .await
             .expect("load transfer state");
     assert_eq!(state, TransferState::Completed.as_str());
-    let payer: String =
-        sqlx::query_scalar("SELECT payer_id FROM billing_founding_awards WHERE award_id = $1")
-            .bind(&award)
-            .fetch_one(&pool)
-            .await
-            .expect("load founding payer");
-    assert_eq!(payer, org);
+    let payer: (String, String) = sqlx::query_as(
+        "SELECT payer_kind, payer_id FROM billing_founding_awards WHERE award_id = $1",
+    )
+    .bind(&award)
+    .fetch_one(&pool)
+    .await
+    .expect("load founding payer");
+    assert_eq!(payer, ("sponsor".into(), org));
 
     let mut tx = pool.begin().await.expect("begin callback replay");
     record_destination_prepared(
