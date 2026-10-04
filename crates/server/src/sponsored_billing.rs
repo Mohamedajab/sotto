@@ -100,6 +100,17 @@ pub struct SponsoredSeatRequest {
 
 impl SponsoredSeatRequest {
     pub fn validate(&self, now_epoch: i64) -> Result<(), SponsoredBillingError> {
+        self.validate_identity()?;
+        if self.effective_from < now_epoch {
+            return Err(SponsoredBillingError::InvalidField("effective interval"));
+        }
+        if self.quote_expires_at_epoch <= now_epoch {
+            return Err(SponsoredBillingError::QuoteExpired);
+        }
+        Ok(())
+    }
+
+    fn validate_identity(&self) -> Result<(), SponsoredBillingError> {
         if self.beneficiary_id.trim().is_empty() {
             return Err(SponsoredBillingError::InvalidField("beneficiary_id"));
         }
@@ -109,16 +120,12 @@ impl SponsoredSeatRequest {
         if self.quote_version < 1 {
             return Err(SponsoredBillingError::InvalidField("quote_version"));
         }
-        if self.quote_expires_at_epoch <= now_epoch {
-            return Err(SponsoredBillingError::QuoteExpired);
-        }
         if self.effective_from > self.quote_expires_at_epoch {
             return Err(SponsoredBillingError::InvalidField("effective_from"));
         }
-        if self.effective_from < now_epoch
-            || self
-                .effective_until
-                .is_some_and(|until| until <= self.effective_from)
+        if self
+            .effective_until
+            .is_some_and(|until| until <= self.effective_from)
         {
             return Err(SponsoredBillingError::InvalidField("effective interval"));
         }
@@ -150,6 +157,13 @@ impl SponsoredSeatRequest {
             }
             _ => Ok(()),
         }
+    }
+
+    fn ensure_unexpired(&self, now_epoch: i64) -> Result<(), SponsoredBillingError> {
+        if self.quote_expires_at_epoch <= now_epoch {
+            return Err(SponsoredBillingError::QuoteExpired);
+        }
+        Ok(())
     }
 }
 
@@ -333,7 +347,7 @@ pub async fn begin_operation(
     request: &SponsoredSeatRequest,
     now_epoch: i64,
 ) -> Result<SponsoredOperation, SponsoredBillingError> {
-    request.validate(now_epoch)?;
+    request.validate_identity()?;
     let access = org::access_for_update(tx, organization_id, actor_user_id)
         .await
         .map_err(|_| SponsoredBillingError::Unauthorised)?;
@@ -363,6 +377,10 @@ pub async fn begin_operation(
         }
         return Ok(existing);
     }
+    if request.effective_from < now_epoch {
+        return Err(SponsoredBillingError::InvalidField("effective interval"));
+    }
+    request.ensure_unexpired(now_epoch)?;
     let existing_live: Option<String> = sqlx::query_scalar(
         "SELECT beneficiary_id FROM billing_sponsored_seats WHERE organization_id = $1 \
          AND beneficiary_id = $2 AND state IN ('pending','active','scheduled_removal') FOR UPDATE",

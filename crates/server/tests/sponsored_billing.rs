@@ -90,6 +90,13 @@ async fn named_seat_operation_is_idempotent_and_activates_after_paid_result() {
     tx.commit().await.expect("commit replay");
     assert_eq!(first.operation_id, replay.operation_id);
 
+    let mut tx = pool.begin().await.expect("begin late replay transaction");
+    let late_replay = begin_operation(&mut tx, &org_id, &owner, &request, 5_000_000_000)
+        .await
+        .expect("late replay keeps the original operation recoverable");
+    tx.commit().await.expect("commit late replay");
+    assert_eq!(first.operation_id, late_replay.operation_id);
+
     let mut tx = pool.begin().await.expect("begin checkout transaction");
     record_checkout(&mut tx, &first.operation_id, "https://stripe.test/checkout")
         .await
