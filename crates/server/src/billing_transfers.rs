@@ -35,6 +35,7 @@ impl TransferPayer {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferState {
+    AwaitingConsent,
     Pending,
     DestinationPrepared,
     DestinationPaid,
@@ -47,6 +48,7 @@ pub enum TransferState {
 impl TransferState {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::AwaitingConsent => "awaiting_consent",
             Self::Pending => "pending",
             Self::DestinationPrepared => "destination_prepared",
             Self::DestinationPaid => "destination_paid",
@@ -59,6 +61,7 @@ impl TransferState {
 
     fn parse(value: &str) -> Result<Self, TransferError> {
         match value {
+            "awaiting_consent" => Ok(Self::AwaitingConsent),
             "pending" => Ok(Self::Pending),
             "destination_prepared" => Ok(Self::DestinationPrepared),
             "destination_paid" => Ok(Self::DestinationPaid),
@@ -74,7 +77,8 @@ impl TransferState {
     fn is_live(self) -> bool {
         matches!(
             self,
-            Self::Pending
+            Self::AwaitingConsent
+                | Self::Pending
                 | Self::DestinationPrepared
                 | Self::DestinationPaid
                 | Self::SourceAdjustmentPending
@@ -282,6 +286,155 @@ pub async fn begin_transfer(
     now_epoch: i64,
 ) -> Result<BeginTransfer, TransferError> {
     request.validate_shape()?;
+    authorise_transfer_parties(tx, request).await?;
+    if let Some(existing) =
+        load_by_idempotency(tx, &request.actor_user_id, &request.idempotency_key).await?
+    {
+        if existing.request_hash != request.request_hash() {
+            return Err(TransferError::ResultConflict);
+        }
+        return Ok(BeginTransfer::AlreadyExists(existing));
+    }
+    request.validate_timing(now_epoch)?;
+    let live: Option<String> = sqlx::query_scalar(
+        "SELECT transfer_id FROM billing_transfer_intents WHERE beneficiary_id = $1 \
+         AND state IN ('awaiting_consent','pending','destination_prepared','destination_paid','source_adjustment_pending','unknown') \
+         FOR UPDATE",
+    )
+    .bind(&request.beneficiary_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if live.is_some() {
+        return Err(TransferError::AlreadyInProgress);
+    }
+    ensure_source_active(tx, request).await?;
+    ensure_destination_free(tx, request).await?;
+    let founding_award_id: Option<String> = sqlx::query_scalar(
+        "SELECT award_id FROM billing_founding_awards WHERE beneficiary_id = $1",
+    )
+    .bind(&request.beneficiary_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(award_id) = founding_award_id.as_deref() {
+        let award = founding_allocator::load_award(tx, award_id)
+            .await?
+            .ok_or(TransferError::CorruptState)?;
+        let (source_kind, source_id) = payer_identity(request, request.source_kind)?;
+        if award.payer_kind != source_kind || award.payer_id != source_id {
+            return Err(TransferError::FoundingPayerConflict);
+        }
+    }
+    let transfer_id = format!("transfer:{}", Uuid::new_v4());
+    let provider_key = format!(
+        "sotto-transfer:{}",
+        hex_digest(&Sha256::digest(transfer_id.as_bytes()))
+    );
+    let initial_state = if request.actor_user_id == request.counterparty_user_id {
+        TransferState::Pending
+    } else {
+        TransferState::AwaitingConsent
+    };
+    sqlx::query(
+        "INSERT INTO billing_transfer_intents \
+         (transfer_id, actor_user_id, counterparty_user_id, beneficiary_id, source_kind, source_organization_id, \
+          destination_kind, destination_organization_id, offer, quote_version, quote_expires_at_epoch, \
+          effective_from, effective_until, idempotency_key, request_hash, provider_idempotency_key, \
+          founding_award_id, state) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)",
+    )
+    .bind(&transfer_id)
+    .bind(&request.actor_user_id)
+    .bind(&request.counterparty_user_id)
+    .bind(&request.beneficiary_id)
+    .bind(request.source_kind.as_str())
+    .bind(request.source_organization_id.as_deref())
+    .bind(request.destination_kind.as_str())
+    .bind(request.destination_organization_id.as_deref())
+    .bind(request.offer.as_str())
+    .bind(request.quote_version)
+    .bind(request.quote_expires_at_epoch)
+    .bind(request.effective_from)
+    .bind(request.effective_until)
+    .bind(&request.idempotency_key)
+    .bind(request.request_hash())
+    .bind(provider_key)
+    .bind(founding_award_id)
+    .bind(initial_state.as_str())
+    .execute(&mut **tx)
+    .await?;
+    Ok(BeginTransfer::Created(
+        load_transfer(tx, &transfer_id).await?,
+    ))
+}
+
+/// Accept the counterparty's side of a two-party transfer. The actor may name the
+/// counterparty, but only that user can move the intent out of `awaiting_consent`.
+/// The authority and coverage checks are repeated while the same user and organisation
+/// rows are locked, so a stale invitation cannot authorise a transfer after either side
+/// has changed.
+pub async fn accept_transfer(
+    tx: &mut Transaction<'_, Postgres>,
+    transfer_id: &str,
+    user_id: &str,
+    now_epoch: i64,
+) -> Result<TransferIntent, TransferError> {
+    if user_id.trim().is_empty() {
+        return Err(TransferError::InvalidField("user_id"));
+    }
+    let invitation = load_transfer_snapshot(tx, transfer_id).await?;
+    if invitation.counterparty_user_id != user_id {
+        return Err(TransferError::Unauthorised);
+    }
+    if invitation.state != TransferState::AwaitingConsent
+        && invitation.state != TransferState::Pending
+    {
+        return Err(TransferError::InvalidTransition);
+    }
+    if invitation.state == TransferState::Pending {
+        return Ok(invitation);
+    }
+    let request = request_from_intent(&invitation);
+    authorise_transfer_parties(tx, &request).await?;
+    let current = load_transfer(tx, transfer_id).await?;
+    if current.counterparty_user_id != user_id {
+        return Err(TransferError::Unauthorised);
+    }
+    if current.state == TransferState::Pending {
+        return Ok(current);
+    }
+    if current.state != TransferState::AwaitingConsent {
+        return Err(TransferError::InvalidTransition);
+    }
+    let request = request_from_intent(&current);
+    request.validate_timing(now_epoch)?;
+    ensure_source_active(tx, &request).await?;
+    ensure_destination_free(tx, &request).await?;
+    if let Some(award_id) = current.founding_award_id.as_deref() {
+        let award = founding_allocator::load_award(tx, award_id)
+            .await?
+            .ok_or(TransferError::CorruptState)?;
+        let (source_kind, source_id) = payer_identity(&request, request.source_kind)?;
+        if award.payer_kind != source_kind || award.payer_id != source_id {
+            return Err(TransferError::FoundingPayerConflict);
+        }
+    }
+    let updated = sqlx::query(
+        "UPDATE billing_transfer_intents SET state = 'pending', updated_at = now() \
+         WHERE transfer_id = $1 AND state = 'awaiting_consent' RETURNING transfer_id",
+    )
+    .bind(transfer_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if updated.is_none() {
+        return Err(TransferError::InvalidTransition);
+    }
+    load_transfer(tx, transfer_id).await
+}
+
+async fn authorise_transfer_parties(
+    tx: &mut Transaction<'_, Postgres>,
+    request: &TransferRequest,
+) -> Result<(), TransferError> {
     let user_ids = [
         request.actor_user_id.as_str(),
         request.counterparty_user_id.as_str(),
@@ -350,81 +503,29 @@ pub async fn begin_transfer(
         &request.counterparty_user_id,
         &organization_authority,
     );
-    if !((actor_source && counterparty_destination) || (actor_destination && counterparty_source)) {
-        return Err(TransferError::Unauthorised);
+    if (actor_source && counterparty_destination) || (actor_destination && counterparty_source) {
+        Ok(())
+    } else {
+        Err(TransferError::Unauthorised)
     }
-    if let Some(existing) =
-        load_by_idempotency(tx, &request.actor_user_id, &request.idempotency_key).await?
-    {
-        if existing.request_hash != request.request_hash() {
-            return Err(TransferError::ResultConflict);
-        }
-        return Ok(BeginTransfer::AlreadyExists(existing));
+}
+
+fn request_from_intent(intent: &TransferIntent) -> TransferRequest {
+    TransferRequest {
+        actor_user_id: intent.actor_user_id.clone(),
+        counterparty_user_id: intent.counterparty_user_id.clone(),
+        beneficiary_id: intent.beneficiary_id.clone(),
+        source_kind: intent.source_kind,
+        source_organization_id: intent.source_organization_id.clone(),
+        destination_kind: intent.destination_kind,
+        destination_organization_id: intent.destination_organization_id.clone(),
+        offer: intent.offer,
+        quote_version: intent.quote_version,
+        quote_expires_at_epoch: intent.quote_expires_at_epoch,
+        effective_from: intent.effective_from,
+        effective_until: intent.effective_until,
+        idempotency_key: intent.idempotency_key.clone(),
     }
-    request.validate_timing(now_epoch)?;
-    let live: Option<String> = sqlx::query_scalar(
-        "SELECT transfer_id FROM billing_transfer_intents WHERE beneficiary_id = $1 \
-         AND state IN ('pending','destination_prepared','destination_paid','source_adjustment_pending','unknown') \
-         FOR UPDATE",
-    )
-    .bind(&request.beneficiary_id)
-    .fetch_optional(&mut **tx)
-    .await?;
-    if live.is_some() {
-        return Err(TransferError::AlreadyInProgress);
-    }
-    ensure_source_active(tx, request).await?;
-    ensure_destination_free(tx, request).await?;
-    let founding_award_id: Option<String> = sqlx::query_scalar(
-        "SELECT award_id FROM billing_founding_awards WHERE beneficiary_id = $1",
-    )
-    .bind(&request.beneficiary_id)
-    .fetch_optional(&mut **tx)
-    .await?;
-    if let Some(award_id) = founding_award_id.as_deref() {
-        let award = founding_allocator::load_award(tx, award_id)
-            .await?
-            .ok_or(TransferError::CorruptState)?;
-        let (source_kind, source_id) = payer_identity(request, request.source_kind)?;
-        if award.payer_kind != source_kind || award.payer_id != source_id {
-            return Err(TransferError::FoundingPayerConflict);
-        }
-    }
-    let transfer_id = format!("transfer:{}", Uuid::new_v4());
-    let provider_key = format!(
-        "sotto-transfer:{}",
-        hex_digest(&Sha256::digest(transfer_id.as_bytes()))
-    );
-    sqlx::query(
-        "INSERT INTO billing_transfer_intents \
-         (transfer_id, actor_user_id, counterparty_user_id, beneficiary_id, source_kind, source_organization_id, \
-          destination_kind, destination_organization_id, offer, quote_version, quote_expires_at_epoch, \
-          effective_from, effective_until, idempotency_key, request_hash, provider_idempotency_key, \
-          founding_award_id) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)",
-    )
-    .bind(&transfer_id)
-    .bind(&request.actor_user_id)
-    .bind(&request.counterparty_user_id)
-    .bind(&request.beneficiary_id)
-    .bind(request.source_kind.as_str())
-    .bind(request.source_organization_id.as_deref())
-    .bind(request.destination_kind.as_str())
-    .bind(request.destination_organization_id.as_deref())
-    .bind(request.offer.as_str())
-    .bind(request.quote_version)
-    .bind(request.quote_expires_at_epoch)
-    .bind(request.effective_from)
-    .bind(request.effective_until)
-    .bind(&request.idempotency_key)
-    .bind(request.request_hash())
-    .bind(provider_key)
-    .bind(founding_award_id)
-    .execute(&mut **tx)
-    .await?;
-    Ok(BeginTransfer::Created(
-        load_transfer(tx, &transfer_id).await?,
-    ))
 }
 
 pub async fn record_destination_prepared(
@@ -608,7 +709,7 @@ pub async fn mark_failed(
     }
     let updated = sqlx::query(
         "UPDATE billing_transfer_intents SET state = 'failed', result_code = $2, updated_at = now() \
-         WHERE transfer_id = $1 AND state IN ('pending','destination_prepared','unknown')",
+         WHERE transfer_id = $1 AND state IN ('awaiting_consent','pending','destination_prepared','unknown')",
     )
     .bind(transfer_id)
     .bind(result_code)
@@ -735,6 +836,17 @@ async fn load_transfer(
             .bind(transfer_id)
             .fetch_one(&mut **tx)
             .await?;
+    transfer_from_row(&row)
+}
+
+async fn load_transfer_snapshot(
+    tx: &mut Transaction<'_, Postgres>,
+    transfer_id: &str,
+) -> Result<TransferIntent, TransferError> {
+    let row = sqlx::query("SELECT * FROM billing_transfer_intents WHERE transfer_id = $1")
+        .bind(transfer_id)
+        .fetch_one(&mut **tx)
+        .await?;
     transfer_from_row(&row)
 }
 
@@ -890,6 +1002,7 @@ mod tests {
     #[test]
     fn only_live_transfer_states_block_a_second_transfer() {
         assert!(TransferState::Pending.is_live());
+        assert!(TransferState::AwaitingConsent.is_live());
         assert!(TransferState::SourceAdjustmentPending.is_live());
         assert!(!TransferState::Completed.is_live());
         assert!(!TransferState::Failed.is_live());

@@ -32,8 +32,8 @@ CREATE TABLE billing_transfer_intents (
     destination_payment_reference TEXT,
     source_adjustment_reference TEXT,
     founding_award_id TEXT,
-    state TEXT NOT NULL DEFAULT 'pending'
-        CHECK (state IN ('pending', 'destination_prepared', 'destination_paid',
+    state TEXT NOT NULL DEFAULT 'awaiting_consent'
+        CHECK (state IN ('awaiting_consent', 'pending', 'destination_prepared', 'destination_paid',
                          'source_adjustment_pending', 'completed', 'failed', 'unknown')),
     result_code TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -46,15 +46,15 @@ CREATE TABLE billing_transfer_intents (
     CHECK ((source_kind = 'personal') = (source_organization_id IS NULL)),
     CHECK ((destination_kind = 'personal') = (destination_organization_id IS NULL)),
     CHECK (source_kind <> destination_kind OR source_organization_id IS DISTINCT FROM destination_organization_id),
-    CHECK (state IN ('pending', 'destination_prepared', 'destination_paid', 'source_adjustment_pending', 'unknown')
+    CHECK (state IN ('awaiting_consent', 'pending', 'destination_prepared', 'destination_paid', 'source_adjustment_pending', 'unknown')
            OR result_code IS NOT NULL),
     UNIQUE (actor_user_id, idempotency_key)
 );
 
 CREATE UNIQUE INDEX billing_transfer_live_beneficiary_idx
     ON billing_transfer_intents (beneficiary_id)
-    WHERE state IN ('pending', 'destination_prepared', 'destination_paid', 'source_adjustment_pending', 'unknown');
+    WHERE state IN ('awaiting_consent', 'pending', 'destination_prepared', 'destination_paid', 'source_adjustment_pending', 'unknown');
 
 CREATE INDEX billing_transfer_recovery_idx
     ON billing_transfer_intents (state, updated_at)
-    WHERE state IN ('pending', 'destination_prepared', 'destination_paid', 'source_adjustment_pending', 'unknown');
+    WHERE state IN ('awaiting_consent', 'pending', 'destination_prepared', 'destination_paid', 'source_adjustment_pending', 'unknown');

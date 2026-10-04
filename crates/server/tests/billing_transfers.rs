@@ -7,9 +7,9 @@ use uuid::Uuid;
 
 use sotto_server::billing_catalogue::BillingOffer;
 use sotto_server::billing_transfers::{
-    begin_source_adjustment, begin_transfer, complete_source_adjustment, mark_failed,
-    record_destination_paid, record_destination_prepared, BeginTransfer, TransferError,
-    TransferPayer, TransferRequest, TransferState,
+    accept_transfer, begin_source_adjustment, begin_transfer, complete_source_adjustment,
+    mark_failed, record_destination_paid, record_destination_prepared, BeginTransfer,
+    TransferError, TransferPayer, TransferRequest, TransferState,
 };
 use sotto_server::db;
 
@@ -337,9 +337,27 @@ async fn concurrent_live_transfer_is_rejected_and_personal_actor_is_required() {
     let mut request = personal_to_sponsor_request(&user, &user, &org, "live-transfer");
     request.counterparty_user_id = other.clone();
     let mut tx = pool.begin().await.expect("begin first transfer");
-    begin_transfer(&mut tx, &request, 1_800_000_000)
+    let first = begin_transfer(&mut tx, &request, 1_800_000_000)
         .await
         .expect("create first transfer");
+    let first_id = match first {
+        BeginTransfer::Created(intent) => {
+            assert_eq!(intent.state, TransferState::AwaitingConsent);
+            intent.transfer_id
+        }
+        BeginTransfer::AlreadyExists(_) => panic!("first transfer unexpectedly existed"),
+    };
+    assert!(matches!(
+        record_destination_prepared(&mut tx, &first_id, "too-early", Some("sub_destination")).await,
+        Err(TransferError::ResultConflict)
+    ));
+    assert!(matches!(
+        accept_transfer(&mut tx, &first_id, &user, 1_800_000_000).await,
+        Err(TransferError::Unauthorised)
+    ));
+    accept_transfer(&mut tx, &first_id, &other, 1_800_000_000)
+        .await
+        .expect("counterparty accepts first transfer");
     tx.commit().await.expect("commit first transfer");
 
     let mut second = request.clone();
@@ -452,7 +470,14 @@ async fn sponsored_admin_and_beneficiary_can_authorise_leaving_a_sponsorship() {
         .await
         .expect("authorised sponsored-to-personal transfer");
     let transfer_id = match outcome {
-        BeginTransfer::Created(intent) => intent.transfer_id,
+        BeginTransfer::Created(intent) => {
+            assert_eq!(intent.state, TransferState::AwaitingConsent);
+            let transfer_id = intent.transfer_id;
+            accept_transfer(&mut tx, &transfer_id, &beneficiary, 1_800_000_000)
+                .await
+                .expect("beneficiary accepts sponsored transfer");
+            transfer_id
+        }
         BeginTransfer::AlreadyExists(_) => panic!("transfer unexpectedly existed"),
     };
     mark_failed(&mut tx, &transfer_id, "test_abort")
