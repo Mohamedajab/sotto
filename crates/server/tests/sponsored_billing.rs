@@ -12,7 +12,7 @@ use sotto_server::billing_catalogue::BillingOffer;
 use sotto_server::db;
 use sotto_server::sponsored_billing::{
     begin_operation, complete_paid_checkout, record_checkout, SponsoredBillingError,
-    SponsoredSeatAction, SponsoredSeatRequest,
+    SponsoredProviderEvidence, SponsoredSeatAction, SponsoredSeatRequest,
 };
 
 async fn pool() -> Option<PgPool> {
@@ -106,13 +106,27 @@ async fn named_seat_operation_is_idempotent_and_activates_after_paid_result() {
     assert_eq!(first.operation_id, late_replay.operation_id);
 
     let mut tx = pool.begin().await.expect("begin checkout transaction");
-    record_checkout(&mut tx, &first.operation_id, "https://stripe.test/checkout")
-        .await
-        .expect("record checkout");
+    record_checkout(
+        &mut tx,
+        &first.operation_id,
+        "https://stripe.test/checkout",
+        "cs_sponsored_test",
+        Some("cus_sponsored_test"),
+        Some("sub_sponsored_test"),
+    )
+    .await
+    .expect("record checkout");
     tx.commit().await.expect("commit checkout");
 
     let mut tx = pool.begin().await.expect("begin settlement transaction");
-    let settled = complete_paid_checkout(&mut tx, &first.operation_id, "pi_sponsored_test")
+    let evidence = SponsoredProviderEvidence {
+        customer_id: Some("cus_sponsored_test".into()),
+        subscription_id: "sub_sponsored_test".into(),
+        checkout_session_id: Some("cs_sponsored_test".into()),
+        payment_reference: "pi_sponsored_test".into(),
+        provider_item_id: Some("si_sponsored_test".into()),
+    };
+    let settled = complete_paid_checkout(&mut tx, &first.operation_id, &evidence)
         .await
         .expect("settle operation");
     tx.commit().await.expect("commit settlement");
@@ -124,9 +138,29 @@ async fn named_seat_operation_is_idempotent_and_activates_after_paid_result() {
             .await
             .expect("load seat state");
     assert_eq!(state, "active");
+    let provider_item: Option<String> = sqlx::query_scalar(
+        "SELECT provider_item_id FROM billing_sponsored_seats WHERE operation_id = $1",
+    )
+    .bind(&first.operation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load provider item");
+    assert_eq!(provider_item.as_deref(), Some("si_sponsored_test"));
+    let stored_provider_ids: (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT provider_customer_id, provider_subscription_id \
+         FROM billing_sponsored_subscriptions WHERE organization_id = $1",
+    )
+    .bind(&org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load sponsored subscription");
+    assert_eq!(stored_provider_ids.0.as_deref(), Some("cus_sponsored_test"));
+    assert_eq!(stored_provider_ids.1.as_deref(), Some("sub_sponsored_test"));
 
     let mut tx = pool.begin().await.expect("begin conflicting settlement");
-    let conflict = complete_paid_checkout(&mut tx, &first.operation_id, "pi_other")
+    let mut conflicting_evidence = evidence.clone();
+    conflicting_evidence.payment_reference = "pi_other".into();
+    let conflict = complete_paid_checkout(&mut tx, &first.operation_id, &conflicting_evidence)
         .await
         .expect_err("a different provider result must conflict");
     assert!(matches!(conflict, SponsoredBillingError::ResultConflict));
@@ -140,7 +174,7 @@ async fn named_seat_operation_is_idempotent_and_activates_after_paid_result() {
         .await
         .expect("mark organisation deleting");
     let mut tx = pool.begin().await.expect("begin deleting settlement");
-    let deletion_error = complete_paid_checkout(&mut tx, &first.operation_id, "pi_sponsored_test")
+    let deletion_error = complete_paid_checkout(&mut tx, &first.operation_id, &evidence)
         .await
         .expect_err("a deleting organisation cannot settle another webhook");
     assert!(matches!(
@@ -164,6 +198,16 @@ async fn named_seat_operation_is_idempotent_and_activates_after_paid_result() {
         .execute(&pool)
         .await
         .expect("delete operations");
+    sqlx::query("DELETE FROM billing_sponsored_subscription_items WHERE organization_id = $1")
+        .bind(&org_id)
+        .execute(&pool)
+        .await
+        .expect("delete subscription items");
+    sqlx::query("DELETE FROM billing_sponsored_subscriptions WHERE organization_id = $1")
+        .bind(&org_id)
+        .execute(&pool)
+        .await
+        .expect("delete sponsored subscription");
     sqlx::query("DELETE FROM organization_memberships WHERE org_id = $1")
         .bind(&org_id)
         .execute(&pool)

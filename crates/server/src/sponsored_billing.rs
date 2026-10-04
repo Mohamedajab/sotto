@@ -226,10 +226,33 @@ pub struct SponsoredOperation {
     pub effective_until: Option<i64>,
     pub request_hash: String,
     pub provider_idempotency_key: String,
+    pub provider_customer_id: Option<String>,
+    pub provider_subscription_id: Option<String>,
+    pub provider_checkout_session_id: Option<String>,
+    pub provider_payment_reference: Option<String>,
+    pub provider_item_id: Option<String>,
     pub provider_checkout_url: Option<String>,
     pub provider_operation_id: Option<String>,
     pub state: String,
     pub result_code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SponsoredProviderEvidence {
+    pub customer_id: Option<String>,
+    pub subscription_id: String,
+    pub checkout_session_id: Option<String>,
+    pub payment_reference: String,
+    pub provider_item_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SponsoredSubscription {
+    pub organization_id: String,
+    pub provider_customer_id: Option<String>,
+    pub provider_subscription_id: Option<String>,
+    pub provider_schedule_id: Option<String>,
+    pub status: String,
 }
 
 #[derive(Debug, Error)]
@@ -491,20 +514,6 @@ pub async fn begin_operation(
         .execute(&mut **tx)
         .await?;
     }
-    if matches!(
-        request.action,
-        SponsoredSeatAction::Remove | SponsoredSeatAction::Replace
-    ) {
-        sqlx::query(
-            "UPDATE billing_sponsored_seats SET state = 'scheduled_removal', effective_until = $3, updated_at = now() \
-             WHERE organization_id = $1 AND beneficiary_id = $2 AND state = 'active'",
-        )
-        .bind(organization_id)
-        .bind(&request.beneficiary_id)
-        .bind(request.effective_until.unwrap_or(request.effective_from))
-        .execute(&mut **tx)
-        .await?;
-    }
     load_operation(tx, &operation_id).await
 }
 
@@ -512,19 +521,67 @@ pub async fn record_checkout(
     tx: &mut Transaction<'_, Postgres>,
     operation_id: &str,
     checkout_url: &str,
+    checkout_session_id: &str,
+    customer_id: Option<&str>,
+    subscription_id: Option<&str>,
 ) -> Result<SponsoredOperation, SponsoredBillingError> {
     let updated = sqlx::query(
-        "UPDATE billing_sponsored_operations SET state = 'checkout_created', provider_checkout_url = $2, updated_at = now() \
+        "UPDATE billing_sponsored_operations SET state = 'checkout_created', provider_checkout_url = $2, \
+         provider_checkout_session_id = $3, provider_customer_id = $4, provider_subscription_id = $5, updated_at = now() \
          WHERE operation_id = $1 AND state = 'pending' RETURNING operation_id",
     )
     .bind(operation_id)
     .bind(checkout_url)
+    .bind(checkout_session_id)
+    .bind(customer_id)
+    .bind(subscription_id)
     .fetch_optional(&mut **tx)
     .await?;
     if updated.is_none() {
         let current = load_operation(tx, operation_id).await?;
         if current.state != "checkout_created"
             || current.provider_checkout_url.as_deref() != Some(checkout_url)
+            || current.provider_checkout_session_id.as_deref() != Some(checkout_session_id)
+        {
+            return Err(SponsoredBillingError::ResultConflict);
+        }
+    }
+    sqlx::query(
+        "UPDATE billing_sponsored_seats SET state = 'scheduled_removal', effective_until = operation.effective_until, updated_at = now() \
+         FROM billing_sponsored_operations AS operation \
+         WHERE operation.operation_id = $1 AND operation.action IN ('remove', 'replace') \
+           AND billing_sponsored_seats.organization_id = operation.organization_id \
+           AND billing_sponsored_seats.beneficiary_id = operation.beneficiary_id \
+           AND billing_sponsored_seats.state = 'active'",
+    )
+    .bind(operation_id)
+    .execute(&mut **tx)
+    .await?;
+    load_operation(tx, operation_id).await
+}
+
+pub async fn record_provider_update(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+    customer_id: Option<&str>,
+    subscription_id: &str,
+    provider_item_id: Option<&str>,
+) -> Result<SponsoredOperation, SponsoredBillingError> {
+    let updated = sqlx::query(
+        "UPDATE billing_sponsored_operations SET state = 'provider_pending', \
+         provider_customer_id = $2, provider_subscription_id = $3, provider_item_id = $4, updated_at = now() \
+         WHERE operation_id = $1 AND state = 'pending' RETURNING operation_id",
+    )
+    .bind(operation_id)
+    .bind(customer_id)
+    .bind(subscription_id)
+    .bind(provider_item_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if updated.is_none() {
+        let current = load_operation(tx, operation_id).await?;
+        if current.state != "provider_pending"
+            || current.provider_subscription_id.as_deref() != Some(subscription_id)
         {
             return Err(SponsoredBillingError::ResultConflict);
         }
@@ -532,10 +589,39 @@ pub async fn record_checkout(
     load_operation(tx, operation_id).await
 }
 
+pub async fn record_provider_item(
+    tx: &mut Transaction<'_, Postgres>,
+    organization_id: &str,
+    provider_item_id: &str,
+    provider_price_id: &str,
+    offer: BillingOffer,
+    quantity: i64,
+) -> Result<(), SponsoredBillingError> {
+    if provider_item_id.trim().is_empty() || provider_price_id.trim().is_empty() || quantity < 0 {
+        return Err(SponsoredBillingError::CorruptState);
+    }
+    sqlx::query(
+        "INSERT INTO billing_sponsored_subscription_items \
+         (subscription_item_id, organization_id, provider_item_id, provider_price_id, offer, quantity, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, now()) \
+         ON CONFLICT (organization_id, offer) DO UPDATE SET provider_item_id = EXCLUDED.provider_item_id, \
+           provider_price_id = EXCLUDED.provider_price_id, quantity = EXCLUDED.quantity, updated_at = now()",
+    )
+    .bind(format!("sponsored-item:{}", Uuid::new_v4()))
+    .bind(organization_id)
+    .bind(provider_item_id)
+    .bind(provider_price_id)
+    .bind(offer.as_str())
+    .bind(quantity)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 pub async fn complete_paid_checkout(
     tx: &mut Transaction<'_, Postgres>,
     operation_id: &str,
-    provider_operation_id: &str,
+    evidence: &SponsoredProviderEvidence,
 ) -> Result<SponsoredOperation, SponsoredBillingError> {
     let organization_id: String = sqlx::query_scalar(
         "SELECT organization_id FROM billing_sponsored_operations WHERE operation_id = $1",
@@ -552,27 +638,48 @@ pub async fn complete_paid_checkout(
         return Err(SponsoredBillingError::OrganisationNotActive);
     }
     let updated = sqlx::query(
-        "UPDATE billing_sponsored_operations SET state = 'active', provider_operation_id = $2, result_code = 'paid', updated_at = now() \
-         WHERE operation_id = $1 AND state = 'checkout_created' RETURNING operation_id",
+        "UPDATE billing_sponsored_operations SET state = 'active', provider_operation_id = $2, \
+         provider_payment_reference = $2, provider_customer_id = COALESCE($3, provider_customer_id), \
+         provider_subscription_id = $4, provider_checkout_session_id = COALESCE($5, provider_checkout_session_id), \
+         provider_item_id = COALESCE($6, provider_item_id), result_code = 'paid', updated_at = now() \
+         WHERE operation_id = $1 AND state IN ('checkout_created','provider_pending') RETURNING operation_id",
     )
     .bind(operation_id)
-    .bind(provider_operation_id)
+    .bind(&evidence.payment_reference)
+    .bind(evidence.customer_id.as_deref())
+    .bind(&evidence.subscription_id)
+    .bind(evidence.checkout_session_id.as_deref())
+    .bind(evidence.provider_item_id.as_deref())
     .fetch_optional(&mut **tx)
     .await?;
     if updated.is_none() {
         let current = load_operation(tx, operation_id).await?;
         if current.state != "active"
-            || current.provider_operation_id.as_deref() != Some(provider_operation_id)
+            || current.provider_payment_reference.as_deref()
+                != Some(evidence.payment_reference.as_str())
         {
             return Err(SponsoredBillingError::ResultConflict);
         }
         return Ok(current);
     }
     sqlx::query(
-        "UPDATE billing_sponsored_seats SET state = 'active', updated_at = now() \
+        "UPDATE billing_sponsored_seats SET state = 'active', provider_item_id = COALESCE($2, provider_item_id), updated_at = now() \
          WHERE operation_id = $1 AND state = 'pending'",
     )
     .bind(operation_id)
+    .bind(evidence.provider_item_id.as_deref())
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO billing_sponsored_subscriptions \
+         (organization_id, provider_customer_id, provider_subscription_id, status, updated_at) \
+         VALUES ($1, $2, $3, 'active', now()) \
+         ON CONFLICT (organization_id) DO UPDATE SET provider_customer_id = COALESCE(EXCLUDED.provider_customer_id, billing_sponsored_subscriptions.provider_customer_id), \
+           provider_subscription_id = EXCLUDED.provider_subscription_id, status = 'active', updated_at = now()",
+    )
+    .bind(&organization_id)
+    .bind(evidence.customer_id.as_deref())
+    .bind(&evidence.subscription_id)
     .execute(&mut **tx)
     .await?;
     load_operation(tx, operation_id).await
@@ -608,7 +715,7 @@ pub async fn cancel_failed_operation(
 ) -> Result<SponsoredOperation, SponsoredBillingError> {
     let updated = sqlx::query(
         "UPDATE billing_sponsored_operations SET state = 'failed', result_code = $2, updated_at = now() \
-         WHERE operation_id = $1 AND state IN ('pending','checkout_created','unknown') RETURNING operation_id",
+         WHERE operation_id = $1 AND state IN ('pending','checkout_created','provider_pending','unknown') RETURNING operation_id",
     )
     .bind(operation_id)
     .bind(result_code)
@@ -694,6 +801,11 @@ fn operation_from_row(
         effective_until: row.try_get("effective_until")?,
         request_hash: row.try_get("request_hash")?,
         provider_idempotency_key: row.try_get("provider_idempotency_key")?,
+        provider_customer_id: row.try_get("provider_customer_id")?,
+        provider_subscription_id: row.try_get("provider_subscription_id")?,
+        provider_checkout_session_id: row.try_get("provider_checkout_session_id")?,
+        provider_payment_reference: row.try_get("provider_payment_reference")?,
+        provider_item_id: row.try_get("provider_item_id")?,
         provider_checkout_url: row.try_get("provider_checkout_url")?,
         provider_operation_id: row.try_get("provider_operation_id")?,
         state: row.try_get("state")?,
