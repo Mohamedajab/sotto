@@ -170,6 +170,18 @@ impl Config {
             .map_err(|_| Error::Config("DATABASE_URL is not set".into()))?;
         let bind_addr = std::env::var("SOTTO_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
         let deployment_mode = DeploymentMode::from_env_result(std::env::var(DeploymentMode::ENV))?;
+        let stripe_variables_present = [
+            "STRIPE_API_KEY",
+            "STRIPE_WEBHOOK_SECRET",
+            "STRIPE_PRICE_ID",
+            "STRIPE_STANDARD_MONTHLY_PRICE_ID",
+            "STRIPE_STANDARD_ANNUAL_PRICE_ID",
+            "STRIPE_FOUNDING_MONTHLY_PRICE_ID",
+            "STRIPE_FOUNDING_ANNUAL_PRICE_ID",
+        ]
+        .into_iter()
+        .any(|name| env_nonempty(name).is_some());
+        validate_deployment_billing_boundary(deployment_mode, stripe_variables_present)?;
         let public_base_url =
             env_nonempty("SOTTO_PUBLIC_URL").unwrap_or_else(|| DEFAULT_PUBLIC_URL.to_string());
         let web_origin = env_nonempty("SOTTO_WEB_ORIGIN");
@@ -187,9 +199,8 @@ impl Config {
             _ => None,
         };
 
-        // Self-hosted deployments deliberately ignore all Stripe configuration. This keeps a
-        // copied .env file from turning a local instance into a hosted billing client or making
-        // ordinary self-hosted operations depend on Sotto's credentials.
+        // The boundary above rejects Stripe credentials on self-hosted deployments before any
+        // billing state is built. Cloud remains the only mode that can construct a provider.
         let billing_price_catalogue = if deployment_mode == DeploymentMode::Cloud {
             billing_price_catalogue_from_env()?
         } else {
@@ -275,6 +286,18 @@ const BILLING_CATALOGUE_ENV: [&str; 4] = [
     "STRIPE_FOUNDING_MONTHLY_PRICE_ID",
     "STRIPE_FOUNDING_ANNUAL_PRICE_ID",
 ];
+
+fn validate_deployment_billing_boundary(
+    deployment_mode: DeploymentMode,
+    stripe_variables_present: bool,
+) -> Result<()> {
+    if deployment_mode == DeploymentMode::SelfHosted && stripe_variables_present {
+        return Err(Error::Config(
+            "Stripe configuration requires SOTTO_DEPLOYMENT_MODE=cloud".into(),
+        ));
+    }
+    Ok(())
+}
 
 fn billing_price_catalogue_from_env() -> Result<Option<BillingPriceIds>> {
     let values = BILLING_CATALOGUE_ENV
@@ -398,7 +421,8 @@ mod tests {
     use super::{
         billing_price_catalogue_from_values, billing_return_url, feature_flag_is_enabled,
         organisation_deletion_retention_from_env_result, organisation_deletion_worker_is_enabled,
-        parse_organisation_deletion_retention_days, telemetry_ping_enabled, DeploymentMode,
+        parse_organisation_deletion_retention_days, telemetry_ping_enabled,
+        validate_deployment_billing_boundary, DeploymentMode,
         DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS, MAX_ORGANISATION_DELETION_RETENTION_DAYS,
     };
 
@@ -431,6 +455,13 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn stripe_configuration_requires_cloud_mode() {
+        assert!(validate_deployment_billing_boundary(DeploymentMode::SelfHosted, true).is_err());
+        assert!(validate_deployment_billing_boundary(DeploymentMode::SelfHosted, false).is_ok());
+        assert!(validate_deployment_billing_boundary(DeploymentMode::Cloud, true).is_ok());
     }
 
     #[test]
