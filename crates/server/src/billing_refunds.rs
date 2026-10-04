@@ -113,6 +113,9 @@ impl CorrectionRequest {
                 return Err(BillingRefundError::InvalidField(field));
             }
         }
+        if !self.payment_reference.starts_with("pi_") {
+            return Err(BillingRefundError::InvalidField("payment_reference"));
+        }
         if (self.payer_kind == PayerKind::Personal) != self.organization_id.is_none() {
             return Err(BillingRefundError::InvalidField("payer boundary"));
         }
@@ -120,6 +123,9 @@ impl CorrectionRequest {
             return Err(BillingRefundError::InvalidField("amount_pence"));
         }
         if self.full_refund_requested && self.amount_pence.is_some() {
+            return Err(BillingRefundError::InvalidField("amount_pence"));
+        }
+        if !self.full_refund_requested && self.amount_pence.is_none() {
             return Err(BillingRefundError::InvalidField("amount_pence"));
         }
         Ok(())
@@ -253,6 +259,9 @@ pub async fn confirm_early_termination(
     let current = load_request_for_update(tx, request_id).await?;
     if current.requester_user_id != requester_user_id {
         return Err(BillingRefundError::Unauthorised);
+    }
+    if current.payer_kind != PayerKind::Personal {
+        return Err(BillingRefundError::InvalidTransition);
     }
     if !current.full_refund_requested {
         return Err(BillingRefundError::InvalidTransition);

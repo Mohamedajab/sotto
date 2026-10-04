@@ -418,6 +418,20 @@ pub trait SubscriptionProvider: Send + Sync {
         self.cancel_subscription(subscription_id, idempotency_key, user_id)
             .await
     }
+
+    /// Immediately terminate a personal subscription after an approved full refund. The
+    /// correction workflow keeps its request in `provider_pending` until this step and the
+    /// refund both succeed, so a retry can safely repeat the same provider idempotency key.
+    async fn terminate_personal_subscription(
+        &self,
+        _subscription_id: &str,
+        _idempotency_key: &str,
+        _user_id: &str,
+    ) -> ProviderResult<SubscriptionObservation> {
+        Err(ProviderError::unsupported(
+            "personal_subscription_termination",
+        ))
+    }
 }
 
 /// Compatibility name for callers that still refer to the pre-provider billing trait.
@@ -856,7 +870,7 @@ impl SubscriptionProvider for StripeBilling {
         amount_pence: Option<i64>,
         idempotency_key: &str,
     ) -> ProviderResult<RefundReceipt> {
-        if payment_reference.trim().is_empty() || idempotency_key.trim().is_empty() {
+        if !payment_reference.starts_with("pi_") || idempotency_key.trim().is_empty() {
             return Err(ProviderError::malformed_response());
         }
         if amount_pence.is_some_and(|amount| amount <= 0) {
@@ -958,6 +972,38 @@ impl SubscriptionProvider for StripeBilling {
             &response,
             subscription_id,
         )?))
+    }
+
+    async fn terminate_personal_subscription(
+        &self,
+        subscription_id: &str,
+        idempotency_key: &str,
+        user_id: &str,
+    ) -> ProviderResult<SubscriptionObservation> {
+        let current = self.get_subscription(subscription_id).await?;
+        let SubscriptionObservation::Current(snapshot) = current else {
+            return Ok(current);
+        };
+        if !matches!(snapshot.status.purge_gate(), PurgeGate::Blocking) {
+            return Ok(SubscriptionObservation::Current(snapshot));
+        }
+        let form = vec![
+            ("invoice_now".into(), "false".into()),
+            ("prorate".into(), "false".into()),
+            (
+                "cancellation_details[comment]".into(),
+                format!("Sotto personal billing correction {user_id}"),
+            ),
+        ];
+        let cancellation = stripe_delete(
+            &self.api_key,
+            &format!("subscriptions/{subscription_id}"),
+            idempotency_key,
+            &form,
+        )
+        .await;
+        let fresh = self.get_subscription(subscription_id).await;
+        cancellation_outcome(cancellation.map(|_| ()), fresh)
     }
 }
 
@@ -2095,6 +2141,17 @@ async fn operator_process_refund(
         return Ok(Json(personal_refund_view(current)));
     }
     let provider_key = format!("sotto-refund:{request_id}");
+    if current.payer_kind == billing_refunds::PayerKind::Personal && !current.preserve_paid_term {
+        billing
+            .provider
+            .terminate_personal_subscription(
+                &current.subscription_id,
+                &format!("{provider_key}:terminate"),
+                &current.beneficiary_id,
+            )
+            .await
+            .map_err(ProviderError::into_error)?;
+    }
     let receipt = billing
         .provider
         .create_refund(

@@ -115,6 +115,18 @@ async fn correction_replays_preserve_terms_until_confirmed_refund_and_early_end(
     seed_personal_account(&pool, &user, &operation).await;
 
     let mut tx = pool.begin().await.expect("begin correction");
+    let mut missing_amount = request(&user, "missing-amount", false);
+    missing_amount.amount_pence = None;
+    assert!(matches!(
+        create_request(&mut tx, &missing_amount).await,
+        Err(BillingRefundError::InvalidField("amount_pence"))
+    ));
+    let mut invalid_reference = request(&user, "invalid-reference", false);
+    invalid_reference.payment_reference = "cs_session".into();
+    assert!(matches!(
+        create_request(&mut tx, &invalid_reference).await,
+        Err(BillingRefundError::InvalidField("payment_reference"))
+    ));
     let (disposition, partial) = create_request(&mut tx, &request(&user, "partial", false))
         .await
         .expect("create partial correction");
