@@ -4,9 +4,9 @@ use sqlx::{postgres::PgConnectOptions, PgPool};
 use uuid::Uuid;
 
 use sotto_server::billing_refunds::{
-    begin_provider_refund, confirm_early_termination, create_request, record_provider_refund,
-    review_request, BillingRefundError, CorrectionReason, CorrectionRequest, CorrectionState,
-    PayerKind, RequestDisposition,
+    begin_provider_refund, confirm_early_termination, create_request, record_provider_pending,
+    record_provider_refund, review_request, BillingRefundError, CorrectionReason,
+    CorrectionRequest, CorrectionState, PayerKind, RequestDisposition,
 };
 use sotto_server::db;
 
@@ -134,9 +134,22 @@ async fn correction_replays_preserve_terms_until_confirmed_refund_and_early_end(
     begin_provider_refund(&mut tx, &partial.request_id)
         .await
         .expect("start partial refund");
-    let partial = record_provider_refund(&mut tx, &partial.request_id, "re_partial", true, None)
+    record_provider_pending(&mut tx, &partial.request_id, "re_partial_pending")
         .await
-        .expect("record partial refund");
+        .expect("record pending partial refund");
+    assert!(matches!(
+        record_provider_pending(&mut tx, &partial.request_id, "re_other_pending").await,
+        Err(BillingRefundError::RequestConflict)
+    ));
+    let partial = record_provider_refund(
+        &mut tx,
+        &partial.request_id,
+        "re_partial_pending",
+        true,
+        None,
+    )
+    .await
+    .expect("record partial refund");
     assert_eq!(partial.state, CorrectionState::Refunded);
     tx.commit().await.expect("commit partial correction");
     let paid_through: i64 = sqlx::query_scalar(

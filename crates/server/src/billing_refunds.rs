@@ -343,15 +343,14 @@ pub async fn record_provider_pending(
         return Err(BillingRefundError::InvalidField("provider_refund_id"));
     }
     let current = load_request_for_update(tx, request_id).await?;
-    if !matches!(
-        current.state,
-        CorrectionState::Approved | CorrectionState::ProviderPending
-    ) {
-        if current.state == CorrectionState::ProviderPending
-            && current.provider_refund_id.as_deref() == Some(provider_refund_id)
-        {
+    if current.state == CorrectionState::ProviderPending {
+        if current.provider_refund_id.as_deref() == Some(provider_refund_id) {
             return Ok(current);
         }
+        if current.provider_refund_id.is_some() {
+            return Err(BillingRefundError::RequestConflict);
+        }
+    } else if current.state != CorrectionState::Approved {
         return Err(BillingRefundError::InvalidTransition);
     }
     sqlx::query(
@@ -379,6 +378,14 @@ pub async fn record_provider_refund(
         return Err(BillingRefundError::InvalidField("result_code"));
     }
     let current = load_request_for_update(tx, request_id).await?;
+    if current.state == CorrectionState::ProviderPending
+        && current
+            .provider_refund_id
+            .as_deref()
+            .is_some_and(|existing| existing != provider_refund_id)
+    {
+        return Err(BillingRefundError::RequestConflict);
+    }
     let target_state = if succeeded {
         CorrectionState::Refunded
     } else {
