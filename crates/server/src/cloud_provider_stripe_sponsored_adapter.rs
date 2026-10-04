@@ -3,7 +3,7 @@
 //! Sponsored invoices cover several named beneficiaries at once, while the reconciliation
 //! boundary publishes one beneficiary's registered source set at a time.  This module is the
 //! narrow, provider-specific seam between those shapes.  It consumes only the authenticated,
-//! composed candidate and a durable collection ticket; it does not read Stripe or Postgres and
+//! composed candidates and a durable collection ticket; it does not read Stripe or Postgres and
 //! it does not start a refresh job.
 
 #![allow(dead_code)]
@@ -19,16 +19,16 @@ use crate::cloud_provider_stripe_sponsored::SponsoredCoverageCandidate;
 
 /// Build the provider-neutral collection for the beneficiary captured by a ticket.
 ///
-/// The candidate can contain several beneficiaries.  Only observations whose source belongs to
-/// the ticket beneficiary are returned, and the ticket's source set must match that beneficiary's
-/// composed sources exactly.  This prevents a grouped invoice from publishing a sibling's facts
-/// into the current projection or from silently publishing an incomplete source batch.
+/// Each candidate may cover several beneficiaries, and a beneficiary may have sources on several
+/// invoices. Only observations whose source belongs to the ticket beneficiary are returned. The
+/// candidates must collectively cover the ticket's complete source set exactly. This prevents a
+/// grouped invoice from publishing a sibling's facts or from silently publishing an incomplete
+/// source batch.
 pub(crate) fn collection_for_ticket(
     context: &ProviderContext,
     ticket: &CollectionTicket,
-    candidate: &SponsoredCoverageCandidate,
+    candidates: &[&SponsoredCoverageCandidate],
 ) -> Result<VerifiedCollection, SponsoredAdapterError> {
-    validate_context(context, ticket, candidate)?;
     if ticket.status != CollectionStatus::Pending || ticket.completed_revision.is_some() {
         return Err(SponsoredAdapterError::InvalidTicket);
     }
@@ -46,80 +46,94 @@ pub(crate) fn collection_for_ticket(
         return Err(SponsoredAdapterError::InvalidTicket);
     }
 
-    let mut beneficiary_sources = BTreeSet::<String>::new();
-    let mut allocation_references = BTreeMap::new();
-    for coverage in candidate.person_coverages() {
-        if coverage.beneficiary_id == ticket.beneficiary_id {
-            beneficiary_sources.extend(
-                coverage
-                    .paid_intervals
-                    .into_iter()
-                    .map(|interval| interval.source_id),
-            );
-        }
+    if candidates.is_empty() {
+        return Err(SponsoredAdapterError::SourceSetMismatch);
     }
-    if let Some(beneficiary) = candidate
-        .beneficiaries()
-        .iter()
-        .find(|beneficiary| beneficiary.beneficiary_id() == ticket.beneficiary_id)
-    {
+
+    let mut observations_by_source = BTreeMap::new();
+    let mut candidate_references = BTreeSet::new();
+    for candidate in candidates {
+        validate_context(context, ticket, candidate)?;
+        candidate_references.insert(candidate.semantic_reference().to_owned());
+
+        let Some(beneficiary) = candidate
+            .beneficiaries()
+            .iter()
+            .find(|beneficiary| beneficiary.beneficiary_id() == ticket.beneficiary_id)
+        else {
+            continue;
+        };
+
+        let mut allocation_references = BTreeMap::new();
         for term in beneficiary.paid_terms() {
             let source_id = term.interval().source_id.clone();
-            if allocation_references
-                .insert(source_id, term.allocation_reference().to_owned())
+            if !expected_sources.contains(source_id.as_str()) {
+                continue;
+            }
+            if let Some(existing) = allocation_references
+                .insert(source_id.clone(), term.allocation_reference().to_owned())
+            {
+                if existing != term.allocation_reference() {
+                    return Err(SponsoredAdapterError::AllocationReferenceMismatch);
+                }
+            }
+        }
+
+        let candidate_observations = candidate.source_observations();
+        for (source_id, allocation_reference) in allocation_references {
+            let binding = ticket
+                .source_bindings
+                .iter()
+                .find(|binding| binding.source_id == source_id)
+                .ok_or(SponsoredAdapterError::MissingObservation)?;
+            if allocation_reference != binding.external_allocation_reference {
+                return Err(SponsoredAdapterError::AllocationReferenceMismatch);
+            }
+            let observation = candidate_observations
+                .iter()
+                .find(|observation| observation_source_id(observation) == source_id)
+                .cloned()
+                .ok_or(SponsoredAdapterError::MissingObservation)?;
+            if observations_by_source
+                .insert(source_id, observation)
                 .is_some()
             {
                 return Err(SponsoredAdapterError::DuplicateObservation);
             }
         }
     }
-    if beneficiary_sources
-        != expected_sources
-            .iter()
-            .map(|source_id| (*source_id).to_owned())
-            .collect::<BTreeSet<_>>()
-    {
+
+    if observations_by_source.len() != expected_sources.len() {
         return Err(SponsoredAdapterError::SourceSetMismatch);
     }
 
-    let mut observations_by_source = BTreeMap::new();
-    for observation in candidate.source_observations() {
-        let source_id = match &observation {
-            SourceObservation::Complete { source_id, .. }
-            | SourceObservation::Unavailable { source_id, .. } => source_id,
-        };
-        if observations_by_source
-            .insert(source_id.clone(), observation)
-            .is_some()
-        {
-            return Err(SponsoredAdapterError::DuplicateObservation);
-        }
-    }
-
-    let mut observations = Vec::with_capacity(expected_sources.len());
-    for source_id in expected_sources {
-        let binding = ticket
-            .source_bindings
-            .iter()
-            .find(|binding| binding.source_id == source_id)
-            .ok_or(SponsoredAdapterError::MissingObservation)?;
-        if allocation_references.get(source_id) != Some(&binding.external_allocation_reference) {
-            return Err(SponsoredAdapterError::AllocationReferenceMismatch);
-        }
-        let observation = observations_by_source
-            .remove(source_id)
-            .ok_or(SponsoredAdapterError::MissingObservation)?;
-        observations.push(observation);
-    }
+    let observations = expected_sources
+        .iter()
+        .map(|source_id| {
+            observations_by_source
+                .remove(*source_id)
+                .ok_or(SponsoredAdapterError::MissingObservation)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(VerifiedCollection {
         aggregate_evidence_reference: format!(
             "stripe-sponsored-collection-v1:{}:{}",
-            candidate.semantic_reference(),
+            candidate_references
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(","),
             ticket.beneficiary_id
         ),
         observations,
     })
+}
+
+fn observation_source_id(observation: &SourceObservation) -> &str {
+    match observation {
+        SourceObservation::Complete { source_id, .. }
+        | SourceObservation::Unavailable { source_id, .. } => source_id,
+    }
 }
 
 fn validate_context(
@@ -261,6 +275,59 @@ mod tests {
         candidate
     }
 
+    fn single_source_candidate(
+        source_id: &str,
+        allocation_reference: &str,
+        beneficiary_id: &str,
+        invoice_id: &str,
+    ) -> SponsoredCoverageCandidate {
+        let manifest = SponsoredAllocationManifest::new(
+            "acct_test",
+            ProviderEnvironment::Test,
+            "cus_1",
+            "sub_1",
+            vec![SponsoredAllocationInterval::new(
+                source_id,
+                allocation_reference,
+                beneficiary_id,
+                "item_1",
+                "price_standard_month",
+                0,
+                None,
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        let settlement = SponsoredInvoiceSettlement::new(
+            invoice_id,
+            "cus_1",
+            "sub_1",
+            100,
+            200,
+            "gbp",
+            100,
+            100,
+            format!("event_{invoice_id}"),
+            vec![SponsoredInvoiceLine::new(
+                format!("line_{invoice_id}"),
+                "item_1",
+                "price_standard_month",
+                100,
+                200,
+                1,
+                false,
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        let SponsoredCoverageResult::Candidate(candidate) =
+            compose_sponsored_coverage(&config(), &manifest, &settlement).unwrap()
+        else {
+            panic!("expected sponsored candidate")
+        };
+        candidate
+    }
+
     fn ticket(source_id: &str, beneficiary_id: &str) -> CollectionTicket {
         CollectionTicket {
             beneficiary_id: beneficiary_id.into(),
@@ -284,6 +351,18 @@ mod tests {
         }
     }
 
+    fn multi_source_ticket() -> CollectionTicket {
+        let mut ticket = ticket("source_a", "user_1");
+        ticket.source_bindings.push(SourceBinding {
+            beneficiary_id: "user_1".into(),
+            source_id: "source_b".into(),
+            provider_namespace: STRIPE_NAMESPACE.into(),
+            external_allocation_reference: "allocation_b".into(),
+            ownership_evidence_reference: "ownership".into(),
+        });
+        ticket
+    }
+
     fn context() -> ProviderContext {
         ProviderContext::new(STRIPE_NAMESPACE, "acct_test", ProviderEnvironment::Test).unwrap()
     }
@@ -291,7 +370,8 @@ mod tests {
     #[test]
     fn grouped_candidate_is_reduced_to_the_ticket_beneficiary() {
         let collection =
-            collection_for_ticket(&context(), &ticket("source_a", "user_1"), &candidate()).unwrap();
+            collection_for_ticket(&context(), &ticket("source_a", "user_1"), &[&candidate()])
+                .unwrap();
         assert_eq!(collection.observations.len(), 1);
         let SourceObservation::Complete { source_id, .. } = &collection.observations[0] else {
             panic!("expected complete observation")
@@ -304,16 +384,34 @@ mod tests {
 
     #[test]
     fn sibling_source_cannot_be_published_into_the_ticket() {
-        let error = collection_for_ticket(&context(), &ticket("source_b", "user_1"), &candidate())
-            .unwrap_err();
+        let error =
+            collection_for_ticket(&context(), &ticket("source_b", "user_1"), &[&candidate()])
+                .unwrap_err();
         assert_eq!(error, SponsoredAdapterError::SourceSetMismatch);
+    }
+
+    #[test]
+    fn separate_invoice_candidates_can_cover_all_registered_sources() {
+        let first = single_source_candidate("source_a", "allocation_a", "user_1", "in_a");
+        let second = single_source_candidate("source_b", "allocation_b", "user_1", "in_b");
+        let collection =
+            collection_for_ticket(&context(), &multi_source_ticket(), &[&first, &second]).unwrap();
+        assert_eq!(collection.observations.len(), 2);
+        assert_eq!(
+            collection
+                .observations
+                .iter()
+                .map(observation_source_id)
+                .collect::<Vec<_>>(),
+            vec!["source_a", "source_b"]
+        );
     }
 
     #[test]
     fn allocation_reference_must_match_the_ticket_binding() {
         let mut ticket = ticket("source_a", "user_1");
         ticket.source_bindings[0].external_allocation_reference = "allocation_forged".into();
-        let error = collection_for_ticket(&context(), &ticket, &candidate()).unwrap_err();
+        let error = collection_for_ticket(&context(), &ticket, &[&candidate()]).unwrap_err();
         assert_eq!(error, SponsoredAdapterError::AllocationReferenceMismatch);
     }
 
@@ -322,8 +420,12 @@ mod tests {
         let mut wrong_context = context();
         wrong_context.account_id = "acct_other".into();
         assert_eq!(
-            collection_for_ticket(&wrong_context, &ticket("source_a", "user_1"), &candidate())
-                .unwrap_err(),
+            collection_for_ticket(
+                &wrong_context,
+                &ticket("source_a", "user_1"),
+                &[&candidate()],
+            )
+            .unwrap_err(),
             SponsoredAdapterError::ContextMismatch
         );
     }
@@ -333,14 +435,14 @@ mod tests {
         let mut invalid_epoch = ticket("source_a", "user_1");
         invalid_epoch.collection_epoch = 0;
         assert_eq!(
-            collection_for_ticket(&context(), &invalid_epoch, &candidate()).unwrap_err(),
+            collection_for_ticket(&context(), &invalid_epoch, &[&candidate()]).unwrap_err(),
             SponsoredAdapterError::InvalidTicket
         );
 
         let mut invalid_revision = ticket("source_a", "user_1");
         invalid_revision.expected_projection_revision = Some(0);
         assert_eq!(
-            collection_for_ticket(&context(), &invalid_revision, &candidate()).unwrap_err(),
+            collection_for_ticket(&context(), &invalid_revision, &[&candidate()]).unwrap_err(),
             SponsoredAdapterError::InvalidTicket
         );
     }
