@@ -106,18 +106,28 @@ describe("VaultView selection loading", () => {
     await screen.findByRole("button", { name: "Alpha" });
 
     const search = screen.getByRole("searchbox", { name: "Search secret names" });
+    const resultStatus = screen.getByRole("status", { name: "Secret search results" });
+    expect(resultStatus).toHaveTextContent("2 secret names available.");
+    search.focus();
     fireEvent.change(search, { target: { value: "ALP" } });
     expect(screen.getByRole("button", { name: "Alpha" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Beta" })).toBeNull();
+    expect(resultStatus).toHaveTextContent("1 secret name matches this search.");
+    expect(search).toHaveFocus();
     expect(api.fetchSecrets).toHaveBeenCalledTimes(1);
+    expect(vault.decryptSecretValue).not.toHaveBeenCalled();
 
     fireEvent.change(search, { target: { value: "missing" } });
-    expect(screen.getByText("No secret names match this search.")).toBeTruthy();
+    expect(resultStatus).toHaveTextContent("No secret names match this search.");
+    expect(search).toHaveFocus();
 
     fireEvent.change(search, { target: { value: "" } });
     expect(screen.getByRole("button", { name: "Alpha" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Beta" })).toBeInTheDocument();
+    expect(resultStatus).toHaveTextContent("2 secret names available.");
+    expect(search).toHaveFocus();
     expect(api.fetchSecrets).toHaveBeenCalledTimes(1);
+    expect(vault.decryptSecretValue).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("button", { name: "env-b" }));
     await screen.findByRole("button", { name: "Gamma" });
@@ -134,6 +144,7 @@ describe("VaultView selection loading", () => {
 
     expect(await screen.findByText("No secrets in this environment.")).toBeInTheDocument();
     expect(screen.queryByRole("searchbox", { name: "Search secret names" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("status", { name: "Secret search results" })).not.toBeInTheDocument();
   });
 
   it("keeps environments from the latest project when requests resolve out of order", async () => {
