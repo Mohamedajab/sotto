@@ -127,6 +127,12 @@ impl TransferRequest {
         if self.quote_version < 1 {
             return Err(TransferError::InvalidField("quote_version"));
         }
+        if self.quote_expires_at_epoch <= 0 {
+            return Err(TransferError::InvalidField("quote_expires_at_epoch"));
+        }
+        if self.effective_from < 0 || self.effective_from > self.quote_expires_at_epoch {
+            return Err(TransferError::InvalidField("effective_from"));
+        }
         Ok(())
     }
 
@@ -752,6 +758,9 @@ mod tests {
         assert!(invalid.validate(1_000).is_err());
         let mut invalid = request();
         invalid.effective_from = 900;
+        assert!(invalid.validate(1_000).is_err());
+        let mut invalid = request();
+        invalid.effective_from = 2_001;
         assert!(invalid.validate(1_000).is_err());
     }
 
