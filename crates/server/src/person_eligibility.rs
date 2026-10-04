@@ -231,7 +231,10 @@ async fn get_eligibility(
 
     let view = evaluate_input(&EligibilityInput {
         deployment_mode: state.deployment_mode,
-        billing_available: state.billing.is_some(),
+        billing_available: state
+            .billing
+            .as_ref()
+            .is_some_and(|billing| billing.price_catalogue().is_some()),
         account_initialized,
         personal_billing_state: personal.as_ref().map(|account| account.state),
         coverage,
