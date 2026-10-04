@@ -1299,7 +1299,6 @@ async fn sponsored_checkout(
             &state.pool,
             &org_id,
             catalogue,
-            &operation,
             sponsored_billing::current_epoch(),
         )
         .await?;
@@ -1450,7 +1449,6 @@ async fn sponsored_provider_phases(
     pool: &sqlx::PgPool,
     organization_id: &str,
     catalogue: &BillingPriceIds,
-    operation: &sponsored_billing::SponsoredOperation,
     now_epoch: i64,
 ) -> Result<Vec<SponsoredSubscriptionPhase>> {
     let mut rows: Vec<(String, String, i64, Option<i64>)> = sqlx::query_as(
@@ -1463,16 +1461,22 @@ async fn sponsored_provider_phases(
     .fetch_all(pool)
     .await?;
 
-    // The removal/replacement row is not marked scheduled_removal until the provider accepts the
-    // schedule. Apply the pending operation in memory so the phases sent to Stripe are atomic
-    // with the operation the caller just requested.
-    if matches!(
-        operation.action,
-        SponsoredSeatAction::Remove | SponsoredSeatAction::Replace
-    ) {
+    // Removal and replacement rows are not marked scheduled_removal until the provider accepts
+    // their schedule. Apply every still-live operation in memory so a second mutation cannot
+    // rebuild Stripe's schedule without an earlier pending change.
+    let pending_changes: Vec<(String, String, Option<i64>)> = sqlx::query_as(
+        "SELECT beneficiary_id, action, effective_until \
+         FROM billing_sponsored_operations \
+         WHERE organization_id = $1 AND state IN ('pending', 'checkout_created', 'provider_pending') \
+           AND action IN ('remove', 'replace') ORDER BY created_at",
+    )
+    .bind(organization_id)
+    .fetch_all(pool)
+    .await?;
+    for (beneficiary_id, _, effective_until) in pending_changes {
         for row in &mut rows {
-            if row.0 == operation.beneficiary_id {
-                row.3 = operation.effective_until;
+            if row.0 == beneficiary_id {
+                row.3 = effective_until;
             }
         }
     }
