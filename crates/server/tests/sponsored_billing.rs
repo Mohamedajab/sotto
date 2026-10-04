@@ -11,8 +11,8 @@ use uuid::Uuid;
 use sotto_server::billing_catalogue::BillingOffer;
 use sotto_server::db;
 use sotto_server::sponsored_billing::{
-    begin_operation, complete_paid_checkout, record_checkout, SponsoredSeatAction,
-    SponsoredSeatRequest,
+    begin_operation, complete_paid_checkout, record_checkout, SponsoredBillingError,
+    SponsoredSeatAction, SponsoredSeatRequest,
 };
 
 async fn pool() -> Option<PgPool> {
@@ -124,6 +124,35 @@ async fn named_seat_operation_is_idempotent_and_activates_after_paid_result() {
             .await
             .expect("load seat state");
     assert_eq!(state, "active");
+
+    let mut tx = pool.begin().await.expect("begin conflicting settlement");
+    let conflict = complete_paid_checkout(&mut tx, &first.operation_id, "pi_other")
+        .await
+        .expect_err("a different provider result must conflict");
+    assert!(matches!(conflict, SponsoredBillingError::ResultConflict));
+    tx.rollback()
+        .await
+        .expect("rollback conflicting settlement");
+
+    sqlx::query("UPDATE organizations SET lifecycle_state = 'deleting' WHERE id = $1")
+        .bind(&org_id)
+        .execute(&pool)
+        .await
+        .expect("mark organisation deleting");
+    let mut tx = pool.begin().await.expect("begin deleting settlement");
+    let deletion_error = complete_paid_checkout(&mut tx, &first.operation_id, "pi_sponsored_test")
+        .await
+        .expect_err("a deleting organisation cannot settle another webhook");
+    assert!(matches!(
+        deletion_error,
+        SponsoredBillingError::OrganisationNotActive
+    ));
+    tx.rollback().await.expect("rollback deleting settlement");
+    sqlx::query("UPDATE organizations SET lifecycle_state = 'active' WHERE id = $1")
+        .bind(&org_id)
+        .execute(&pool)
+        .await
+        .expect("restore organisation lifecycle");
 
     sqlx::query("DELETE FROM billing_sponsored_seats WHERE organization_id = $1")
         .bind(&org_id)
