@@ -269,25 +269,18 @@ pub trait SubscriptionProvider: Send + Sync {
     #[allow(clippy::too_many_arguments)]
     async fn create_sponsored_checkout(
         &self,
-        organization_id: &str,
-        customer: Option<&str>,
-        price_id: &str,
-        quantity: i64,
-        operation_id: &str,
-        beneficiary_id: &str,
-        idempotency_key: &str,
-        success_url: &str,
-        cancel_url: &str,
+        _organization_id: &str,
+        _customer: Option<&str>,
+        _price_id: &str,
+        _quantity: i64,
+        _operation_id: &str,
+        _beneficiary_id: &str,
+        _idempotency_key: &str,
+        _expires_at_epoch: i64,
+        _success_url: &str,
+        _cancel_url: &str,
     ) -> ProviderResult<String> {
-        let _ = (
-            price_id,
-            quantity,
-            operation_id,
-            beneficiary_id,
-            idempotency_key,
-        );
-        self.create_checkout(organization_id, customer, success_url, cancel_url)
-            .await
+        Err(ProviderError::unsupported("sponsored_checkout"))
     }
 
     /// Validate the configured Stripe price before quoting or creating a personal checkout.
@@ -495,6 +488,7 @@ impl SubscriptionProvider for StripeBilling {
         operation_id: &str,
         beneficiary_id: &str,
         idempotency_key: &str,
+        expires_at_epoch: i64,
         success_url: &str,
         cancel_url: &str,
     ) -> ProviderResult<String> {
@@ -523,6 +517,7 @@ impl SubscriptionProvider for StripeBilling {
             ),
             ("success_url".to_string(), success_url.to_string()),
             ("cancel_url".to_string(), cancel_url.to_string()),
+            ("expires_at".to_string(), expires_at_epoch.to_string()),
         ];
         let mut form = form;
         if let Some(customer) = customer {
@@ -1033,6 +1028,10 @@ async fn sponsored_checkout(
                 .as_deref()
                 .unwrap_or(&request.beneficiary_id),
             &operation.provider_idempotency_key,
+            personal_checkout_expiry(
+                operation.quote_expires_at_epoch,
+                sponsored_billing::current_epoch(),
+            )?,
             &success_url,
             &cancel_url,
         )
