@@ -194,7 +194,13 @@ async fn get_entitlements(
     .bind(&org_id)
     .fetch_one(&state.pool)
     .await?;
-    let effective = effective_tier(&state.pool, &org_id).await?;
+    let effective = if state.deployment_mode == crate::config::DeploymentMode::SelfHosted {
+        // Self-hosted deployments have no commercial tier or quota. Report the unlimited view
+        // that matches the write gates so clients do not hide features that are available.
+        Tier::Team
+    } else {
+        effective_tier(&state.pool, &org_id).await?
+    };
 
     Ok(Json(EntitlementsView {
         tier,
@@ -210,6 +216,7 @@ async fn get_entitlements(
                 max_org_projects: FREE_MAX_ORG_PROJECTS,
             }),
         },
-        billing_enabled: state.billing.is_some(),
+        billing_enabled: state.deployment_mode == crate::config::DeploymentMode::Cloud
+            && state.billing.is_some(),
     }))
 }
