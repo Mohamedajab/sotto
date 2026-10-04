@@ -76,6 +76,7 @@ pub mod error;
 pub mod health;
 pub mod machine;
 pub mod org;
+pub mod person_eligibility;
 pub mod personal_billing;
 // The lifecycle seam, HTTP adapter, and worker remain doc-hidden: deletion is enabled per
 // deployment rather than presented as a stable public API surface, and the internal seam is not
@@ -125,6 +126,7 @@ pub fn app(state: AppState) -> Router {
         .merge(audit::router())
         .merge(entitlements::router())
         .merge(account::router())
+        .merge(person_eligibility::router())
         .merge(org::router())
         .merge(billing::router())
         .merge(machine::router())
