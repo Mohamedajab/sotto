@@ -2893,7 +2893,7 @@ async fn invoice_paid(
         return Ok(());
     };
     if sponsored_billing_enabled()
-        && sponsored_invoice_paid(tx, object, &subscription_id, catalogue).await?
+        && sponsored_invoice_paid(tx, object, subscription_id, catalogue).await?
     {
         return Ok(());
     }
