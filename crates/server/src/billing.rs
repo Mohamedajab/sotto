@@ -222,6 +222,41 @@ pub enum SubscriptionObservation {
     Missing,
 }
 
+/// One price-class quantity on the organisation's sponsored subscription.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SponsoredSubscriptionItem {
+    pub provider_item_id: String,
+    pub provider_price_id: String,
+    pub quantity: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SponsoredSubscriptionItemRequest {
+    pub provider_price_id: String,
+    pub quantity: i64,
+}
+
+/// Provider state needed to reconcile a sponsored subscription mutation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SponsoredSubscriptionSnapshot {
+    pub customer_id: Option<String>,
+    pub subscription_id: String,
+    pub status: SubscriptionStatus,
+    pub current_period_start: Option<i64>,
+    pub current_period_end: Option<i64>,
+    pub schedule_id: Option<String>,
+    pub items: Vec<SponsoredSubscriptionItem>,
+}
+
+/// The durable identifiers returned while creating the initial hosted subscription.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SponsoredCheckoutSession {
+    pub session_id: String,
+    pub checkout_url: String,
+    pub customer_id: Option<String>,
+    pub subscription_id: Option<String>,
+}
+
 impl SubscriptionObservation {
     pub fn purge_gate(&self) -> PurgeGate {
         match self {
@@ -263,24 +298,53 @@ pub trait SubscriptionProvider: Send + Sync {
             .await
     }
 
-    /// Create a named sponsored checkout. The provider call carries only the organisation,
-    /// operation and named beneficiary metadata; the durable seat rows are activated by the
-    /// verified paid webhook.
+    /// Create the initial named sponsored subscription checkout. All price classes are sent in
+    /// one Checkout Session so an organisation receives one subscription and one invoice.
     #[allow(clippy::too_many_arguments)]
     async fn create_sponsored_checkout(
         &self,
         _organization_id: &str,
         _customer: Option<&str>,
-        _price_id: &str,
-        _quantity: i64,
+        _items: &[SponsoredSubscriptionItemRequest],
         _operation_id: &str,
-        _beneficiary_id: &str,
         _idempotency_key: &str,
         _expires_at_epoch: i64,
         _success_url: &str,
         _cancel_url: &str,
-    ) -> ProviderResult<String> {
+    ) -> ProviderResult<SponsoredCheckoutSession> {
         Err(ProviderError::unsupported("sponsored_checkout"))
+    }
+
+    /// Apply the desired named-seat quantities at the next billing boundary. The provider
+    /// implementation uses an explicit subscription schedule so local effective dates and
+    /// Stripe's future invoice agree.
+    async fn update_sponsored_subscription(
+        &self,
+        _organization_id: &str,
+        _subscription_id: &str,
+        _items: &[SponsoredSubscriptionItemRequest],
+        _effective_at_epoch: i64,
+        _idempotency_key: &str,
+    ) -> ProviderResult<SponsoredSubscriptionSnapshot> {
+        Err(ProviderError::unsupported("sponsored_subscription_update"))
+    }
+
+    async fn get_sponsored_subscription(
+        &self,
+        _subscription_id: &str,
+    ) -> ProviderResult<SponsoredSubscriptionSnapshot> {
+        Err(ProviderError::unsupported("sponsored_subscription_lookup"))
+    }
+
+    async fn cancel_sponsored_subscription(
+        &self,
+        _organization_id: &str,
+        _subscription_id: &str,
+        _idempotency_key: &str,
+    ) -> ProviderResult<SponsoredSubscriptionSnapshot> {
+        Err(ProviderError::unsupported(
+            "sponsored_subscription_cancellation",
+        ))
     }
 
     /// Validate the configured Stripe price before quoting or creating a personal checkout.
@@ -483,22 +547,22 @@ impl SubscriptionProvider for StripeBilling {
         &self,
         organization_id: &str,
         customer: Option<&str>,
-        price_id: &str,
-        quantity: i64,
+        items: &[SponsoredSubscriptionItemRequest],
         operation_id: &str,
-        beneficiary_id: &str,
         idempotency_key: &str,
         expires_at_epoch: i64,
         success_url: &str,
         cancel_url: &str,
-    ) -> ProviderResult<String> {
-        if price_id.is_empty() || quantity <= 0 || beneficiary_id.is_empty() {
+    ) -> ProviderResult<SponsoredCheckoutSession> {
+        if items.is_empty()
+            || items
+                .iter()
+                .any(|item| item.provider_price_id.is_empty() || item.quantity <= 0)
+        {
             return Err(ProviderError::malformed_response());
         }
-        let form = vec![
+        let mut form = vec![
             ("mode".to_string(), "subscription".to_string()),
-            ("line_items[0][price]".to_string(), price_id.to_string()),
-            ("line_items[0][quantity]".to_string(), quantity.to_string()),
             (
                 ("client_reference_id").to_string(),
                 format!("sponsored:{operation_id}"),
@@ -511,15 +575,20 @@ impl SubscriptionProvider for StripeBilling {
                 "subscription_data[metadata][organization_id]".to_string(),
                 organization_id.to_string(),
             ),
-            (
-                "subscription_data[metadata][beneficiary_id]".to_string(),
-                beneficiary_id.to_string(),
-            ),
             ("success_url".to_string(), success_url.to_string()),
             ("cancel_url".to_string(), cancel_url.to_string()),
             ("expires_at".to_string(), expires_at_epoch.to_string()),
         ];
-        let mut form = form;
+        for (index, item) in items.iter().enumerate() {
+            form.push((
+                format!("line_items[{index}][price]"),
+                item.provider_price_id.clone(),
+            ));
+            form.push((
+                format!("line_items[{index}][quantity]"),
+                item.quantity.to_string(),
+            ));
+        }
         if let Some(customer) = customer {
             form.push(("customer".to_string(), customer.to_string()));
         }
@@ -530,10 +599,140 @@ impl SubscriptionProvider for StripeBilling {
             idempotency_key,
         )
         .await?;
-        session["url"]
+        let session_id = session["id"]
             .as_str()
-            .map(str::to_string)
-            .ok_or_else(ProviderError::malformed_response)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(ProviderError::malformed_response)?;
+        let checkout_url = session["url"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(ProviderError::malformed_response)?;
+        Ok(SponsoredCheckoutSession {
+            session_id: session_id.to_string(),
+            checkout_url: checkout_url.to_string(),
+            customer_id: session["customer"].as_str().map(str::to_string),
+            subscription_id: session["subscription"].as_str().map(str::to_string),
+        })
+    }
+
+    async fn update_sponsored_subscription(
+        &self,
+        organization_id: &str,
+        subscription_id: &str,
+        items: &[SponsoredSubscriptionItemRequest],
+        effective_at_epoch: i64,
+        idempotency_key: &str,
+    ) -> ProviderResult<SponsoredSubscriptionSnapshot> {
+        if subscription_id.is_empty() || items.iter().any(|item| item.quantity < 0) {
+            return Err(ProviderError::malformed_response());
+        }
+        let current = self.get_sponsored_subscription(subscription_id).await?;
+        let schedule_id = if let Some(schedule_id) = current.schedule_id.clone() {
+            schedule_id
+        } else {
+            let schedule = stripe_post_with_idempotency(
+                &self.api_key,
+                "subscription_schedules",
+                &[("from_subscription".into(), subscription_id.into())],
+                &format!("{idempotency_key}-schedule"),
+            )
+            .await?;
+            schedule["id"]
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(ProviderError::malformed_response)?
+                .to_string()
+        };
+        let current_start = current
+            .current_period_start
+            .ok_or_else(ProviderError::malformed_response)?;
+        let current_end = current
+            .current_period_end
+            .ok_or_else(ProviderError::malformed_response)?;
+        if effective_at_epoch < current_end {
+            return Err(ProviderError::malformed_response());
+        }
+        let mut form = vec![
+            (
+                "end_behavior".into(),
+                if items.is_empty() {
+                    "cancel"
+                } else {
+                    "release"
+                }
+                .into(),
+            ),
+            ("proration_behavior".into(), "none".into()),
+            ("metadata[organization_id]".into(), organization_id.into()),
+            ("phases[0][start_date]".into(), current_start.to_string()),
+            ("phases[0][end_date]".into(), effective_at_epoch.to_string()),
+        ];
+        for (index, item) in current.items.iter().enumerate() {
+            form.push((
+                format!("phases[0][items][{index}][price]"),
+                item.provider_price_id.clone(),
+            ));
+            form.push((
+                format!("phases[0][items][{index}][quantity]"),
+                item.quantity.to_string(),
+            ));
+        }
+        if !items.is_empty() {
+            form.push((
+                "phases[1][start_date]".into(),
+                effective_at_epoch.to_string(),
+            ));
+            for (index, item) in items.iter().enumerate() {
+                form.push((
+                    format!("phases[1][items][{index}][price]"),
+                    item.provider_price_id.clone(),
+                ));
+                form.push((
+                    format!("phases[1][items][{index}][quantity]"),
+                    item.quantity.to_string(),
+                ));
+            }
+        }
+        stripe_post_with_idempotency(
+            &self.api_key,
+            &format!("subscription_schedules/{schedule_id}"),
+            &form,
+            idempotency_key,
+        )
+        .await?;
+        self.get_sponsored_subscription(subscription_id).await
+    }
+
+    async fn get_sponsored_subscription(
+        &self,
+        subscription_id: &str,
+    ) -> ProviderResult<SponsoredSubscriptionSnapshot> {
+        let value = stripe_get(&self.api_key, &format!("subscriptions/{subscription_id}")).await?;
+        sponsored_subscription_snapshot(&value, subscription_id)
+    }
+
+    async fn cancel_sponsored_subscription(
+        &self,
+        organization_id: &str,
+        subscription_id: &str,
+        idempotency_key: &str,
+    ) -> ProviderResult<SponsoredSubscriptionSnapshot> {
+        let form = vec![
+            ("invoice_now".into(), "false".into()),
+            ("prorate".into(), "false".into()),
+            (
+                "cancellation_details[comment]".into(),
+                format!("Sotto sponsored billing for organisation {organization_id}"),
+            ),
+        ];
+        stripe_delete(
+            &self.api_key,
+            &format!("subscriptions/{subscription_id}"),
+            idempotency_key,
+            &form,
+        )
+        .await?;
+        self.get_sponsored_subscription(subscription_id).await
     }
 
     async fn validate_personal_price(
@@ -749,6 +948,21 @@ fn billing_config(state: &AppState) -> Result<&BillingState> {
         .ok_or_else(|| Error::NotConfigured("billing is not configured".into()))
 }
 
+const SPONSORED_BILLING_ENABLED_ENV: &str = "SOTTO_SPONSORED_BILLING_ENABLED";
+
+fn sponsored_billing_enabled() -> bool {
+    std::env::var(SPONSORED_BILLING_ENABLED_ENV).as_deref() == Ok("1")
+}
+
+fn sponsored_billing_config(state: &AppState) -> Result<&BillingState> {
+    if !sponsored_billing_enabled() {
+        return Err(Error::NotConfigured(
+            "hosted sponsored billing is not enabled".into(),
+        ));
+    }
+    billing_config(state)
+}
+
 /// Billing is admin+: the same bar as membership management, and a non-member sees a 404.
 async fn require_billing_admin(
     tx: &mut Transaction<'_, Postgres>,
@@ -872,6 +1086,7 @@ async fn sponsored_seats(
     user: AuthUser,
     Path(org_id): Path<String>,
 ) -> Result<Json<Vec<SponsoredSeatView>>> {
+    sponsored_billing_config(&state)?;
     let seats = sponsored_billing::list_seats(&state.pool, &org_id, &user.user_id)
         .await
         .map_err(Error::from)?;
@@ -914,7 +1129,7 @@ async fn sponsored_quote(
         ));
     }
     let offer = billing_offer(&request.offer)?;
-    let billing = billing_config(&state)?;
+    let billing = sponsored_billing_config(&state)?;
     let catalogue = billing
         .price_catalogue()
         .ok_or_else(|| Error::NotConfigured("hosted sponsored billing is not configured".into()))?;
@@ -959,7 +1174,7 @@ async fn sponsored_checkout(
     Path(org_id): Path<String>,
     Json(input): Json<SponsoredCheckoutRequest>,
 ) -> Result<Json<SponsoredOperationView>> {
-    let billing = billing_config(&state)?;
+    let billing = sponsored_billing_config(&state)?;
     let catalogue = billing
         .price_catalogue()
         .ok_or_else(|| Error::NotConfigured("hosted sponsored billing is not configured".into()))?;
@@ -994,61 +1209,95 @@ async fn sponsored_checkout(
             provider_checkout_url: operation.provider_checkout_url,
         }));
     }
-    if action == SponsoredSeatAction::Remove {
-        let operation = sponsored_billing::complete_local_removal(&mut tx, &operation.operation_id)
+    let existing_subscription: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT provider_customer_id, provider_subscription_id \
+         FROM billing_sponsored_subscriptions WHERE organization_id = $1 FOR UPDATE",
+    )
+    .bind(&org_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let existing_customer: Option<String> =
+        sqlx::query_scalar("SELECT stripe_customer_id FROM organizations WHERE id = $1")
+            .bind(&org_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    tx.commit().await?;
+
+    let items = sponsored_provider_items(&state.pool, &org_id, catalogue, &operation).await?;
+    let (success_url, cancel_url) = checkout_return_urls(&billing.return_url);
+    let result = if let Some((customer_id, Some(subscription_id))) = existing_subscription {
+        let snapshot = billing
+            .provider
+            .update_sponsored_subscription(
+                &org_id,
+                &subscription_id,
+                &items,
+                operation
+                    .effective_until
+                    .unwrap_or(operation.effective_from),
+                &operation.provider_idempotency_key,
+            )
             .await
-            .map_err(Error::from)?;
-        tx.commit().await?;
-        return Ok(Json(SponsoredOperationView {
+            .map_err(ProviderError::into_error)?;
+        let mut result_tx = state.pool.begin().await?;
+        let operation = sponsored_billing::record_provider_update(
+            &mut result_tx,
+            &operation.operation_id,
+            customer_id.as_deref().or(snapshot.customer_id.as_deref()),
+            &subscription_id,
+            None,
+        )
+        .await
+        .map_err(Error::from)?;
+        result_tx.commit().await?;
+        SponsoredOperationView {
             operation_id: operation.operation_id,
             action: operation.action.as_str().into(),
             state: operation.state,
-            provider_checkout_url: None,
-        }));
-    }
-    let customer: Option<String> =
-        sqlx::query_scalar("SELECT stripe_customer_id FROM organizations WHERE id = $1")
-            .bind(&org_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .flatten();
-    tx.commit().await?;
-    let (success_url, cancel_url) = checkout_return_urls(&billing.return_url);
-    let price_id = catalogue.id_for(offer);
-    let checkout_url = billing
-        .provider
-        .create_sponsored_checkout(
-            &org_id,
-            customer.as_deref(),
-            price_id,
-            1,
+            provider_checkout_url: operation.provider_checkout_url,
+        }
+    } else if existing_subscription.is_none() && action == SponsoredSeatAction::Add {
+        let checkout = billing
+            .provider
+            .create_sponsored_checkout(
+                &org_id,
+                existing_customer.as_deref(),
+                &items,
+                &operation.operation_id,
+                &operation.provider_idempotency_key,
+                personal_checkout_expiry(
+                    operation.quote_expires_at_epoch,
+                    sponsored_billing::current_epoch(),
+                )?,
+                &success_url,
+                &cancel_url,
+            )
+            .await
+            .map_err(ProviderError::into_error)?;
+        let mut result_tx = state.pool.begin().await?;
+        let operation = sponsored_billing::record_checkout(
+            &mut result_tx,
             &operation.operation_id,
-            request
-                .replacement_beneficiary_id
-                .as_deref()
-                .unwrap_or(&request.beneficiary_id),
-            &operation.provider_idempotency_key,
-            personal_checkout_expiry(
-                operation.quote_expires_at_epoch,
-                sponsored_billing::current_epoch(),
-            )?,
-            &success_url,
-            &cancel_url,
+            &checkout.checkout_url,
+            &checkout.session_id,
+            checkout.customer_id.as_deref(),
+            checkout.subscription_id.as_deref(),
         )
         .await
-        .map_err(ProviderError::into_error)?;
-    let mut result_tx = state.pool.begin().await?;
-    let operation =
-        sponsored_billing::record_checkout(&mut result_tx, &operation.operation_id, &checkout_url)
-            .await
-            .map_err(Error::from)?;
-    result_tx.commit().await?;
-    Ok(Json(SponsoredOperationView {
-        operation_id: operation.operation_id,
-        action: operation.action.as_str().into(),
-        state: operation.state,
-        provider_checkout_url: operation.provider_checkout_url,
-    }))
+        .map_err(Error::from)?;
+        result_tx.commit().await?;
+        SponsoredOperationView {
+            operation_id: operation.operation_id,
+            action: operation.action.as_str().into(),
+            state: operation.state,
+            provider_checkout_url: operation.provider_checkout_url,
+        }
+    } else {
+        return Err(Error::Conflict(
+            "sponsored subscription is missing for this change".into(),
+        ));
+    };
+    Ok(Json(result))
 }
 
 async fn sponsored_operation(
@@ -1056,6 +1305,7 @@ async fn sponsored_operation(
     user: AuthUser,
     Path((org_id, operation_id)): Path<(String, String)>,
 ) -> Result<Json<SponsoredOperationView>> {
+    sponsored_billing_config(&state)?;
     let operation =
         sponsored_billing::load_operation_for_actor(&state.pool, &operation_id, &user.user_id)
             .await
@@ -1086,6 +1336,34 @@ async fn validate_personal_catalogue(
             .map_err(ProviderError::into_error)?;
     }
     Ok(())
+}
+
+async fn sponsored_provider_items(
+    pool: &sqlx::PgPool,
+    organization_id: &str,
+    catalogue: &BillingPriceIds,
+    operation: &sponsored_billing::SponsoredOperation,
+) -> Result<Vec<SponsoredSubscriptionItemRequest>> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT offer, count(*)::BIGINT FROM billing_sponsored_seats \
+         WHERE organization_id = $1 AND state IN ('active', 'pending') \
+           AND NOT ($2 IN ('remove', 'replace') AND beneficiary_id = $3) \
+         GROUP BY offer ORDER BY offer",
+    )
+    .bind(organization_id)
+    .bind(operation.action.as_str())
+    .bind(&operation.beneficiary_id)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|(offer, quantity)| {
+            let offer = billing_offer(&offer)?;
+            Ok(SponsoredSubscriptionItemRequest {
+                provider_price_id: catalogue.id_for(offer).to_string(),
+                quantity,
+            })
+        })
+        .collect()
 }
 
 fn billing_epoch() -> i64 {
@@ -1777,6 +2055,46 @@ fn subscription_snapshot(
     })
 }
 
+fn sponsored_subscription_snapshot(
+    object: &serde_json::Value,
+    requested_id: &str,
+) -> ProviderResult<SponsoredSubscriptionSnapshot> {
+    let base = subscription_snapshot(object, requested_id)?;
+    let items = object["items"]["data"]
+        .as_array()
+        .ok_or_else(ProviderError::malformed_response)?
+        .iter()
+        .map(|item| {
+            let provider_item_id = item["id"]
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(ProviderError::malformed_response)?;
+            let provider_price_id = item["price"]["id"]
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(ProviderError::malformed_response)?;
+            let quantity = item["quantity"]
+                .as_i64()
+                .filter(|value| *value >= 0)
+                .ok_or_else(ProviderError::malformed_response)?;
+            Ok(SponsoredSubscriptionItem {
+                provider_item_id: provider_item_id.to_string(),
+                provider_price_id: provider_price_id.to_string(),
+                quantity,
+            })
+        })
+        .collect::<ProviderResult<Vec<_>>>()?;
+    Ok(SponsoredSubscriptionSnapshot {
+        customer_id: object["customer"].as_str().map(str::to_string),
+        subscription_id: base.id,
+        status: base.status,
+        current_period_start: object["current_period_start"].as_i64(),
+        current_period_end: object["current_period_end"].as_i64(),
+        schedule_id: object["schedule"].as_str().map(str::to_string),
+        items,
+    })
+}
+
 fn cancellation_form(org_id: &str) -> Vec<(String, String)> {
     vec![
         ("invoice_now".into(), "false".into()),
@@ -1904,6 +2222,21 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
     } else {
         None
     };
+    let sponsored_snapshot = if sponsored_billing_enabled() && is_sponsored_checkout_event(&event) {
+        if let Some(subscription_id) = subscription_id.as_deref() {
+            Some(
+                billing
+                    .provider
+                    .get_sponsored_subscription(subscription_id)
+                    .await
+                    .map_err(ProviderError::into_error)?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     if disposition == EventDisposition::Reconcile {
         if is_sponsored_checkout_expired_event(&event) {
             sponsored_checkout_expired(&mut tx, object).await?;
@@ -1921,6 +2254,7 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
                 event.created,
                 event.kind == "checkout.session.async_payment_succeeded",
                 personal_period_end,
+                sponsored_snapshot.as_ref(),
             )
             .await?;
             if let Some(subscription_id) = subscription_id {
@@ -1964,13 +2298,14 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
                     event.created,
                     event.kind == "checkout.session.async_payment_succeeded",
                     personal_period_end,
+                    sponsored_snapshot.as_ref(),
                 )
                 .await?
             }
             "checkout.session.expired" => sponsored_checkout_expired(&mut tx, object).await?,
             "customer.subscription.updated" => subscription_updated(&mut tx, object).await?,
             "customer.subscription.deleted" => subscription_deleted(&mut tx, object).await?,
-            "invoice.paid" => invoice_paid(&mut tx, object).await?,
+            "invoice.paid" => invoice_paid(&mut tx, object, billing.price_catalogue()).await?,
             _ => {}
         },
         EventDisposition::Reconcile | EventDisposition::Ignore => {
@@ -2199,6 +2534,9 @@ async fn sponsored_checkout_expired(
     tx: &mut Transaction<'_, Postgres>,
     object: &serde_json::Value,
 ) -> Result<()> {
+    if !sponsored_billing_enabled() {
+        return Ok(());
+    }
     let Some(reference) = object["client_reference_id"].as_str() else {
         return Ok(());
     };
@@ -2219,6 +2557,7 @@ async fn checkout_completed(
     event_created: i64,
     async_payment_succeeded: bool,
     personal_period_end: Option<i64>,
+    sponsored_snapshot: Option<&SponsoredSubscriptionSnapshot>,
 ) -> Result<()> {
     // Sessions this server creates always carry the org id; anything else isn't ours to act on.
     // Said out loud, because ignoring an event and acting on one are indistinguishable from
@@ -2243,16 +2582,35 @@ async fn checkout_completed(
         .await;
     }
     if let Some(operation_id) = org_id.strip_prefix("sponsored:") {
+        if !sponsored_billing_enabled() {
+            return Ok(());
+        }
         if !async_payment_succeeded && object["payment_status"].as_str() != Some("paid") {
             return Ok(());
         }
-        let provider_operation_id = object["payment_intent"]
+        let payment_reference = object["payment_intent"]
             .as_str()
             .or_else(|| object["id"].as_str())
             .ok_or_else(|| {
                 Error::Config("paid sponsored checkout has no payment reference".into())
             })?;
-        sponsored_billing::complete_paid_checkout(tx, operation_id, provider_operation_id)
+        let subscription_id = object["subscription"]
+            .as_str()
+            .or_else(|| sponsored_snapshot.map(|snapshot| snapshot.subscription_id.as_str()))
+            .ok_or_else(|| Error::Config("sponsored checkout has no subscription id".into()))?;
+        let evidence = sponsored_billing::SponsoredProviderEvidence {
+            customer_id: object["customer"]
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| sponsored_snapshot.and_then(|snapshot| snapshot.customer_id.clone())),
+            subscription_id: subscription_id.to_string(),
+            checkout_session_id: object["id"].as_str().map(str::to_string),
+            payment_reference: payment_reference.to_string(),
+            provider_item_id: sponsored_snapshot.and_then(|snapshot| {
+                (snapshot.items.len() == 1).then(|| snapshot.items[0].provider_item_id.clone())
+            }),
+        };
+        sponsored_billing::complete_paid_checkout(tx, operation_id, &evidence)
             .await
             .map_err(Error::from)?;
         return Ok(());
@@ -2529,10 +2887,16 @@ fn invoice_subscription_id(object: &serde_json::Value) -> Option<&str> {
 async fn invoice_paid(
     tx: &mut Transaction<'_, Postgres>,
     object: &serde_json::Value,
+    catalogue: Option<&BillingPriceIds>,
 ) -> Result<()> {
     let Some(subscription_id) = invoice_subscription_id(object) else {
         return Ok(());
     };
+    if sponsored_billing_enabled()
+        && sponsored_invoice_paid(tx, object, &subscription_id, catalogue).await?
+    {
+        return Ok(());
+    }
     let personal: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM billing_personal_accounts \
          WHERE stripe_subscription_id = $1)",
@@ -2561,6 +2925,108 @@ async fn invoice_paid(
     .await
     .map_err(personal_billing_error)?;
     Ok(())
+}
+
+async fn sponsored_invoice_paid(
+    tx: &mut Transaction<'_, Postgres>,
+    object: &serde_json::Value,
+    subscription_id: &str,
+    catalogue: Option<&BillingPriceIds>,
+) -> Result<bool> {
+    let Some(catalogue) = catalogue else {
+        return Err(Error::NotConfigured(
+            "sponsored billing price catalogue is not configured".into(),
+        ));
+    };
+    let organization_id: Option<String> = sqlx::query_scalar(
+        "SELECT organization_id FROM billing_sponsored_subscriptions \
+         WHERE provider_subscription_id = $1 FOR UPDATE",
+    )
+    .bind(subscription_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(organization_id) = organization_id else {
+        return Ok(false);
+    };
+    let payment_reference = object["payment_intent"]
+        .as_str()
+        .or_else(|| object["id"].as_str())
+        .ok_or_else(|| Error::Config("paid sponsored invoice has no payment reference".into()))?;
+    let customer_id = object["customer"].as_str().map(str::to_string);
+    sqlx::query(
+        "INSERT INTO billing_sponsored_subscriptions \
+         (organization_id, provider_customer_id, provider_subscription_id, status, updated_at) \
+         VALUES ($1, $2, $3, 'active', now()) \
+         ON CONFLICT (organization_id) DO UPDATE SET provider_customer_id = COALESCE(EXCLUDED.provider_customer_id, billing_sponsored_subscriptions.provider_customer_id), \
+           provider_subscription_id = EXCLUDED.provider_subscription_id, status = 'active', updated_at = now()",
+    )
+    .bind(&organization_id)
+    .bind(customer_id.as_deref())
+    .bind(subscription_id)
+    .execute(&mut **tx)
+    .await?;
+    let line_items = sponsored_invoice_items(object);
+    for (item_id, price_id, quantity) in &line_items {
+        if let Some(offer) = BillingOffer::ALL
+            .into_iter()
+            .find(|offer| catalogue.id_for(*offer) == price_id)
+        {
+            sponsored_billing::record_provider_item(
+                tx,
+                &organization_id,
+                item_id,
+                price_id,
+                offer,
+                *quantity,
+            )
+            .await
+            .map_err(Error::from)?;
+        }
+    }
+    let operations: Vec<(String, String)> = sqlx::query_as(
+        "SELECT operation_id, offer FROM billing_sponsored_operations \
+         WHERE organization_id = $1 AND state IN ('checkout_created', 'provider_pending') \
+         ORDER BY created_at FOR UPDATE",
+    )
+    .bind(&organization_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    for (operation_id, offer) in operations {
+        let offer = billing_offer(&offer)?;
+        let provider_item_id = line_items
+            .iter()
+            .find(|(_, price_id, _)| price_id == catalogue.id_for(offer))
+            .map(|(item_id, _, _)| item_id.clone());
+        let evidence = sponsored_billing::SponsoredProviderEvidence {
+            customer_id: customer_id.clone(),
+            subscription_id: subscription_id.to_string(),
+            checkout_session_id: None,
+            payment_reference: payment_reference.to_string(),
+            provider_item_id,
+        };
+        sponsored_billing::complete_paid_checkout(tx, &operation_id, &evidence)
+            .await
+            .map_err(Error::from)?;
+    }
+    Ok(true)
+}
+
+fn sponsored_invoice_items(object: &serde_json::Value) -> Vec<(String, String, i64)> {
+    object["lines"]["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|line| {
+            let item_id = line["subscription_item"].as_str().or_else(|| {
+                line["parent"]["subscription_item_details"]["subscription_item"].as_str()
+            })?;
+            let price_id = line["price"]["id"]
+                .as_str()
+                .or_else(|| line["parent"]["subscription_item_details"]["price"].as_str())?;
+            let quantity = line["quantity"].as_i64().unwrap_or(1);
+            Some((item_id.to_string(), price_id.to_string(), quantity))
+        })
+        .collect()
 }
 
 /// The subscription ended for good: back to the free tier (existing data stays readable - the
