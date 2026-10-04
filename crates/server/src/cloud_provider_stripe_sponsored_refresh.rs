@@ -3,8 +3,9 @@
 //! This module is the provider-specific executor behind the generic refresh queue. It deliberately
 //! remains dormant until the runtime wires it into the worker: the implementation is complete and
 //! testable, but enabling it is a separate rollout decision. A sponsored beneficiary can have
-//! sources represented by several invoices, so collection reads the bounded subscription history,
-//! composes one candidate per relevant invoice, and only then crosses the reconciliation adapter.
+//! sources represented by several invoices, so collection reads a bounded recent subscription
+//! prefix, selects the newest valid invoice candidate for each source, and only then crosses the
+//! reconciliation adapter.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -292,7 +293,7 @@ pub async fn collect_sponsored_collection(
                 "triggering invoice id is required",
             ))?;
     let mut session = stripe.session();
-    let invoices = stripe
+    let mut invoices = stripe
         .subscription_invoices_bounded(
             &mut session,
             &allocation.subscription_id,
@@ -301,6 +302,14 @@ pub async fn collect_sponsored_collection(
         )
         .await
         .map_err(SponsoredRefreshError::Stripe)?;
+    if !invoices.iter().any(|invoice| invoice.id == invoice_id) {
+        invoices.push(
+            stripe
+                .invoice(&mut session, invoice_id)
+                .await
+                .map_err(SponsoredRefreshError::Stripe)?,
+        );
+    }
     let Some(trigger) = invoices.iter().find(|invoice| invoice.id == invoice_id) else {
         return Err(SponsoredRefreshError::TriggerInvoiceMissing);
     };
