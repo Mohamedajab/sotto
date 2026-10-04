@@ -143,6 +143,57 @@ describe("VaultApp startup transitions", () => {
   });
 });
 
+describe("VaultApp unlock retries", () => {
+  it("recovers from a derivation failure using the latest form values", async () => {
+    vi.mocked(api.me).mockResolvedValue({ userId: "u1" });
+    const storedAccount = account();
+    vi.mocked(api.fetchAccount).mockResolvedValue(storedAccount);
+    const firstDerivation = deferred<Uint8Array>();
+    vi.mocked(vaultCrypto.deriveMasterKey)
+      .mockReturnValueOnce(firstDerivation.promise)
+      .mockResolvedValueOnce(new Uint8Array([7]));
+
+    render(<VaultApp />);
+
+    expect(await screen.findByText("Unlock your vault")).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Master password"), {
+      target: { value: "wrong password" },
+    });
+    fireEvent.change(screen.getByLabelText("Secret key (SK1-…)"), {
+      target: { value: "SK1-test" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Unlock" }));
+
+    expect(screen.getByRole("button", { name: "Deriving key…" })).toBeDisabled();
+    expect(screen.queryByText("vault-view")).not.toBeInTheDocument();
+
+    await act(async () => {
+      firstDerivation.reject(new Error("internal derivation detail"));
+    });
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Couldn't unlock - check your master password and secret key.",
+    );
+    expect(screen.getByRole("alert")).not.toHaveTextContent("internal derivation detail");
+    expect(screen.getByRole("button", { name: "Unlock" })).toBeEnabled();
+    expect(screen.queryByText("vault-view")).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Master password"), {
+      target: { value: "corrected password" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Unlock" }));
+
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(vaultCrypto.deriveMasterKey).toHaveBeenNthCalledWith(
+      2,
+      "corrected password",
+      "SK1-test",
+      storedAccount.salt,
+    );
+    expect(await screen.findByText("vault-view")).toBeInTheDocument();
+  });
+});
+
 describe.each(["locked", "unlocked"] as const)("logout from the %s phase", (phase) => {
   async function showPhase() {
     vi.mocked(api.me).mockResolvedValue({ userId: "u1" });
