@@ -369,3 +369,105 @@ pub async fn collect_sponsored_collection(
     collection_for_ticket(context, ticket, &references)
         .map_err(|error| SponsoredRefreshError::Adapter(error.to_string()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_inputs, SponsoredRefreshLimits};
+    use crate::cloud_provider::{
+        AllocationState, PayerKind, ProviderContext, ProviderEnvironment, VerifiedAllocation,
+        VerifiedProviderEvent,
+    };
+    use crate::cloud_provider_refresh_inputs::RefreshJobInputs;
+    use crate::cloud_provider_refresh_jobs::RefreshJobLease;
+    use crate::cloud_provider_stripe_sponsored::SponsoredStripeCoverageConfig;
+
+    fn inputs(event_type: &str, object_id: Option<&str>) -> RefreshJobInputs {
+        let context =
+            ProviderContext::new("stripe", "acct_test", ProviderEnvironment::Test).unwrap();
+        let event = VerifiedProviderEvent::from_stored(
+            "evt_1".into(),
+            event_type.to_owned(),
+            1,
+            Some("sub_1".into()),
+            None,
+            object_id.map(str::to_owned),
+            "0000000000000000000000000000000000000000000000000000000000000000".into(),
+        )
+        .unwrap();
+        let allocation = VerifiedAllocation::new(
+            "allocation_1",
+            "payer_1",
+            "cus_1",
+            PayerKind::Sponsor,
+            "user_1",
+            "sub_1",
+            "item_1",
+            "reference_1",
+            "source_1",
+            1,
+            None,
+            AllocationState::Active,
+            "ownership",
+        )
+        .unwrap();
+        RefreshJobInputs {
+            lease: RefreshJobLease {
+                job_id: "job".into(),
+                context,
+                event_id: "evt_1".into(),
+                beneficiary_id: "user_1".into(),
+                allocation_id: "allocation_1".into(),
+                source_id: "source_1".into(),
+                worker_id: "worker".into(),
+                attempt_count: 1,
+            },
+            event,
+            allocation,
+            receipt_status: "pending".into(),
+        }
+    }
+
+    fn coverage() -> SponsoredStripeCoverageConfig {
+        SponsoredStripeCoverageConfig::new(
+            "acct_test",
+            ProviderEnvironment::Test,
+            "price_standard_month",
+            "price_standard_year",
+            "price_founding_month",
+            "price_founding_year",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn limits_require_a_positive_invoice_bound() {
+        assert!(SponsoredRefreshLimits {
+            max_invoices: 0,
+            ..SponsoredRefreshLimits::default()
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn refresh_requires_the_paid_invoice_object_identity() {
+        let error = validate_inputs(&inputs("invoice.paid", None), &coverage()).unwrap_err();
+        assert!(matches!(
+            error,
+            super::SponsoredRefreshError::InvalidInput(_)
+        ));
+    }
+
+    #[test]
+    fn refresh_rejects_non_paid_events() {
+        let error = validate_inputs(
+            &inputs("customer.subscription.updated", Some("in_1")),
+            &coverage(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            super::SponsoredRefreshError::InvalidInput(_)
+        ));
+    }
+}
