@@ -525,7 +525,7 @@ pub async fn complete_paid_checkout(
     }
     let updated = sqlx::query(
         "UPDATE billing_sponsored_operations SET state = 'active', provider_operation_id = $2, result_code = 'paid', updated_at = now() \
-         WHERE operation_id = $1 AND state IN ('checkout_created','active') RETURNING operation_id",
+         WHERE operation_id = $1 AND state = 'checkout_created' RETURNING operation_id",
     )
     .bind(operation_id)
     .bind(provider_operation_id)
