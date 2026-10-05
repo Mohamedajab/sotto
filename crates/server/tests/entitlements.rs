@@ -33,6 +33,7 @@ fn app_with_mode(pool: PgPool, deployment_mode: sotto_server::config::Deployment
         deployment_mode,
         telemetry_ingest: false,
         cloud_action_enforcement_enabled: false,
+        machine_eligibility_enforcement_enabled: false,
         pool,
         oauth: None,
         oauth_config: None,

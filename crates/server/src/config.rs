@@ -62,6 +62,7 @@ const PROVIDER_REFRESH_INGEST_ENV: &str = "SOTTO_PROVIDER_REFRESH_INGEST_ENABLED
 const PROVIDER_REFRESH_WORKER_ENV: &str = "SOTTO_PROVIDER_REFRESH_WORKER_ENABLED";
 const PROVIDER_REFRESH_RECONCILIATION_ENV: &str = "SOTTO_PROVIDER_REFRESH_RECONCILIATION_ENABLED";
 const CLOUD_ACTION_ENFORCEMENT_ENV: &str = "SOTTO_CLOUD_ACTION_ENFORCEMENT";
+const MACHINE_ELIGIBILITY_ENFORCEMENT_ENV: &str = "SOTTO_MACHINE_ELIGIBILITY_ENFORCEMENT";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -93,6 +94,8 @@ pub struct Config {
     pub provider_refresh_reconciliation_enabled: bool,
     /// Whether the dormant human hosted action policy rejects ineligible requests.
     pub cloud_action_enforcement_enabled: bool,
+    /// Whether hosted machine retrieval and creation apply the accountable beneficiary policy.
+    pub machine_eligibility_enforcement_enabled: bool,
 }
 
 /// Anonymous version-ping telemetry settings (see [`crate::telemetry`]).
@@ -266,6 +269,11 @@ impl Config {
         );
         let cloud_action_enforcement_enabled =
             feature_flag_is_enabled(std::env::var(CLOUD_ACTION_ENFORCEMENT_ENV).ok().as_deref());
+        let machine_eligibility_enforcement_enabled = feature_flag_is_enabled(
+            std::env::var(MACHINE_ELIGIBILITY_ENFORCEMENT_ENV)
+                .ok()
+                .as_deref(),
+        );
 
         Ok(Self {
             database_url,
@@ -282,6 +290,7 @@ impl Config {
             provider_refresh_worker_enabled,
             provider_refresh_reconciliation_enabled,
             cloud_action_enforcement_enabled,
+            machine_eligibility_enforcement_enabled,
         })
     }
 }
@@ -585,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_refresh_switches_require_independent_exact_opt_in() {
+    fn dormant_policy_switches_require_independent_exact_opt_in() {
         assert!(!feature_flag_is_enabled(None));
         assert!(!feature_flag_is_enabled(Some("")));
         assert!(!feature_flag_is_enabled(Some("true")));

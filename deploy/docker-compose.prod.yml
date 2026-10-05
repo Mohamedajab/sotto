@@ -48,6 +48,8 @@ services:
       # Human hosted action enforcement is a deliberate rollout switch; keep it shadow-only by
       # default until the Cloud transition and export gates are approved.
       SOTTO_CLOUD_ACTION_ENFORCEMENT: ${SOTTO_CLOUD_ACTION_ENFORCEMENT:-0}
+      # Machine eligibility enforcement remains dormant until the hosted CI policy is approved.
+      SOTTO_MACHINE_ELIGIBILITY_ENFORCEMENT: ${SOTTO_MACHINE_ELIGIBILITY_ENFORCEMENT:-0}
       # Optional: without these the server still boots (health + migrations), but login and every
       # authenticated endpoint return 503. Fill them in for a usable instance.
       GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}

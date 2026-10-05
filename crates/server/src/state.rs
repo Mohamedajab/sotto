@@ -35,4 +35,6 @@ pub struct AppState {
     pub organisation_deletion_operator_token: Option<String>,
     /// Whether the dormant human hosted action policy rejects ineligible requests.
     pub cloud_action_enforcement_enabled: bool,
+    /// Whether hosted machine retrieval and creation apply the accountable beneficiary policy.
+    pub machine_eligibility_enforcement_enabled: bool,
 }

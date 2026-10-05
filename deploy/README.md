@@ -57,6 +57,10 @@ existing ACL, grant, lifecycle, and export responses remain unchanged. Do not se
 `SOTTO_CLOUD_ACTION_ENFORCEMENT=1` until the Cloud transition and export gates have been
 rehearsed and approved.
 
+Hosted machine-token eligibility is separately dormant. Do not set
+`SOTTO_MACHINE_ELIGIBILITY_ENFORCEMENT=1` until the accountable-beneficiary migration and legacy
+token inventory have been reviewed; self-hosted machine access does not depend on Cloud billing.
+
 Database migrations run automatically on server boot. Pin a released version with
 `SOTTO_IMAGE_TAG=vX.Y.Z` in `.env` (default: `latest`). To build everything from source instead -
 for unreleased changes, or if you'd rather not trust prebuilt images - use

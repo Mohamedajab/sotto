@@ -1010,10 +1010,13 @@ fn token_command(
                     .map(|label| format!("  {label}"))
                     .unwrap_or_default();
                 println!(
-                    "{}  {}  {}{expiry}",
+                    "{}  {}  {}  accountable: {}{expiry}",
                     t.token_id,
                     t.name,
-                    t.created_by.as_deref().unwrap_or("(unknown creator)")
+                    t.created_by.as_deref().unwrap_or("(unknown creator)"),
+                    t.beneficiary_id
+                        .as_deref()
+                        .unwrap_or("(ambiguous beneficiary)")
                 );
             }
             Ok(())
@@ -1676,6 +1679,8 @@ fn machine_token_list_json(tokens: &[remote::api::MachineTokenInfo]) -> Result<S
                 "token_id": token.token_id,
                 "name": token.name,
                 "created_by": token.created_by,
+                "beneficiary_id": token.beneficiary_id,
+                "beneficiary_status": token.beneficiary_status,
             })
         })
         .collect();
@@ -2494,6 +2499,8 @@ mod tests {
                 name: "nightly \"build\" 🚀".into(),
                 public_key: "unused".into(),
                 created_by: Some("user-1".into()),
+                beneficiary_id: Some("user-1".into()),
+                beneficiary_status: Some("verified".into()),
                 expires_at: None,
                 expires_in_days: None,
             },
@@ -2502,6 +2509,8 @@ mod tests {
                 name: "backup".into(),
                 public_key: "unused".into(),
                 created_by: None,
+                beneficiary_id: None,
+                beneficiary_status: Some("ambiguous".into()),
                 expires_at: None,
                 expires_in_days: None,
             },
@@ -2510,7 +2519,11 @@ mod tests {
             serde_json::from_str(&machine_token_list_json(&tokens).unwrap()).unwrap();
         assert_eq!(value[0]["name"], "nightly \"build\" 🚀");
         assert_eq!(value[0]["created_by"], "user-1");
+        assert_eq!(value[0]["beneficiary_id"], "user-1");
+        assert_eq!(value[0]["beneficiary_status"], "verified");
         assert!(value[1]["created_by"].is_null());
+        assert!(value[1]["beneficiary_id"].is_null());
+        assert_eq!(value[1]["beneficiary_status"], "ambiguous");
         assert_eq!(machine_token_list_json(&[]).unwrap(), "[]");
     }
 

@@ -23,6 +23,7 @@ fn app(pool: PgPool, token: Option<&str>) -> Router {
         billing: None,
         telemetry_ingest: false,
         cloud_action_enforcement_enabled: false,
+        machine_eligibility_enforcement_enabled: false,
         organisation_deletion_enabled: false,
         organisation_deletion_retention_days: DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
         organisation_deletion_metrics_token: token.map(str::to_owned),
