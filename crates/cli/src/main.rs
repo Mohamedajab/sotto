@@ -2398,7 +2398,10 @@ mod tests {
             "Unlock and --passphrase prompts may still apply",
             "sotto share DATABASE_URL --views 3 --expire 3600",
         ] {
-            assert!(help.contains(expected), "missing share help text: {expected}");
+            assert!(
+                help.contains(expected),
+                "missing share help text: {expected}"
+            );
         }
     }
 
