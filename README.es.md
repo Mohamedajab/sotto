@@ -128,6 +128,18 @@ sotto ls --env staging
 
 `--env` se aplica solo a ese comando; `sotto env use` cambia el entorno predeterminado.
 
+Lista los entornos, cambia el predeterminado o previsualiza una copia entre entornos existentes:
+
+```sh
+sotto env ls                          # list environments; the active one is marked
+sotto env use staging                 # switch the project's active environment
+sotto env copy dev staging            # preview additions and updates without writing
+sotto env copy dev staging --confirm  # apply the copy; never delete destination keys
+```
+
+Sin `--confirm`, la copia es una simulación. Una copia confirmada añade y actualiza secretos,
+pero deja intactas las claves que solo existen en el destino.
+
 Exportar escribe texto plano, por lo que necesita `--reveal` en un terminal, igual que `sotto get`.
 Usa `sotto share --no-copy` para desactivar la copia interactiva, o `--copy` para solicitarla explícitamente.
 El borrado del portapapeles es una medida de mejor esfuerzo: si reemplazas el contenido se protege el nuevo valor,

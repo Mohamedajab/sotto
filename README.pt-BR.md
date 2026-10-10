@@ -128,6 +128,18 @@ sotto ls --env staging
 
 `--env` vale apenas para esse comando; `sotto env use` altera o ambiente padrão.
 
+Liste os ambientes, altere o padrão ou visualize uma cópia entre ambientes existentes:
+
+```sh
+sotto env ls                          # list environments; the active one is marked
+sotto env use staging                 # switch the project's active environment
+sotto env copy dev staging            # preview additions and updates without writing
+sotto env copy dev staging --confirm  # apply the copy; never delete destination keys
+```
+
+Sem `--confirm`, a cópia é uma simulação. Uma cópia confirmada adiciona e atualiza segredos,
+mas mantém intactas as chaves que existem apenas no destino.
+
 A exportação escreve texto puro, portanto precisa de `--reveal` em um terminal, assim como `sotto get`.
 Use `sotto share --no-copy` para desativar a cópia interativa, ou `--copy` para solicitá-la explicitamente.
 A limpeza da área de transferência é uma medida de melhor esforço: substituir o conteúdo protege o novo valor,

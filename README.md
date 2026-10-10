@@ -125,6 +125,18 @@ sotto ls --env staging
 
 `--env` lasts for that command only; `sotto env use` changes the default.
 
+List environments, switch the default, or preview a copy between existing environments:
+
+```sh
+sotto env ls                          # list environments; the active one is marked
+sotto env use staging                 # switch the project's active environment
+sotto env copy dev staging            # preview additions and updates without writing
+sotto env copy dev staging --confirm  # apply the copy; never delete destination keys
+```
+
+Without `--confirm`, copying is a dry-run. A confirmed copy adds and updates secrets but
+leaves keys that exist only in the destination untouched.
+
 Export writes plaintext, so it needs `--reveal` on a terminal, just like `sotto get`.
 Use `sotto share --no-copy` to disable interactive copying, or `--copy` to request it explicitly.
 Clipboard clearing is best-effort: replacing the clipboard protects the newer content, while

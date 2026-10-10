@@ -128,6 +128,18 @@ sotto ls --env staging
 
 `--env` ne s'applique qu'à cette commande ; `sotto env use` modifie l'environnement par défaut.
 
+Listez les environnements, changez celui par défaut ou prévisualisez une copie entre environnements existants :
+
+```sh
+sotto env ls                          # list environments; the active one is marked
+sotto env use staging                 # switch the project's active environment
+sotto env copy dev staging            # preview additions and updates without writing
+sotto env copy dev staging --confirm  # apply the copy; never delete destination keys
+```
+
+Sans `--confirm`, la copie est une simulation. Une copie confirmée ajoute et met à jour les secrets,
+mais laisse intactes les clés présentes uniquement dans la destination.
+
 L'export écrit en clair ; il nécessite donc `--reveal` dans un terminal, comme `sotto get`.
 Utilisez `sotto share --no-copy` pour désactiver la copie interactive, ou `--copy` pour la demander explicitement.
 L'effacement du presse-papiers est une mesure de meilleur effort : remplacer son contenu protège la nouvelle valeur,
