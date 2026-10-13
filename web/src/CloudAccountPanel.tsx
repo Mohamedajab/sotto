@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import {
   cancelPersonalBilling,
@@ -16,6 +16,7 @@ import {
   type PersonalLifecycle,
   type PersonalOperation,
   type PersonalQuote,
+  type PersonalBillingTerm,
   type RefundRequest,
 } from "./api";
 
@@ -25,7 +26,10 @@ function date(epoch: number | null): string | null { return epoch === null ? nul
 
 export function CloudAccountPanel() {
   const [eligibility, setEligibility] = useState<EligibilityView | null>(null);
-  const [offer, setOffer] = useState<PersonalQuote["offer"]>("monthly");
+  const [eligibilityLoading, setEligibilityLoading] = useState(true);
+  const [eligibilityAttempted, setEligibilityAttempted] = useState(false);
+  const eligibilityRequestInFlight = useRef(false);
+  const [offer, setOffer] = useState<PersonalBillingTerm>("monthly");
   const [quote, setQuote] = useState<PersonalQuote | null>(null);
   const [quoteError, setQuoteError] = useState<string | null>(null);
   const [quoteLoading, setQuoteLoading] = useState(false);
@@ -39,11 +43,19 @@ export function CloudAccountPanel() {
   const [notice, setNotice] = useState<string | null>(null);
 
   async function load() {
+    if (eligibilityRequestInFlight.current) return;
+    eligibilityRequestInFlight.current = true;
+    setEligibilityLoading(true);
     setError(null);
     try {
       const next = await fetchEligibility();
       setEligibility(next);
     } catch (e) { setError(message(e)); }
+    finally {
+      eligibilityRequestInFlight.current = false;
+      setEligibilityAttempted(true);
+      setEligibilityLoading(false);
+    }
   }
   useEffect(() => { void load(); }, []);
   useEffect(() => {
@@ -87,7 +99,7 @@ export function CloudAccountPanel() {
   }, [eligibility?.state]);
 
   async function checkout() {
-    if (quote === null || quoteLoading || quote.offer !== offer) return;
+    if (quote === null || quoteLoading || !quote.offer.endsWith(`_${offer}`)) return;
     setBusy(true); setError(null); setNotice(null);
     try {
       // The server accepts only its configured web origin as the return-url identity. Stripe's
@@ -132,7 +144,12 @@ export function CloudAccountPanel() {
     finally { setBusy(false); }
   }
 
-  if (eligibility === null) return <><h1>Cloud account</h1>{error !== null ? <p role="alert">{error}</p> : <p className="muted">Loading account status…</p>}</>;
+  if (eligibility === null) return <>
+    <h1>Cloud account</h1>
+    {error !== null && <p role="alert">{error}</p>}
+    {eligibilityLoading && <p className="muted" role="status">{eligibilityAttempted ? "Checking account status again…" : "Loading account status…"}</p>}
+    {eligibilityAttempted && <button disabled={eligibilityLoading} aria-busy={eligibilityLoading} onClick={() => void load()}>{eligibilityLoading ? "Retrying…" : "Retry account status"}</button>}
+  </>;
   const paidThrough = date(eligibility.paidThroughEpoch); const recoveryUntil = date(eligibility.recoveryUntilEpoch); const exportUntil = date(eligibility.exportUntilEpoch);
   return <>
     <h1>Cloud account</h1>
@@ -142,10 +159,10 @@ export function CloudAccountPanel() {
     <section aria-labelledby="status-heading"><h2 id="status-heading">Hosted access</h2><p><strong>{eligibility.state.replaceAll("_", " ")}</strong>{paidThrough !== null ? ` · paid through ${paidThrough}` : ""}</p>{recoveryUntil !== null && <p className="muted">Recovery is available until {recoveryUntil}.</p>}{eligibility.payer === null && eligibility.state === "paid" && <p className="muted">Your hosted access is sponsored or provided by another billing record. There is no personal upgrade to buy.</p>}{eligibility.state === "unavailable" && <p>Billing evidence is temporarily unavailable. Checkout is hidden until the account can be checked safely.</p>}</section>
     {eligibility.actions.billing && <section aria-labelledby="billing-heading">
       <h2 id="billing-heading">Choose hosted billing</h2>
-      <label>Term <select value={offer} disabled={busy} onChange={(e) => setOffer(e.target.value as PersonalQuote["offer"])}><option value="monthly">Monthly</option><option value="annual">Annual</option></select></label>
+      <label>Term <select value={offer} disabled={busy} onChange={(e) => setOffer(e.target.value as PersonalBillingTerm)}><option value="monthly">Monthly</option><option value="annual">Annual</option></select></label>
       {quoteLoading && <p className="muted" role="status">Loading billing quote…</p>}
       {quoteError !== null && <><p role="alert">{quoteError}</p><button disabled={busy || quoteLoading} onClick={() => setQuoteAttempt((attempt) => attempt + 1)}>Retry billing quote</button></>}
-      {quote !== null && quote.offer === offer && <>
+      {quote !== null && quote.offer.endsWith(`_${offer}`) && <>
         <p>{pounds(quote.amountPence)} per {quote.interval}. Tax is shown at checkout.</p>
         {quote.founding && <p className="muted">Founding price: {quote.foundingRemainingPlaces ?? 0} places remain; {quote.foundingTerm}. Renews at {pounds(quote.nextRenewalAmountPence)}.</p>}
         <button className="primary" disabled={busy || quoteLoading} onClick={() => void checkout()}>{busy ? "Opening checkout…" : "Continue to secure checkout"}</button>
