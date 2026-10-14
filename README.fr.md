@@ -168,11 +168,36 @@ sotto grant <user-id>                      # share the active environment (they 
 sotto token create --name ci               # SOTTO_TOKEN: run/export in CI, no password needed
 ```
 
-Les tokens machine expirent. Un nouveau token dure 90 jours, sauf si vous passez `--expires-in-days`
-avec une valeur de 1 à 365, et `sotto token ls` indique quand chacun prend fin. Deux semaines avant,
-`sotto run` et `sotto export` affichent un avertissement dans le journal de la CI. Pour remplacer un
-token, créez-en un nouveau, mettez à jour le secret de la CI, puis révoquez l'ancien avec
-`sotto token revoke`.
+Les tokens machine expirent. Un nouveau token dure 90 jours, sauf si vous passez
+`--expires-in-days` avec une valeur de 1 à 365 ; `sotto token ls` indique quand chacun expire.
+Deux semaines avant, `sotto run` et `sotto export` affichent un avertissement dans le journal de la CI.
+
+Les commandes de gestion des tokens utilisent l'accès de l'utilisateur connecté et l'environnement
+sélectionné. Dans un environnement d'organisation, seuls un administrateur ou un propriétaire
+peut gérer les tokens machine. La liste contient uniquement les métadonnées des tokens actifs :
+les tokens révoqués et expirés sont omis, et elle ne permet pas de retrouver l'identifiant secret
+affiché une seule fois lors de la création avec `sotto token create`. Le JSON contient `token_id`,
+`name`, `created_by`, `beneficiary_id`, `beneficiary_status`, `expires_at` et
+`expires_in_days` ; les champs d'expiration peuvent être null. Le `token_id` est l'ID à révoquer,
+pas le nom du token ni le secret `SOTTO_TOKEN`.
+
+Utilisez ces commandes pour consulter, remplacer et révoquer un token. Le choix d'environnement
+ne s'applique qu'à cette commande :
+
+```sh
+sotto token ls
+sotto token ls --json
+sotto --env staging token ls --json
+sotto token create --name ci
+sotto token revoke <token-id>
+```
+
+Pour remplacer un token CI, identifiez l'ancien ID dans la liste, créez un remplacement, mettez
+à jour le secret CI et vérifiez que la CI l'utilise, puis révoquez l'ancien ID avec
+`sotto token revoke <token-id>`. La révocation empêche immédiatement ce token de s'authentifier
+auprès de l'API, mais ne renouvelle pas la clé d'environnement. Pour un environnement
+d'organisation, suivez les instructions existantes de `sotto rotate` si la rotation de la clé
+est nécessaire. Ni la révocation ni la rotation ne peuvent effacer du texte brut déjà copié.
 
 ### État Cloud
 
@@ -244,6 +269,36 @@ Appuyez sur `t` pour parcourir les thèmes avec un aperçu en direct. Utilisez l
 prévisualiser chaque thème, puis appuyez sur `Enter` pour enregistrer votre choix ou sur `Esc` pour
 annuler. Les [règles de priorité des thèmes](#thèmes-de-sortie) expliquent comment les options de
 commande et les variables d'environnement influent sur la préférence enregistrée.
+
+### Consulter l'état local
+
+Exécutez `sotto status` pour savoir si une identité locale existe, si la session est déverrouillée
+et quels projet et environnement le répertoire courant sélectionne. Cette commande lit l'état local.
+Elle ne vérifie pas la connexion au serveur ni la possibilité de déchiffrer chaque secret stocké.
+
+```sh
+sotto status
+sotto status --json
+```
+
+Utilisez `sotto status --json` dans les scripts. `initialized` indique si une identité locale existe,
+et `unlocked` si une clé maîtresse est en cache. `project` contient `name` et `environment` issus du
+`sotto.toml` le plus proche, ou vaut `null` hors d'un projet configuré. La commande peut réussir avec
+`unlocked: false` ; les scripts qui exigent une session déverrouillée doivent lire ce champ.
+
+Ces exemples JSON sont fictifs. Avec un `sotto.toml` mais sans identité locale :
+
+```json
+{"initialized":false,"project":{"environment":"dev","name":"demo"},"unlocked":false}
+```
+
+Sans `sotto.toml` ni identité locale :
+
+```json
+{"initialized":false,"project":null,"unlocked":false}
+```
+
+L'absence de `sotto.toml` signifie qu'aucun projet n'est sélectionné. Un fichier invalide ou illisible provoque une erreur.
 
 ### Thèmes de sortie
 

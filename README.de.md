@@ -168,10 +168,35 @@ sotto grant <user-id>                      # share the active environment (they 
 sotto token create --name ci               # SOTTO_TOKEN: run/export in CI, no password needed
 ```
 
-Maschinen-Tokens laufen ab. Ein neues Token gilt 90 Tage, sofern du nicht `--expires-in-days` mit
-einem Wert von 1 bis 365 angibst, und `sotto token ls` zeigt, wann jedes endet. Zwei Wochen vorher
-geben `sotto run` und `sotto export` eine Warnung im CI-Log aus. Um ein Token zu ersetzen, erstelle
-ein neues, aktualisiere das CI-Secret und widerrufe dann das alte mit `sotto token revoke`.
+Maschinen-Tokens laufen ab. Ein neues Token gilt 90 Tage, sofern du nicht `--expires-in-days`
+mit einem Wert von 1 bis 365 angibst; `sotto token ls` zeigt, wann jedes abläuft. Zwei Wochen
+vorher geben `sotto run` und `sotto export` eine Warnung im CI-Log aus.
+
+Token-Befehle verwenden den Zugriff des angemeldeten Benutzers und die ausgewählte Umgebung. In
+einer Organisationsumgebung dürfen nur Admins oder Eigentümer Maschinen-Token verwalten. Die
+Liste enthält nur Metadaten aktiver Token: widerrufene und abgelaufene Token werden ausgelassen,
+und das einmal bei `sotto token create` ausgegebene Zugangstoken lässt sich über die Liste nicht
+wiederherstellen. Das JSON enthält `token_id`, `name`, `created_by`, `beneficiary_id`,
+`beneficiary_status`, `expires_at` und `expires_in_days`; Ablauf-Felder können null sein.
+Die `token_id` ist die ID für den Widerruf, nicht der Token-Name oder das `SOTTO_TOKEN`-Secret.
+
+Mit diesen Befehlen kannst du Token anzeigen, ersetzen und widerrufen. Die Umgebungs-Auswahl
+gilt nur für diesen Befehl:
+
+```sh
+sotto token ls
+sotto token ls --json
+sotto --env staging token ls --json
+sotto token create --name ci
+sotto token revoke <token-id>
+```
+
+Um ein CI-Token zu ersetzen, ermittle zuerst die alte ID in der Liste, erstelle ein Ersatz-Token,
+aktualisiere das CI-Secret und prüfe, ob die CI es verwendet, und widerrufe dann die alte ID mit
+`sotto token revoke <token-id>`. Der Widerruf verhindert sofort, dass sich dieses Token bei
+der API authentifiziert, rotiert aber nicht den Umgebungsschlüssel. Für eine
+Organisationsumgebung beachte bei Bedarf die vorhandenen Hinweise zu `sotto rotate`. Weder
+Widerruf noch Rotation können bereits kopierten Klartext löschen.
 
 ### Cloud-Status
 
@@ -245,6 +270,36 @@ Drücke `t`, um Themes mit einer Live-Vorschau durchzugehen. Mit den Pfeiltasten
 Theme. Drücke `Enter`, um deine Wahl zu speichern, oder `Esc`, um abzubrechen. Die
 [Vorrangregeln für Themes](#ausgabe-themes) erklären, wie Befehlsoptionen und Umgebungsvariablen
 die gespeicherte Einstellung beeinflussen.
+
+### Lokalen Status prüfen
+
+Mit `sotto status` siehst du, ob eine lokale Identität vorhanden ist, ob die Sitzung entsperrt ist
+und welches Projekt mit welcher Umgebung das aktuelle Verzeichnis auswählt. Der Befehl liest den
+lokalen Zustand. Er prüft weder die Serververbindung noch, ob alle gespeicherten Secrets entschlüsselbar sind.
+
+```sh
+sotto status
+sotto status --json
+```
+
+Verwende `sotto status --json` in Skripten. `initialized` zeigt an, ob eine lokale Identität vorhanden ist,
+und `unlocked`, ob ein Hauptschlüssel zwischengespeichert ist. `project` enthält `name` und `environment`
+aus der nächsten `sotto.toml` oder ist außerhalb eines konfigurierten Projekts `null`. Ein erfolgreicher
+Befehl kann `unlocked: false` melden. Skripte, die eine entsperrte Sitzung benötigen, müssen dieses Feld prüfen.
+
+Diese JSON-Beispiele dienen nur zur Veranschaulichung. Mit einer `sotto.toml`, aber ohne lokale Identität:
+
+```json
+{"initialized":false,"project":{"environment":"dev","name":"demo"},"unlocked":false}
+```
+
+Ohne `sotto.toml` und ohne lokale Identität:
+
+```json
+{"initialized":false,"project":null,"unlocked":false}
+```
+
+Fehlt `sotto.toml`, ist kein Projekt ausgewählt. Eine fehlerhafte oder unlesbare Datei führt zu einem Fehler.
 
 ### Ausgabe-Themes
 
