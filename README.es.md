@@ -270,6 +270,36 @@ y pulsa `Enter` para guardar tu elección o `Esc` para cancelar. Las
 [reglas de precedencia de los temas](#temas-de-salida) explican cómo los ajustes del comando y del
 entorno afectan a la preferencia guardada.
 
+### Consultar el estado local
+
+Ejecuta `sotto status` para ver si existe una identidad local, si la sesión está desbloqueada y
+qué proyecto y entorno selecciona el directorio actual. Lee el estado local. No comprueba la
+conexión con el servidor ni garantiza que todos los secretos guardados se puedan descifrar.
+
+```sh
+sotto status
+sotto status --json
+```
+
+Usa `sotto status --json` en scripts. `initialized` indica si existe una identidad local y
+`unlocked` indica si hay una clave maestra en caché. `project` contiene `name` y `environment`
+del `sotto.toml` más cercano, o es `null` fuera de un proyecto configurado. Un comando correcto
+puede mostrar `unlocked: false`; los scripts que necesitan una sesión desbloqueada deben consultar ese campo.
+
+Estos ejemplos JSON son ilustrativos. Con un `sotto.toml` pero sin identidad local:
+
+```json
+{"initialized":false,"project":{"environment":"dev","name":"demo"},"unlocked":false}
+```
+
+Sin un `sotto.toml` ni identidad local:
+
+```json
+{"initialized":false,"project":null,"unlocked":false}
+```
+
+Si falta `sotto.toml`, no hay ningún proyecto seleccionado. Un archivo mal formado o ilegible produce un error.
+
 ### Temas de salida
 
 La CLI incluye cinco temas integrados: `nord` (el predeterminado), `sordino`, `terminal`,

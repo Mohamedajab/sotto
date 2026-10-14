@@ -262,6 +262,36 @@ Press `t` to browse themes with a live preview. Use the arrow keys to preview ea
 press `Enter` to save your choice or `Esc` to cancel. The [theme precedence rules](#output-themes)
 explain how command and environment overrides affect the saved preference.
 
+### Inspect local status
+
+Run `sotto status` to see whether a local identity exists, whether the session is unlocked, and
+which project and environment the current directory selects. It reads local state. It does not
+check server connectivity or prove that every stored secret can be decrypted.
+
+```sh
+sotto status
+sotto status --json
+```
+
+Use `sotto status --json` in scripts. `initialized` reports whether a local identity exists, and
+`unlocked` reports whether a master key is cached. `project` contains `name` and `environment`
+from the nearest `sotto.toml`, or is `null` outside a configured project. A successful command can
+report `unlocked: false`, so scripts must inspect that field if they need an unlocked session.
+
+These JSON examples are illustrative. With a `sotto.toml` but no local identity:
+
+```json
+{"initialized":false,"project":{"environment":"dev","name":"demo"},"unlocked":false}
+```
+
+Without a `sotto.toml` or local identity:
+
+```json
+{"initialized":false,"project":null,"unlocked":false}
+```
+
+An absent `sotto.toml` means no project is selected. A malformed or unreadable file is an error.
+
 ### Output themes
 
 The CLI ships five built-in themes: `nord` (the default), `sordino`, `terminal`, `monochrome`,

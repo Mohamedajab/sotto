@@ -20,6 +20,8 @@ use sotto_server::cloud_provider_stripe::StripeCoverageConfig;
 use sotto_server::cloud_provider_stripe_http::StripeReadClient;
 #[cfg(not(feature = "e2e-mock-billing"))]
 use sotto_server::cloud_provider_stripe_http::StripeReadLimits;
+#[cfg(not(feature = "e2e-mock-billing"))]
+use sotto_server::cloud_provider_stripe_sponsored::SponsoredStripeCoverageConfig;
 use sotto_server::config::Config;
 use sotto_server::db;
 use sotto_server::error::{Error, Result};
@@ -122,7 +124,21 @@ async fn run() -> Result<()> {
                     .map_err(|_| {
                         Error::Config("configured provider refresh limits are invalid".into())
                     })?;
-                    personal_coverage_runtime = Some((coverage.clone(), client.clone()));
+                    let sponsored_coverage = SponsoredStripeCoverageConfig::new(
+                        account_id,
+                        environment,
+                        ids.standard_monthly.clone(),
+                        ids.standard_annual.clone(),
+                        ids.founding_monthly.clone(),
+                        ids.founding_annual.clone(),
+                    )
+                    .map_err(|_| {
+                        Error::Config(
+                            "configured sponsored Stripe prices do not form a valid coverage identity".into(),
+                        )
+                    })?;
+                    personal_coverage_runtime =
+                        Some((coverage.clone(), sponsored_coverage, client.clone()));
                     state = state.with_personal_coverage(
                         coverage,
                         client,
@@ -136,7 +152,7 @@ async fn run() -> Result<()> {
         None
     };
     #[cfg(not(feature = "e2e-mock-billing"))]
-    if let Some((coverage, stripe)) = &personal_coverage_runtime {
+    if let Some((coverage, _, stripe)) = &personal_coverage_runtime {
         if let Some(ids) = config
             .billing
             .as_ref()
@@ -205,12 +221,17 @@ async fn run() -> Result<()> {
         sotto_server::org_deletion_worker::spawn(pool.clone(), worker_provider);
     }
     if config.provider_refresh_worker_enabled {
-        let Some((coverage, stripe)) = personal_coverage_runtime else {
+        let Some((coverage, sponsored_coverage, stripe)) = personal_coverage_runtime else {
             return Err(Error::Config(
                 "provider refresh worker requires configured personal Stripe coverage".into(),
             ));
         };
-        sotto_server::cloud_provider_stripe_personal_refresh::spawn(pool.clone(), stripe, coverage);
+        sotto_server::cloud_provider_stripe_refresh_executor::spawn(
+            pool.clone(),
+            stripe,
+            coverage,
+            sponsored_coverage,
+        );
     }
     sotto_server::telemetry::spawn(pool, config.telemetry.clone());
 
