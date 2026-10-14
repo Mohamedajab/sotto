@@ -56,6 +56,8 @@ pub mod cloud_provider_stripe_adapter;
 #[doc(hidden)]
 pub mod cloud_provider_stripe_http;
 #[doc(hidden)]
+pub mod cloud_provider_stripe_personal_refresh;
+#[doc(hidden)]
 pub mod cloud_provider_stripe_renewal_store;
 #[doc(hidden)]
 pub mod cloud_provider_stripe_renewals;

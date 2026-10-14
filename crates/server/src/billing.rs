@@ -22,8 +22,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use sqlx::{Postgres, Row, Transaction};
+use uuid::Uuid;
 
 #[cfg(feature = "e2e-mock-billing")]
 use url::Url;
@@ -32,6 +33,13 @@ use crate::auth::AuthUser;
 use crate::billing_catalogue::{BillingOffer, BillingPriceIds};
 use crate::billing_operations::{self, BeginOperation, BillingOperationState};
 use crate::billing_refunds::{self, CorrectionReason, PayerKind};
+use crate::cloud_provider::{
+    accept_provider_invalidation, record_verified_event, register_verified_allocation,
+    AllocationState, PayerKind as ProviderPayerKind, ProviderContext, VerifiedAllocation,
+};
+use crate::cloud_provider_stripe::StripeCoverageConfig;
+use crate::cloud_provider_stripe::{decode_paid_invoice, StripeAllocationBinding};
+use crate::cloud_provider_stripe_http::StripeReadClient;
 use crate::config::BillingConfig;
 use crate::error::{Error, Result};
 use crate::founding_allocator::{self, FoundingOffer};
@@ -143,6 +151,57 @@ impl ProviderError {
         let detail = self.code.unwrap_or_else(|| "unknown_error".into());
         Error::Upstream(format!("stripe provider error: {detail}"))
     }
+}
+
+/// A provider 4xx response proves that the requested sponsored mutation was rejected. A 5xx,
+/// transport failure or malformed success response can follow an applied mutation, so its
+/// reservation must remain until the provider outcome is reconciled.
+fn provider_failure_is_definitive(error: &ProviderError) -> bool {
+    matches!(error.status, Some(400 | 401 | 403 | 404))
+        && error.kind != ProviderErrorKind::Retryable
+}
+
+async fn fail_sponsored_provider_operation(
+    pool: &sqlx::PgPool,
+    operation_id: &str,
+    result_code: &str,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    founding_allocator::lock_capacity(&mut tx)
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?;
+    sponsored_billing::cancel_failed_operation(&mut tx, operation_id, result_code)
+        .await
+        .map_err(Error::from)?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn rotate_sponsored_provider_retry_key(
+    pool: &sqlx::PgPool,
+    operation_id: &str,
+    current_key: &str,
+) -> Result<()> {
+    // Updating a subscription schedule replaces the complete desired phase set, so an ambiguous
+    // outcome can be retried with a fresh provider key without duplicating a charge or a resource.
+    let operation_hash: String = Sha256::digest(operation_id.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let next_key = format!(
+        "sotto-sponsored:{operation_hash}-retry-{}",
+        Uuid::new_v4().simple()
+    );
+    sqlx::query(
+        "UPDATE billing_sponsored_operations SET provider_idempotency_key = $3, updated_at = now() \
+         WHERE operation_id = $1 AND state = 'pending' AND provider_idempotency_key = $2",
+    )
+    .bind(operation_id)
+    .bind(current_key)
+    .bind(next_key)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 impl fmt::Display for ProviderError {
@@ -305,12 +364,19 @@ pub trait SubscriptionProvider: Send + Sync {
         customer: Option<&str>,
         price_id: &str,
         operation_id: &str,
+        allocation_reference: &str,
         idempotency_key: &str,
         expires_at_epoch: i64,
         success_url: &str,
         cancel_url: &str,
     ) -> ProviderResult<String> {
-        let _ = (price_id, operation_id, idempotency_key, expires_at_epoch);
+        let _ = (
+            price_id,
+            operation_id,
+            allocation_reference,
+            idempotency_key,
+            expires_at_epoch,
+        );
         self.create_checkout(user_id, customer, success_url, cancel_url)
             .await
     }
@@ -452,6 +518,14 @@ pub struct BillingState {
     return_url: String,
     price_catalogue: Option<BillingPriceIds>,
     cloud_sales_enabled: bool,
+    personal_coverage: Option<PersonalCoverageRuntime>,
+}
+
+#[derive(Clone)]
+struct PersonalCoverageRuntime {
+    config: StripeCoverageConfig,
+    client: StripeReadClient,
+    ingest_enabled: bool,
 }
 
 impl BillingState {
@@ -479,7 +553,39 @@ impl BillingState {
             return_url: config.return_url,
             price_catalogue: config.price_catalogue,
             cloud_sales_enabled: config.cloud_sales_enabled,
+            personal_coverage: None,
         }
+    }
+
+    pub fn with_personal_coverage(
+        mut self,
+        config: StripeCoverageConfig,
+        client: StripeReadClient,
+        ingest_enabled: bool,
+    ) -> Self {
+        self.personal_coverage = Some(PersonalCoverageRuntime {
+            config,
+            client,
+            ingest_enabled,
+        });
+        self
+    }
+
+    pub fn with_price_catalogue(mut self, catalogue: BillingPriceIds) -> Self {
+        self.price_catalogue = Some(catalogue);
+        self
+    }
+
+    pub(crate) fn personal_coverage(&self) -> Option<(&StripeCoverageConfig, &StripeReadClient)> {
+        self.personal_coverage
+            .as_ref()
+            .map(|runtime| (&runtime.config, &runtime.client))
+    }
+
+    pub(crate) fn personal_coverage_ingest_enabled(&self) -> bool {
+        self.personal_coverage
+            .as_ref()
+            .is_some_and(|runtime| runtime.ingest_enabled)
     }
 
     pub fn with_provider(
@@ -503,6 +609,7 @@ impl BillingState {
             return_url,
             price_catalogue: None,
             cloud_sales_enabled,
+            personal_coverage: None,
         }
     }
 
@@ -514,6 +621,7 @@ impl BillingState {
             return_url: config.return_url,
             price_catalogue: config.price_catalogue,
             cloud_sales_enabled: config.cloud_sales_enabled,
+            personal_coverage: None,
         }
     }
 }
@@ -564,6 +672,7 @@ impl SubscriptionProvider for StripeBilling {
         customer: Option<&str>,
         price_id: &str,
         operation_id: &str,
+        allocation_reference: &str,
         idempotency_key: &str,
         expires_at_epoch: i64,
         success_url: &str,
@@ -587,6 +696,10 @@ impl SubscriptionProvider for StripeBilling {
             (
                 "subscription_data[metadata][operation_id]".to_string(),
                 operation_id.to_string(),
+            ),
+            (
+                "subscription_data[metadata][sotto_allocation_reference]".to_string(),
+                allocation_reference.to_string(),
             ),
             ("success_url".to_string(), success_url.to_string()),
             ("cancel_url".to_string(), cancel_url.to_string()),
@@ -1305,12 +1418,17 @@ struct SponsoredQuoteRequest {
 #[derive(Debug, Serialize)]
 struct SponsoredQuoteView {
     action: String,
+    offer: String,
     seat_count: i64,
     amount_pence: i64,
     currency: &'static str,
     interval: &'static str,
     quote_version: i64,
     quote_expires_at_epoch: i64,
+    founding: bool,
+    founding_remaining_places: Option<i64>,
+    founding_term: Option<&'static str>,
+    next_renewal_amount_pence: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -1376,7 +1494,7 @@ async fn sponsored_quote(
     Json(request): Json<SponsoredQuoteRequest>,
 ) -> Result<Json<SponsoredQuoteView>> {
     let action = SponsoredSeatAction::parse(&request.action).map_err(Error::from)?;
-    if request.beneficiary_ids.is_empty()
+    if request.beneficiary_ids.len() != 1
         || request
             .beneficiary_ids
             .iter()
@@ -1389,10 +1507,10 @@ async fn sponsored_quote(
             != request.beneficiary_ids.len()
     {
         return Err(Error::BadRequest(
-            "beneficiary_ids must contain unique existing accounts".into(),
+            "a sponsored quote must name exactly one unique beneficiary account".into(),
         ));
     }
-    let offer = billing_offer(&request.offer)?;
+    let requested_offer = billing_offer(&request.offer)?;
     let billing = sponsored_sales_config(&state)?;
     let catalogue = billing
         .price_catalogue()
@@ -1414,21 +1532,68 @@ async fn sponsored_quote(
             return Err(Error::NotFound("sponsored beneficiary not found".into()));
         }
     }
-    let quote = sponsored_billing::quote(
-        action,
-        offer,
-        request.beneficiary_ids.len(),
-        sponsored_billing::current_epoch(),
-    )
-    .map_err(Error::from)?;
+    let now = sponsored_billing::current_epoch();
+    let (offer, founding_remaining_places) = if action == SponsoredSeatAction::Remove {
+        (requested_offer, None)
+    } else {
+        let mut tx = state.pool.begin().await?;
+        let selected = founding_allocator::select_offer(
+            &mut tx,
+            &request.beneficiary_ids[0],
+            FoundingOffer::for_billing_offer_interval(requested_offer),
+            None,
+            now,
+        )
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?;
+        let founding_offer = FoundingOffer::from_billing_offer(selected);
+        let remaining = if let Some(founding_offer) = founding_offer {
+            let status = founding_allocator::quote_status(&mut tx, founding_offer, now)
+                .await
+                .map_err(|error| Error::Internal(error.to_string()))?;
+            let subscription_period_end: Option<Option<i64>> = sqlx::query_scalar(
+                "SELECT current_period_end FROM billing_sponsored_subscriptions \
+                 WHERE organization_id = $1 AND provider_subscription_id IS NOT NULL \
+                   AND status IN ('pending', 'active', 'past_due')",
+            )
+            .bind(&org_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if subscription_period_end.is_some_and(|period_end| period_end.is_none()) {
+                return Err(Error::Conflict(
+                    "sponsored subscription period is unavailable; founding quote cannot be issued"
+                        .into(),
+                ));
+            }
+            Some(status.remaining_places)
+        } else {
+            None
+        };
+        tx.rollback().await?;
+        (selected, remaining)
+    };
+    let quote = sponsored_billing::quote(action, offer, request.beneficiary_ids.len(), now)
+        .map_err(Error::from)?;
     Ok(Json(SponsoredQuoteView {
         action: quote.action.as_str().into(),
+        offer: quote.offer.as_str().into(),
         seat_count: quote.seat_count,
         amount_pence: quote.amount_pence,
         currency: quote.currency,
         interval: quote.interval,
         quote_version: quote.quote_version,
         quote_expires_at_epoch: quote.quote_expires_at_epoch,
+        founding: FoundingOffer::from_billing_offer(offer).is_some(),
+        founding_remaining_places,
+        founding_term: FoundingOffer::from_billing_offer(offer).map(|offer| match offer {
+            FoundingOffer::Monthly => "for the first monthly billing term",
+            FoundingOffer::Annual => "for the first annual billing term",
+        }),
+        next_renewal_amount_pence: match FoundingOffer::from_billing_offer(offer) {
+            Some(FoundingOffer::Monthly) => BillingOffer::StandardMonthly.expected_amount_pence(),
+            Some(FoundingOffer::Annual) => BillingOffer::StandardAnnual.expected_amount_pence(),
+            None => offer.expected_amount_pence(),
+        },
     }))
 }
 
@@ -1474,6 +1639,23 @@ async fn sponsored_checkout(
         .map_err(Error::from)?;
     let now = sponsored_billing::current_epoch();
     let mut tx = state.pool.begin().await?;
+    // Keep the allocator mutex ahead of organisation, seat, operation and subscription locks.
+    // Invoice settlement and expiry use the same order.
+    founding_allocator::lock_capacity(&mut tx)
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?;
+    let incoming_beneficiary = request
+        .replacement_beneficiary_id
+        .as_deref()
+        .unwrap_or(&request.beneficiary_id);
+    sponsored_billing::cancel_expired_pending_checkouts(
+        &mut tx,
+        &org_id,
+        incoming_beneficiary,
+        now,
+    )
+    .await
+    .map_err(Error::from)?;
     let operation =
         sponsored_billing::begin_operation(&mut tx, &org_id, &user.user_id, &request, now)
             .await
@@ -1487,24 +1669,94 @@ async fn sponsored_checkout(
             provider_checkout_url: operation.provider_checkout_url,
         }));
     }
-    let existing_subscription: Option<(Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT provider_customer_id, provider_subscription_id \
+    if request.action != SponsoredSeatAction::Remove {
+        let selected_offer = founding_allocator::select_offer(
+            &mut tx,
+            incoming_beneficiary,
+            FoundingOffer::for_billing_offer_interval(offer),
+            Some(&operation.operation_id),
+            now,
+        )
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?;
+        if selected_offer != offer {
+            return Err(Error::Conflict(
+                "sponsored billing quote no longer matches founding availability; refresh the quote".into(),
+            ));
+        }
+    }
+    let existing_subscription: Option<(Option<String>, Option<String>, Option<i64>)> =
+        sqlx::query_as(
+            "SELECT provider_customer_id, provider_subscription_id, current_period_end \
          FROM billing_sponsored_subscriptions \
          WHERE organization_id = $1 AND provider_subscription_id IS NOT NULL \
            AND status IN ('pending', 'active', 'past_due') FOR UPDATE",
-    )
-    .bind(&org_id)
-    .fetch_optional(&mut *tx)
-    .await?;
+        )
+        .bind(&org_id)
+        .fetch_optional(&mut *tx)
+        .await?;
     let existing_customer: Option<String> =
         sqlx::query_scalar("SELECT stripe_customer_id FROM organizations WHERE id = $1")
             .bind(&org_id)
             .fetch_one(&mut *tx)
             .await?;
+
+    if request.action != SponsoredSeatAction::Remove {
+        if let Some(founding_offer) = FoundingOffer::from_billing_offer(offer) {
+            let reservation_expires_at = if let Some((_, Some(_), period_end)) =
+                existing_subscription.as_ref()
+            {
+                let period_end = period_end.ok_or_else(|| {
+                    Error::Conflict(
+                        "sponsored subscription period is unavailable; founding quote cannot be reserved".into(),
+                    )
+                })?;
+                period_end
+                    .checked_add(founding_allocator::SETTLEMENT_RECOVERY_SECONDS)
+                    .ok_or_else(|| Error::Internal("billing clock overflow".into()))?
+                    .max(request.quote_expires_at_epoch)
+            } else {
+                personal_checkout_expiry(request.quote_expires_at_epoch, now)?
+            };
+            let reservation = founding_allocator::reserve_with_payer_kind_until(
+                &mut tx,
+                &format!("founding:{}", operation.operation_id),
+                &operation.operation_id,
+                incoming_beneficiary,
+                founding_allocator::FoundingPayerKind::Sponsor,
+                &org_id,
+                founding_offer,
+                request.quote_version,
+                request.quote_expires_at_epoch,
+                reservation_expires_at,
+                now,
+            )
+            .await
+            .map_err(|error| Error::Conflict(error.to_string()))?;
+            if matches!(reservation, founding_allocator::ReservationOutcome::Full) {
+                return Err(Error::Conflict(
+                    "founding hosted places are no longer available; refresh the quote".into(),
+                ));
+            }
+        }
+    }
+    if let Some((_, Some(subscription_id), _)) = existing_subscription.as_ref() {
+        // Persist the target before the provider call. If Stripe ends the subscription while an
+        // update is in flight, the terminal webhook can fail this operation and release its
+        // founding reservation instead of leaving an orphaned pending seat behind.
+        sqlx::query(
+            "UPDATE billing_sponsored_operations SET provider_subscription_id = $2, updated_at = now() \
+             WHERE operation_id = $1 AND state = 'pending'",
+        )
+        .bind(&operation.operation_id)
+        .bind(subscription_id)
+        .execute(&mut *tx)
+        .await?;
+    }
     tx.commit().await?;
 
     let (success_url, cancel_url) = checkout_return_urls(&billing.return_url);
-    let result = if let Some((customer_id, Some(subscription_id))) = existing_subscription {
+    let result = if let Some((customer_id, Some(subscription_id), _)) = existing_subscription {
         let phases = sponsored_provider_phases(
             &state.pool,
             &org_id,
@@ -1512,7 +1764,7 @@ async fn sponsored_checkout(
             sponsored_billing::current_epoch(),
         )
         .await?;
-        let snapshot = billing
+        let snapshot = match billing
             .provider
             .update_sponsored_subscription(
                 &org_id,
@@ -1521,7 +1773,27 @@ async fn sponsored_checkout(
                 &operation.provider_idempotency_key,
             )
             .await
-            .map_err(ProviderError::into_error)?;
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                if provider_failure_is_definitive(&error) {
+                    fail_sponsored_provider_operation(
+                        &state.pool,
+                        &operation.operation_id,
+                        "provider_rejected",
+                    )
+                    .await?;
+                } else if error.kind == ProviderErrorKind::Retryable {
+                    rotate_sponsored_provider_retry_key(
+                        &state.pool,
+                        &operation.operation_id,
+                        &operation.provider_idempotency_key,
+                    )
+                    .await?;
+                }
+                return Err(error.into_error());
+            }
+        };
         let mut result_tx = state.pool.begin().await?;
         let operation = sponsored_billing::record_provider_update(
             &mut result_tx,
@@ -1543,7 +1815,7 @@ async fn sponsored_checkout(
         }
     } else if existing_subscription.is_none() && action == SponsoredSeatAction::Add {
         let items = sponsored_provider_items(&state.pool, &org_id, catalogue, &operation).await?;
-        let checkout = billing
+        let checkout = match billing
             .provider
             .create_sponsored_checkout(
                 &org_id,
@@ -1559,7 +1831,20 @@ async fn sponsored_checkout(
                 &cancel_url,
             )
             .await
-            .map_err(ProviderError::into_error)?;
+        {
+            Ok(checkout) => checkout,
+            Err(error) => {
+                if provider_failure_is_definitive(&error) {
+                    fail_sponsored_provider_operation(
+                        &state.pool,
+                        &operation.operation_id,
+                        "provider_rejected",
+                    )
+                    .await?;
+                }
+                return Err(error.into_error());
+            }
+        };
         let mut result_tx = state.pool.begin().await?;
         let operation = sponsored_billing::record_checkout(
             &mut result_tx,
@@ -1768,7 +2053,8 @@ async fn personal_quote(
     let catalogue = billing
         .price_catalogue()
         .ok_or_else(|| Error::NotConfigured("hosted personal billing is not configured".into()))?;
-    let offer = billing_offer(&query.offer)?;
+    let requested_offer = billing_offer(&query.offer)?;
+    let requested_interval = FoundingOffer::for_billing_offer_interval(requested_offer);
     validate_personal_catalogue(billing, catalogue).await?;
     let now = billing_epoch();
     let expires = now
@@ -1804,6 +2090,10 @@ async fn personal_quote(
             "this person already has sponsored hosted coverage".into(),
         ));
     }
+    let offer =
+        founding_allocator::select_offer(&mut tx, &user.user_id, requested_interval, None, now)
+            .await
+            .map_err(|error| Error::Internal(error.to_string()))?;
     let amount_pence = offer.expected_amount_pence();
     let interval = offer.expected_interval();
     let founding = FoundingOffer::from_billing_offer(offer);
@@ -1814,8 +2104,8 @@ async fn personal_quote(
         (
             Some(status.remaining_places),
             Some(match founding_offer {
-                FoundingOffer::Monthly => "through the founding monthly term",
-                FoundingOffer::Annual => "through the founding annual term",
+                FoundingOffer::Monthly => "for the first monthly billing term",
+                FoundingOffer::Annual => "for the first annual billing term",
             }),
             status.standard_amount_pence,
         )
@@ -1869,6 +2159,9 @@ async fn personal_checkout(
     billing_operations::validate_return_url(&billing.return_url, &request.return_url)
         .map_err(Error::from)?;
     let mut tx = state.pool.begin().await?;
+    founding_allocator::lock_capacity(&mut tx)
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?;
     let operation = billing_operations::begin_personal_operation(
         &mut tx,
         &user.user_id,
@@ -1884,6 +2177,21 @@ async fn personal_checkout(
     let mut checkout_expires_at_epoch = None;
     let operation = match operation {
         BeginOperation::Created(operation) => {
+            let selected_offer = founding_allocator::select_offer(
+                &mut tx,
+                &user.user_id,
+                FoundingOffer::for_billing_offer_interval(offer),
+                Some(&operation.operation_id),
+                billing_epoch(),
+            )
+            .await
+            .map_err(|error| Error::Internal(error.to_string()))?;
+            if selected_offer != offer {
+                return Err(Error::Conflict(
+                    "billing quote no longer matches founding availability; refresh the quote"
+                        .into(),
+                ));
+            }
             let expiry = personal_checkout_expiry(request.quote_expires_at_epoch, billing_epoch())?;
             checkout_expires_at_epoch = Some(expiry);
             personal_billing::begin_account(
@@ -1897,14 +2205,16 @@ async fn personal_checkout(
             .await
             .map_err(personal_billing_error)?;
             if let Some(founding_offer) = FoundingOffer::from_billing_offer(offer) {
-                let reservation = founding_allocator::reserve(
+                let reservation = founding_allocator::reserve_with_payer_kind_until(
                     &mut tx,
                     &format!("founding:{}", operation.operation_id),
                     &operation.operation_id,
                     &user.user_id,
+                    founding_allocator::FoundingPayerKind::Personal,
                     &user.user_id,
                     founding_offer,
                     request.quote_version,
+                    request.quote_expires_at_epoch,
                     expiry,
                     billing_epoch(),
                 )
@@ -1942,6 +2252,12 @@ async fn personal_checkout(
         Some(expiry) => expiry,
         None => personal_checkout_expiry(operation.quote_expires_at_epoch, billing_epoch())?,
     };
+    let allocation_reference: String = sqlx::query_scalar(
+        "SELECT allocation_reference FROM billing_personal_accounts WHERE operation_id = $1",
+    )
+    .bind(&operation.operation_id)
+    .fetch_one(&state.pool)
+    .await?;
     let (success_url, cancel_url) = checkout_return_urls(&billing.return_url);
     let checkout_url = billing
         .provider
@@ -1950,6 +2266,7 @@ async fn personal_checkout(
             None,
             &price_id,
             &operation.operation_id,
+            &allocation_reference,
             &operation.provider_idempotency_key,
             checkout_expires_at_epoch,
             &success_url,
@@ -2879,6 +3196,32 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
         )));
     }
 
+    let processed_duplicate =
+        if event.kind == "invoice.paid" && billing.personal_coverage_ingest_enabled() {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM stripe_webhook_events \
+             WHERE event_id = $1 AND processed_at IS NOT NULL)",
+            )
+            .bind(&event.id)
+            .fetch_one(&state.pool)
+            .await?
+        } else {
+            false
+        };
+    let (personal_coverage, coverage_rejection) = if event.kind == "invoice.paid"
+        && billing.personal_coverage_ingest_enabled()
+        && !processed_duplicate
+    {
+        match prepare_personal_invoice_coverage(&state.pool, billing, &body, signature, now).await?
+        {
+            PersonalInvoiceCoveragePreparation::NotApplicable => (None, None),
+            PersonalInvoiceCoveragePreparation::Prepared(coverage) => (Some(*coverage), None),
+            PersonalInvoiceCoveragePreparation::Rejected(reason) => (None, Some(reason)),
+        }
+    } else {
+        (None, None)
+    };
+
     let mut tx = state.pool.begin().await?;
     prune_webhook_events(&mut tx).await?;
     let disposition = record_webhook_event(&mut tx, &event).await?;
@@ -2986,7 +3329,26 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
             "checkout.session.expired" => sponsored_checkout_expired(&mut tx, object).await?,
             "customer.subscription.updated" => subscription_updated(&mut tx, object).await?,
             "customer.subscription.deleted" => subscription_deleted(&mut tx, object).await?,
-            "invoice.paid" => invoice_paid(&mut tx, object, billing.price_catalogue()).await?,
+            "invoice.paid" => {
+                invoice_paid(
+                    &mut tx,
+                    object,
+                    event.created,
+                    billing.price_catalogue(),
+                    personal_coverage.as_ref(),
+                )
+                .await?;
+                if let Some(coverage) = &personal_coverage {
+                    accept_personal_invoice_coverage(
+                        &mut tx,
+                        &coverage.context,
+                        &coverage.event,
+                        &coverage.allocation,
+                        true,
+                    )
+                    .await?;
+                }
+            }
             _ => {}
         },
         EventDisposition::Reconcile | EventDisposition::Ignore => {
@@ -2998,7 +3360,512 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
     }
     mark_webhook_event_processed(&mut tx, &event.id).await?;
     tx.commit().await?;
+    if let Some(reason) = coverage_rejection {
+        eprintln!(
+            "error: accepted Stripe invoice event {} for billing without personal Cloud coverage: {}",
+            event.id, reason
+        );
+    }
     Ok(())
+}
+
+struct PreparedPersonalInvoiceCoverage {
+    context: ProviderContext,
+    event: crate::cloud_provider::VerifiedProviderEvent,
+    allocation: VerifiedAllocation,
+    payment_reference: String,
+    period_end: i64,
+}
+
+enum PersonalInvoiceCoveragePreparation {
+    NotApplicable,
+    Prepared(Box<PreparedPersonalInvoiceCoverage>),
+    Rejected(&'static str),
+}
+
+async fn prepare_personal_invoice_coverage(
+    pool: &sqlx::PgPool,
+    billing: &BillingState,
+    raw_event: &str,
+    signature: &str,
+    now_epoch: i64,
+) -> Result<PersonalInvoiceCoveragePreparation> {
+    let (coverage_config, stripe) = billing
+        .personal_coverage()
+        .ok_or_else(|| Error::Internal("personal Stripe coverage is not configured".into()))?;
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw_event) else {
+        return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+            "invoice_payload_malformed",
+        ));
+    };
+    let Some(invoice) = value.get("data").and_then(|data| data.get("object")) else {
+        return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+            "invoice_payload_malformed",
+        ));
+    };
+    let subscription_claim = invoice_subscription_id_claim(invoice);
+    let allocation_reference = invoice_allocation_reference_claim(invoice);
+    let subscription_binding_required = if let Some(subscription_id) = subscription_claim.as_deref()
+    {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT stripe_coverage_binding_required FROM billing_personal_accounts \
+             WHERE stripe_subscription_id = $1",
+        )
+        .bind(subscription_id)
+        .fetch_optional(pool)
+        .await?
+    } else {
+        None
+    };
+    let metadata_binding = if let (Some(user_id), Some(operation_id)) = (
+        invoice_metadata_claim(invoice, "personal_user_id"),
+        invoice_metadata_claim(invoice, "operation_id"),
+    ) {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT stripe_coverage_binding_required FROM billing_personal_accounts \
+             WHERE user_id = $1 AND operation_id = $2",
+        )
+        .bind(user_id)
+        .bind(operation_id)
+        .fetch_optional(pool)
+        .await?
+    } else {
+        None
+    };
+    let Some(allocation_reference) = allocation_reference else {
+        if subscription_binding_required == Some(true) {
+            return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+                "allocation_reference_missing",
+            ));
+        }
+        if metadata_binding == Some(true) {
+            return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+                "allocation_reference_missing",
+            ));
+        }
+        return Ok(PersonalInvoiceCoveragePreparation::NotApplicable);
+    };
+    if !allocation_reference.starts_with("alloc_") {
+        if subscription_binding_required == Some(true) || metadata_binding == Some(true) {
+            return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+                "allocation_reference_invalid",
+            ));
+        }
+        return Ok(PersonalInvoiceCoveragePreparation::NotApplicable);
+    }
+
+    let row = sqlx::query(
+        "SELECT user_id, operation_id, allocation_reference, stripe_coverage_binding_required, \
+                offer, stripe_customer_id, \
+                stripe_subscription_id FROM billing_personal_accounts \
+         WHERE allocation_reference = $1",
+    )
+    .bind(&allocation_reference)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        if subscription_binding_required == Some(true) {
+            return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+                "allocation_reference_unrecognised",
+            ));
+        }
+        if metadata_binding == Some(true) {
+            return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+                "allocation_reference_unrecognised",
+            ));
+        }
+        return Ok(PersonalInvoiceCoveragePreparation::NotApplicable);
+    };
+    if !row.try_get::<bool, _>("stripe_coverage_binding_required")? {
+        return Ok(PersonalInvoiceCoveragePreparation::NotApplicable);
+    }
+    let user_id: String = row.try_get("user_id")?;
+    let operation_id: String = row.try_get("operation_id")?;
+    let stored_reference: String = row.try_get("allocation_reference")?;
+    let offer: String = row.try_get("offer")?;
+    let Some(customer_id) = row.try_get::<Option<String>, _>("stripe_customer_id")? else {
+        return Err(Error::Internal(
+            "personal invoice checkout is not yet linked".into(),
+        ));
+    };
+    let Some(subscription_id) = row.try_get::<Option<String>, _>("stripe_subscription_id")? else {
+        return Err(Error::Internal(
+            "personal invoice checkout is not yet linked".into(),
+        ));
+    };
+    if stored_reference != allocation_reference
+        || invoice_metadata_claim(invoice, "personal_user_id").is_some_and(|claim| claim != user_id)
+        || invoice_metadata_claim(invoice, "operation_id")
+            .is_some_and(|claim| claim != operation_id)
+    {
+        return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+            "invoice_binding_mismatch",
+        ));
+    }
+    let Some(invoice_id) = invoice.get("id").and_then(stripe_reference) else {
+        return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+            "invoice_id_missing",
+        ));
+    };
+    let Some(customer_claim) = invoice.get("customer").and_then(stripe_reference) else {
+        return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+            "invoice_customer_missing",
+        ));
+    };
+    let Some(subscription_claim) = invoice_subscription_id_claim(invoice) else {
+        return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+            "invoice_subscription_missing",
+        ));
+    };
+    if customer_claim != customer_id || subscription_claim != subscription_id {
+        return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+            "invoice_binding_mismatch",
+        ));
+    }
+    let Some(provider_item_id) = invoice
+        .get("lines")
+        .and_then(|lines| lines.get("data"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|lines| (lines.len() == 1).then(|| &lines[0]))
+        .and_then(|line| line.get("parent"))
+        .and_then(|parent| parent.get("subscription_item_details"))
+        .and_then(|details| details.get("subscription_item"))
+        .and_then(stripe_reference)
+    else {
+        return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+            "invoice_item_missing",
+        ));
+    };
+    let binding = match StripeAllocationBinding::new(
+        allocation_reference.clone(),
+        customer_id.clone(),
+        subscription_id.clone(),
+        provider_item_id,
+        ProviderPayerKind::Personal,
+    ) {
+        Ok(binding) => binding,
+        Err(_) => {
+            return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+                "invoice_binding_invalid",
+            ));
+        }
+    };
+    let mut session = stripe.session();
+    let observation = match stripe
+        .personal_invoice_observation(&mut session, &invoice_id, &binding)
+        .await
+    {
+        Ok(observation) => observation,
+        Err(error) if error.is_evidence_rejection() => {
+            return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+                "stripe_invoice_evidence_rejected",
+            ));
+        }
+        Err(_) => {
+            return Err(Error::Internal(
+                "personal Stripe invoice read failed".into(),
+            ));
+        }
+    };
+    let payments = match stripe.invoice_payments(&mut session, &invoice_id).await {
+        Ok(payments) => payments,
+        Err(error) if error.is_evidence_rejection() => {
+            return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+                "stripe_payment_evidence_rejected",
+            ));
+        }
+        Err(_) => {
+            return Err(Error::Internal(
+                "personal Stripe payment read failed".into(),
+            ));
+        }
+    };
+    if payments.len() != 1 {
+        return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+            "payment_count_unsupported",
+        ));
+    }
+    let settlement = match payments[0].settlement(coverage_config) {
+        Ok(settlement) => settlement,
+        Err(_) => {
+            return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+                "payment_settlement_unsupported",
+            ));
+        }
+    };
+    let evidence = match decode_paid_invoice(
+        raw_event.as_bytes(),
+        signature,
+        &billing.webhook_secret,
+        now_epoch,
+        coverage_config,
+        &binding,
+        &settlement,
+    ) {
+        Ok(evidence) => evidence,
+        Err(_) => {
+            return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+                "invoice_evidence_unsupported",
+            ));
+        }
+    };
+    if evidence.invoice_id != observation.invoice_id()
+        || evidence.customer_id != observation.customer_id()
+        || evidence.subscription_id != observation.subscription_id()
+        || evidence.provider_item_id != observation.provider_item_id()
+        || evidence.allocation_reference != observation.allocation_reference()
+        || evidence.payment_intent_id != observation.payment_intent_id()
+        || evidence.amount_paid != observation.amount_paid()
+        || evidence.interval.to_string() != observation.interval().to_string()
+        || evidence.period_start != observation.period_start()
+        || evidence.period_end != observation.period_end()
+        || evidence.payment_intent_id != settlement.payment_intent_id()
+        || !billing_offer_matches_price(billing.price_catalogue(), &offer, &evidence.price_id)
+    {
+        return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+            "invoice_evidence_changed",
+        ));
+    }
+
+    let context = match coverage_config.provider_context() {
+        Ok(context) => context,
+        Err(_) => {
+            return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+                "stripe_context_invalid",
+            ));
+        }
+    };
+    let stored = sqlx::query(
+        "SELECT allocation.allocation_id, allocation.payer_id, allocation.beneficiary_id, \
+                payer.provider_customer_id, allocation.provider_subscription_id, \
+                allocation.provider_item_id, allocation.coverage_source_id, allocation.effective_from, \
+                allocation.effective_until, allocation.state, allocation.ownership_evidence_reference, \
+                payer.payer_kind, allocation.provider_account_id, allocation.provider_environment \
+         FROM cloud_provider_allocations AS allocation \
+         JOIN cloud_provider_payers AS payer ON payer.payer_id = allocation.payer_id \
+         WHERE allocation.provider_namespace = $1 AND allocation.provider_account_id = $2 \
+           AND allocation.provider_environment = $3 AND allocation.external_allocation_reference = $4",
+    )
+    .bind(&context.namespace)
+    .bind(&context.account_id)
+    .bind(context.environment.as_str())
+    .bind(&allocation_reference)
+    .fetch_optional(pool)
+    .await?;
+    let allocation = match VerifiedAllocation::new(
+        stored
+            .as_ref()
+            .map(|row| row.try_get::<String, _>("allocation_id"))
+            .transpose()?
+            .unwrap_or_else(|| {
+                opaque_provider_id("stripe-personal-allocation", &[&allocation_reference])
+            }),
+        stored
+            .as_ref()
+            .map(|row| row.try_get::<String, _>("payer_id"))
+            .transpose()?
+            .unwrap_or_else(|| {
+                opaque_provider_id(
+                    "stripe-personal-payer",
+                    &[
+                        &context.account_id,
+                        context.environment.as_str(),
+                        &customer_id,
+                    ],
+                )
+            }),
+        customer_id.clone(),
+        ProviderPayerKind::Personal,
+        stored
+            .as_ref()
+            .map(|row| row.try_get::<String, _>("beneficiary_id"))
+            .transpose()?
+            .unwrap_or_else(|| user_id.clone()),
+        subscription_id.clone(),
+        evidence.provider_item_id.clone(),
+        allocation_reference.clone(),
+        stored
+            .as_ref()
+            .map(|row| row.try_get::<String, _>("coverage_source_id"))
+            .transpose()?
+            .unwrap_or_else(|| {
+                opaque_provider_id("stripe-personal-source", &[&allocation_reference])
+            }),
+        stored
+            .as_ref()
+            .map(|row| row.try_get::<i64, _>("effective_from"))
+            .transpose()?
+            .unwrap_or(evidence.period_start),
+        stored
+            .as_ref()
+            .map(|row| row.try_get::<Option<i64>, _>("effective_until"))
+            .transpose()?
+            .unwrap_or(None),
+        stored
+            .as_ref()
+            .map(|row| row.try_get::<String, _>("state"))
+            .transpose()?
+            .as_deref()
+            .map(parse_allocation_state)
+            .transpose()?
+            .unwrap_or(AllocationState::Active),
+        stored
+            .as_ref()
+            .map(|row| row.try_get::<String, _>("ownership_evidence_reference"))
+            .transpose()?
+            .unwrap_or_else(|| format!("stripe:personal-operation:{operation_id}")),
+    ) {
+        Ok(allocation) => allocation,
+        Err(_) => {
+            return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+                "provider_allocation_invalid",
+            ));
+        }
+    };
+    if stored.as_ref().is_some_and(|row| {
+        row.try_get::<String, _>("beneficiary_id").ok().as_deref()
+            != Some(allocation.beneficiary_id.as_str())
+            || row
+                .try_get::<String, _>("provider_customer_id")
+                .ok()
+                .as_deref()
+                != Some(allocation.provider_customer_id.as_str())
+            || row
+                .try_get::<String, _>("provider_subscription_id")
+                .ok()
+                .as_deref()
+                != Some(allocation.subscription_id.as_str())
+            || row.try_get::<String, _>("provider_item_id").ok().as_deref()
+                != Some(allocation.provider_item_id.as_str())
+            || row.try_get::<String, _>("payer_kind").ok().as_deref() != Some("personal")
+            || row
+                .try_get::<String, _>("provider_account_id")
+                .ok()
+                .as_deref()
+                != Some(context.account_id.as_str())
+            || row
+                .try_get::<String, _>("provider_environment")
+                .ok()
+                .as_deref()
+                != Some(context.environment.as_str())
+    }) {
+        return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+            "provider_allocation_mismatch",
+        ));
+    }
+    Ok(PersonalInvoiceCoveragePreparation::Prepared(Box::new(
+        PreparedPersonalInvoiceCoverage {
+            context,
+            event: evidence.event,
+            allocation,
+            payment_reference: evidence.payment_intent_id,
+            period_end: evidence.period_end,
+        },
+    )))
+}
+
+fn parse_allocation_state(value: &str) -> Result<AllocationState> {
+    match value {
+        "pending" => Ok(AllocationState::Pending),
+        "active" => Ok(AllocationState::Active),
+        "ended" => Ok(AllocationState::Ended),
+        _ => Err(Error::Internal(
+            "personal provider allocation state is invalid".into(),
+        )),
+    }
+}
+
+async fn accept_personal_invoice_coverage(
+    tx: &mut Transaction<'_, Postgres>,
+    context: &ProviderContext,
+    event: &crate::cloud_provider::VerifiedProviderEvent,
+    allocation: &VerifiedAllocation,
+    ingest_enabled: bool,
+) -> Result<()> {
+    record_verified_event(tx, context, event)
+        .await
+        .map_err(|_| Error::Internal("personal provider event receipt failed".into()))?;
+    register_verified_allocation(tx, context, allocation)
+        .await
+        .map_err(|_| Error::Internal("personal provider source registration failed".into()))?;
+    accept_provider_invalidation(tx, context, event, allocation, ingest_enabled)
+        .await
+        .map_err(|_| Error::Internal("personal provider invalidation failed".into()))?;
+    Ok(())
+}
+
+fn invoice_allocation_reference_claim(invoice: &serde_json::Value) -> Option<String> {
+    let root = invoice.get("metadata");
+    let parent = invoice
+        .get("parent")
+        .and_then(|parent| parent.get("subscription_details"))
+        .and_then(|details| details.get("metadata"));
+    let line = invoice
+        .get("lines")
+        .and_then(|lines| lines.get("data"))
+        .and_then(serde_json::Value::as_array)
+        .filter(|lines| lines.len() == 1)
+        .and_then(|lines| lines.first())
+        .and_then(|line| line.get("metadata"));
+    [line, parent, root]
+        .into_iter()
+        .flatten()
+        .find_map(|metadata| metadata.get("sotto_allocation_reference"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+fn invoice_metadata_claim<'a>(invoice: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    invoice
+        .get("parent")
+        .and_then(|parent| parent.get("subscription_details"))
+        .and_then(|details| details.get("metadata"))
+        .and_then(|metadata| metadata.get(key))
+        .and_then(serde_json::Value::as_str)
+}
+
+fn invoice_subscription_id_claim(invoice: &serde_json::Value) -> Option<String> {
+    invoice
+        .get("parent")
+        .and_then(|parent| parent.get("subscription_details"))
+        .and_then(|details| details.get("subscription"))
+        .and_then(stripe_reference)
+        .or_else(|| invoice.get("subscription").and_then(stripe_reference))
+}
+
+fn stripe_reference(value: &serde_json::Value) -> Option<String> {
+    value
+        .as_str()
+        .or_else(|| value.get("id").and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+}
+
+fn billing_offer_matches_price(
+    catalogue: Option<&BillingPriceIds>,
+    offer: &str,
+    price_id: &str,
+) -> bool {
+    catalogue.is_some_and(|catalogue| {
+        BillingOffer::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == offer)
+            .is_some_and(|candidate| catalogue.id_for(candidate) == price_id)
+    })
+}
+
+fn opaque_provider_id(prefix: &str, parts: &[&str]) -> String {
+    let mut digest = Sha256::new();
+    for part in parts {
+        digest.update((part.len() as u64).to_be_bytes());
+        digest.update(part.as_bytes());
+    }
+    let hash = digest.finalize();
+    format!(
+        "{prefix}:{}",
+        hash.iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3277,7 +4144,11 @@ async fn checkout_completed(
             return Ok(());
         }
         if !async_payment_succeeded && object["payment_status"].as_str() != Some("paid") {
+            record_pending_founding_checkout(tx, operation_id, event_created).await?;
             return Ok(());
+        }
+        if async_payment_succeeded {
+            record_async_payment_founding_checkout(tx, operation_id, object).await?;
         }
         let payment_reference = object["payment_intent"]
             .as_str()
@@ -3302,6 +4173,9 @@ async fn checkout_completed(
                 (snapshot.items.len() == 1).then(|| snapshot.items[0].provider_item_id.clone())
             }),
         };
+        if record_sponsored_founding_award(tx, operation_id, &evidence, event_created).await? {
+            return Ok(());
+        }
         sponsored_billing::complete_paid_checkout(tx, operation_id, &evidence)
             .await
             .map_err(Error::from)?;
@@ -3360,9 +4234,17 @@ async fn personal_checkout_completed(
     if !async_payment_succeeded && object["payment_status"].as_str() != Some("paid") {
         // A completed Checkout session is not itself authority. The account remains pending until
         // Stripe says the session is paid, so SCA failures and asynchronous payment methods never
-        // become a free hosted term.
+        // become a free hosted term. Preserve a founding reservation only if Checkout completed
+        // while that offer was still live; delayed payment success is handled separately below.
+        record_pending_founding_checkout(tx, operation_id, event_created).await?;
         return Ok(());
     }
+    if async_payment_succeeded {
+        record_async_payment_founding_checkout(tx, operation_id, object).await?;
+    }
+    founding_allocator::lock_capacity(tx)
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?;
     let customer = object["customer"]
         .as_str()
         .ok_or_else(|| Error::Config("paid personal checkout has no customer".into()))?;
@@ -3458,6 +4340,43 @@ async fn personal_checkout_completed(
     Ok(())
 }
 
+async fn record_pending_founding_checkout(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+    event_created: i64,
+) -> Result<()> {
+    founding_allocator::record_pending_checkout_completion(
+        tx,
+        operation_id,
+        event_created,
+        billing_epoch(),
+    )
+    .await
+    .map_err(|error| Error::Internal(error.to_string()))?;
+    Ok(())
+}
+
+async fn record_async_payment_founding_checkout(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+    object: &serde_json::Value,
+) -> Result<()> {
+    let Some(session_expires_at_epoch) = object["expires_at"].as_i64() else {
+        // A missing deadline cannot extend an expired offer. Settlement will fail closed below.
+        return Ok(());
+    };
+    founding_allocator::record_async_payment_checkout_completion(
+        tx,
+        operation_id,
+        session_expires_at_epoch,
+        object["status"].as_str() == Some("complete"),
+        billing_epoch(),
+    )
+    .await
+    .map_err(|error| Error::Internal(error.to_string()))?;
+    Ok(())
+}
+
 /// A subscription lifecycle change: the status decides the tier. Handles late/failed payments
 /// (`unpaid` → free) and recoveries (`active` again → team).
 fn sponsored_subscription_status(status: SubscriptionStatus) -> Option<(&'static str, bool)> {
@@ -3514,6 +4433,12 @@ async fn apply_sponsored_subscription_state(
     period_start: Option<i64>,
     period_end: Option<i64>,
 ) -> Result<()> {
+    if terminal {
+        // Match invoice settlement's lock order before touching subscription or operation rows.
+        founding_allocator::lock_capacity(tx)
+            .await
+            .map_err(|error| Error::Internal(error.to_string()))?;
+    }
     sqlx::query(
         "UPDATE billing_sponsored_subscriptions SET \
            provider_customer_id = COALESCE($2, provider_customer_id), \
@@ -3534,6 +4459,21 @@ async fn apply_sponsored_subscription_state(
     .execute(&mut **tx)
     .await?;
     if terminal {
+        let pending_operations: Vec<String> = sqlx::query_scalar(
+            "SELECT operation_id FROM billing_sponsored_operations \
+             WHERE organization_id = $1 AND provider_subscription_id = $2 \
+               AND state IN ('pending', 'checkout_created', 'provider_pending', 'unknown') \
+             ORDER BY created_at FOR UPDATE",
+        )
+        .bind(organization_id)
+        .bind(subscription_id)
+        .fetch_all(&mut **tx)
+        .await?;
+        for operation_id in pending_operations {
+            sponsored_billing::cancel_failed_operation(tx, &operation_id, "subscription_ended")
+                .await
+                .map_err(Error::from)?;
+        }
         sqlx::query(
             "UPDATE billing_sponsored_seats SET state = 'canceled', \
              effective_until = COALESCE(effective_until, $2, floor(extract(epoch FROM now()))::BIGINT), \
@@ -3728,13 +4668,15 @@ fn invoice_subscription_id(object: &serde_json::Value) -> Option<&str> {
 async fn invoice_paid(
     tx: &mut Transaction<'_, Postgres>,
     object: &serde_json::Value,
+    event_created: i64,
     catalogue: Option<&BillingPriceIds>,
+    verified_personal_invoice: Option<&PreparedPersonalInvoiceCoverage>,
 ) -> Result<()> {
     let Some(subscription_id) = invoice_subscription_id(object) else {
         return Ok(());
     };
     if sponsored_billing_enabled()
-        && sponsored_invoice_paid(tx, object, subscription_id, catalogue).await?
+        && sponsored_invoice_paid(tx, object, subscription_id, event_created, catalogue).await?
     {
         return Ok(());
     }
@@ -3748,13 +4690,22 @@ async fn invoice_paid(
     if !personal {
         return Ok(());
     }
-    let period_end = invoice_period_end(object)
+    founding_allocator::lock_capacity(tx)
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?;
+    let period_end = verified_personal_invoice
+        .map(|evidence| evidence.period_end)
+        .or_else(|| invoice_period_end(object))
         .ok_or_else(|| Error::Config("paid personal invoice has no period end".into()))?;
     let paid_through = founding_allocator::FoundingDate::from_unix_seconds(period_end)
         .map_err(|_| Error::Config("paid personal invoice has invalid period end".into()))?;
-    let payment_reference = object["payment_intent"]
-        .as_str()
-        .or_else(|| object["id"].as_str())
+    let payment_reference = verified_personal_invoice
+        .map(|evidence| evidence.payment_reference.as_str())
+        .or_else(|| {
+            object["payment_intent"]
+                .as_str()
+                .or_else(|| object["id"].as_str())
+        })
         .ok_or_else(|| Error::Config("paid personal invoice has no payment reference".into()))?;
     personal_billing::record_invoice_paid(
         tx,
@@ -3772,6 +4723,7 @@ async fn sponsored_invoice_paid(
     tx: &mut Transaction<'_, Postgres>,
     object: &serde_json::Value,
     subscription_id: &str,
+    event_created: i64,
     catalogue: Option<&BillingPriceIds>,
 ) -> Result<bool> {
     let Some(catalogue) = catalogue else {
@@ -3779,6 +4731,19 @@ async fn sponsored_invoice_paid(
             "sponsored billing price catalogue is not configured".into(),
         ));
     };
+    let known_subscription: Option<String> = sqlx::query_scalar(
+        "SELECT organization_id FROM billing_sponsored_subscriptions \
+         WHERE provider_subscription_id = $1",
+    )
+    .bind(subscription_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if known_subscription.is_none() {
+        return Ok(false);
+    }
+    founding_allocator::lock_capacity(tx)
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?;
     let organization_id: Option<String> = sqlx::query_scalar(
         "SELECT organization_id FROM billing_sponsored_subscriptions \
          WHERE provider_subscription_id = $1 FOR UPDATE",
@@ -3795,6 +4760,10 @@ async fn sponsored_invoice_paid(
         .ok_or_else(|| Error::Config("paid sponsored invoice has no payment reference".into()))?;
     let period_end = invoice_period_end(object)
         .ok_or_else(|| Error::Config("paid sponsored invoice has no period end".into()))?;
+    let paid_at = object["status_transitions"]["paid_at"]
+        .as_i64()
+        .or_else(|| object["created"].as_i64())
+        .unwrap_or(event_created);
     let customer_id = object["customer"].as_str().map(str::to_string);
     sqlx::query(
         "INSERT INTO billing_sponsored_subscriptions \
@@ -3828,11 +4797,13 @@ async fn sponsored_invoice_paid(
     }
     let operations: Vec<(String, String)> = sqlx::query_as(
         "SELECT operation_id, offer FROM billing_sponsored_operations \
-         WHERE organization_id = $1 AND state IN ('checkout_created', 'provider_pending') \
-           AND effective_from < $2 \
+         WHERE organization_id = $1 \
+           AND state = 'provider_pending' AND provider_subscription_id = $2 \
+           AND effective_from < $3 \
          ORDER BY created_at FOR UPDATE",
     )
     .bind(&organization_id)
+    .bind(subscription_id)
     .bind(period_end)
     .fetch_all(&mut **tx)
     .await?;
@@ -3853,11 +4824,62 @@ async fn sponsored_invoice_paid(
             payment_reference: payment_reference.to_string(),
             provider_item_id,
         };
+        if record_sponsored_founding_award(tx, &operation_id, &evidence, paid_at).await? {
+            continue;
+        }
         sponsored_billing::complete_paid_checkout(tx, &operation_id, &evidence)
             .await
             .map_err(Error::from)?;
     }
     Ok(true)
+}
+
+/// Confirm a sponsor's founding reservation before activating its named seat. Returns true when
+/// payment must remain refund-required instead of becoming coverage.
+async fn record_sponsored_founding_award(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+    evidence: &sponsored_billing::SponsoredProviderEvidence,
+    paid_at_epoch: i64,
+) -> Result<bool> {
+    founding_allocator::lock_capacity(tx)
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?;
+    let offer: String = sqlx::query_scalar(
+        "SELECT offer FROM billing_sponsored_operations WHERE operation_id = $1 FOR UPDATE",
+    )
+    .bind(operation_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let offer = billing_offer(&offer)?;
+    if FoundingOffer::from_billing_offer(offer).is_none() {
+        return Ok(false);
+    }
+    let paid_on = founding_allocator::FoundingDate::from_unix_seconds(paid_at_epoch)
+        .map_err(|_| Error::Config("sponsored founding payment timestamp is invalid".into()))?;
+    // One organisation invoice can pay for several named founding seats. Keep the allocator's
+    // globally unique payment claim specific to this operation while retaining the unmodified
+    // provider reference in the sponsored operation for refund handling.
+    let allocation_payment_reference = format!("{}:{operation_id}", evidence.payment_reference);
+    match founding_allocator::confirm_payment(
+        tx,
+        &format!("founding:{operation_id}"),
+        &allocation_payment_reference,
+        paid_on,
+        paid_at_epoch,
+    )
+    .await
+    .map_err(|error| Error::Internal(error.to_string()))?
+    {
+        founding_allocator::ConfirmationOutcome::Awarded(_)
+        | founding_allocator::ConfirmationOutcome::AlreadyAwarded(_) => Ok(false),
+        founding_allocator::ConfirmationOutcome::RefundRequired => {
+            sponsored_billing::record_founding_refund_required(tx, operation_id, evidence)
+                .await
+                .map_err(Error::from)?;
+            Ok(true)
+        }
+    }
 }
 
 fn sponsored_invoice_items(object: &serde_json::Value) -> Vec<(String, String, i64)> {
@@ -4397,6 +5419,26 @@ mod tests {
             ProviderError::transport().kind,
             ProviderErrorKind::Retryable
         );
+        assert!(provider_failure_is_definitive(&ProviderError::http(
+            400,
+            Some("invalid_request_error".into())
+        )));
+        assert!(provider_failure_is_definitive(&ProviderError::http(
+            401,
+            Some("invalid_api_key".into())
+        )));
+        assert!(!provider_failure_is_definitive(&ProviderError::http(
+            409,
+            Some("idempotency_key_in_use".into())
+        )));
+        assert!(!provider_failure_is_definitive(&ProviderError::http(
+            500,
+            Some("api_error".into())
+        )));
+        assert!(!provider_failure_is_definitive(&ProviderError::transport()));
+        assert!(!provider_failure_is_definitive(
+            &ProviderError::malformed_response()
+        ));
     }
 
     #[test]
