@@ -168,10 +168,35 @@ sotto grant <user-id>                      # share the active environment (they 
 sotto token create --name ci               # SOTTO_TOKEN: run/export in CI, no password needed
 ```
 
-Tokens de máquina expiram. Um token novo dura 90 dias, a menos que você passe `--expires-in-days`
-com um valor de 1 a 365, e `sotto token ls` mostra quando cada um termina. Duas semanas antes,
-`sotto run` e `sotto export` exibem um aviso no log da CI. Para substituir um token, crie um novo,
-atualize o segredo da CI e depois revogue o antigo com `sotto token revoke`.
+Tokens de máquina expiram. Um token novo dura 90 dias, a menos que você passe
+`--expires-in-days` com um valor de 1 a 365; `sotto token ls` mostra quando cada um termina.
+Duas semanas antes, `sotto run` e `sotto export` exibem um aviso no log da CI.
+
+Os comandos de token usam o acesso do usuário conectado e o ambiente selecionado. Em um ambiente
+de organização, somente um administrador ou proprietário pode gerenciar tokens de máquina. A
+lista contém apenas metadados de tokens ativos: tokens revogados ou expirados são omitidos, e
+não é possível recuperar pela lista a credencial exibida uma única vez ao criar um token com
+`sotto token create`. O JSON inclui `token_id`, `name`, `created_by`, `beneficiary_id`,
+`beneficiary_status`, `expires_at` e `expires_in_days`; os campos de expiração podem ser null.
+O `token_id` é o ID usado para revogar, não o nome do token nem o segredo `SOTTO_TOKEN`.
+
+Use estes comandos para consultar, substituir e revogar um token. A seleção do ambiente vale
+somente para este comando:
+
+```sh
+sotto token ls
+sotto token ls --json
+sotto --env staging token ls --json
+sotto token create --name ci
+sotto token revoke <token-id>
+```
+
+Para substituir um token de CI, identifique o ID antigo na lista, crie um substituto, atualize
+o segredo da CI e confirme que ela já usa o novo token; depois revogue o ID antigo com
+`sotto token revoke <token-id>`. A revogação impede imediatamente a autenticação desse token
+na API, mas não rotaciona a chave do ambiente. Em um ambiente de organização, consulte as
+orientações existentes de `sotto rotate` quando for necessário rotacionar a chave. Nem a
+revogação nem a rotação apagam texto puro que já tenha sido copiado.
 
 ### Status do Cloud
 
@@ -242,6 +267,36 @@ Pressione `t` para percorrer os temas com visualização ao vivo. Use as setas p
 e pressione `Enter` para salvar sua escolha ou `Esc` para cancelar. As
 [regras de precedência dos temas](#temas-de-saída) explicam como as opções do comando e as
 variáveis de ambiente afetam a preferência salva.
+
+### Consultar o estado local
+
+Execute `sotto status` para ver se existe uma identidade local, se a sessão está desbloqueada e
+qual projeto e ambiente o diretório atual seleciona. O comando lê o estado local. Ele não verifica
+a conexão com o servidor nem prova que todos os segredos armazenados podem ser descriptografados.
+
+```sh
+sotto status
+sotto status --json
+```
+
+Use `sotto status --json` em scripts. `initialized` indica se existe uma identidade local e
+`unlocked` indica se uma chave mestra está em cache. `project` contém `name` e `environment` da
+`sotto.toml` mais próxima ou é `null` fora de um projeto configurado. Um comando bem-sucedido
+pode mostrar `unlocked: false`; scripts que precisam de uma sessão desbloqueada devem verificar esse campo.
+
+Estes exemplos JSON são ilustrativos. Com uma `sotto.toml`, mas sem identidade local:
+
+```json
+{"initialized":false,"project":{"environment":"dev","name":"demo"},"unlocked":false}
+```
+
+Sem `sotto.toml` nem identidade local:
+
+```json
+{"initialized":false,"project":null,"unlocked":false}
+```
+
+Sem `sotto.toml`, nenhum projeto está selecionado. Um arquivo inválido ou ilegível causa um erro.
 
 ### Temas de saída
 

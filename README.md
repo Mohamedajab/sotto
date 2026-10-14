@@ -165,8 +165,33 @@ sotto token create --name ci               # SOTTO_TOKEN: run/export in CI, no p
 
 Machine tokens expire. A new token lasts 90 days unless you pass `--expires-in-days` with anything
 from 1 to 365, and `sotto token ls` shows when each one ends. Two weeks before that, `sotto run` and
-`sotto export` print a warning in the CI log. To replace a token, create a new one, update the CI
-secret, then revoke the old one with `sotto token revoke`.
+`sotto export` print a warning in the CI log.
+
+Token commands use the logged-in user's access and the selected environment. In an organisation
+environment, only an admin or owner can manage machine tokens. Listings contain active-token
+metadata only: revoked and expired tokens are omitted, and the credential printed once by
+`sotto token create` cannot be retrieved by listing. JSON includes `token_id`, `name`,
+`created_by`, `beneficiary_id`, `beneficiary_status`, `expires_at` and `expires_in_days`;
+expiry fields may be null. The `token_id` is the ID to revoke, not the token's name or the
+`SOTTO_TOKEN` secret.
+
+Use these commands to inspect, replace and revoke a token. The environment override applies to
+this command only:
+
+```sh
+sotto token ls
+sotto token ls --json
+sotto --env staging token ls --json
+sotto token create --name ci
+sotto token revoke <token-id>
+```
+
+To replace a CI token, identify the old ID in the listing, create a replacement, update the CI
+secret and verify CI uses it, then revoke the old ID with `sotto token revoke <token-id>`.
+Revocation immediately stops that token from authenticating to the API; it does not rotate the
+environment key. For an organisation environment, see the existing `sotto rotate` guidance
+when key rotation is needed. Neither revocation nor rotation can erase plaintext that was already
+copied.
 
 ### Cloud status
 
@@ -236,6 +261,36 @@ clears an active search or quits.
 Press `t` to browse themes with a live preview. Use the arrow keys to preview each theme, then
 press `Enter` to save your choice or `Esc` to cancel. The [theme precedence rules](#output-themes)
 explain how command and environment overrides affect the saved preference.
+
+### Inspect local status
+
+Run `sotto status` to see whether a local identity exists, whether the session is unlocked, and
+which project and environment the current directory selects. It reads local state. It does not
+check server connectivity or prove that every stored secret can be decrypted.
+
+```sh
+sotto status
+sotto status --json
+```
+
+Use `sotto status --json` in scripts. `initialized` reports whether a local identity exists, and
+`unlocked` reports whether a master key is cached. `project` contains `name` and `environment`
+from the nearest `sotto.toml`, or is `null` outside a configured project. A successful command can
+report `unlocked: false`, so scripts must inspect that field if they need an unlocked session.
+
+These JSON examples are illustrative. With a `sotto.toml` but no local identity:
+
+```json
+{"initialized":false,"project":{"environment":"dev","name":"demo"},"unlocked":false}
+```
+
+Without a `sotto.toml` or local identity:
+
+```json
+{"initialized":false,"project":null,"unlocked":false}
+```
+
+An absent `sotto.toml` means no project is selected. A malformed or unreadable file is an error.
 
 ### Output themes
 
