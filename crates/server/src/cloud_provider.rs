@@ -557,6 +557,29 @@ pub async fn record_verified_event(
     }
 }
 
+/// Register the trusted payer, allocation and source binding for a verified provider event.
+///
+/// The caller owns the transaction and should record the event receipt first, then call this and
+/// accept the corresponding invalidation before committing. Reconciliation preparation uses the
+/// same idempotent registration path.
+pub async fn register_verified_allocation(
+    tx: &mut Transaction<'_, Postgres>,
+    context: &ProviderContext,
+    allocation: &VerifiedAllocation,
+) -> Result<(), ProviderAdapterError> {
+    context.validate()?;
+    allocation.validate()?;
+    ensure_payer(tx, context, allocation).await?;
+    ensure_allocation(tx, context, allocation).await?;
+    register_source(
+        tx,
+        &scoped_identity("provider-source-v1", &[&allocation.allocation_id]),
+        &source_binding(context, allocation),
+    )
+    .await?;
+    Ok(())
+}
+
 /// Accept one verified provider change and advance the beneficiary fence exactly once.
 ///
 /// The event receipt is locked before the coordinator, matching preparation and completion's
