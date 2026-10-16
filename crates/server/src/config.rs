@@ -137,6 +137,9 @@ pub struct BillingConfig {
     /// The optional server-owned four-offer catalogue. Partial configuration is rejected at
     /// boot, and new hosted sales require all four prices plus the explicit sales switch.
     pub price_catalogue: Option<BillingPriceIds>,
+    /// Stripe Customer Portal configuration used by Cloud. It must permit payment-method updates
+    /// and period-end cancellation while disabling subscription changes.
+    pub cloud_portal_configuration_id: Option<String>,
     /// Explicit purchase gate. Management, cancellation, refunds, and webhooks do not use it.
     pub cloud_sales_enabled: bool,
     /// Where Stripe-hosted pages send the browser back to (the web app origin).
@@ -205,6 +208,7 @@ impl Config {
             "STRIPE_STANDARD_ANNUAL_PRICE_ID",
             "STRIPE_FOUNDING_MONTHLY_PRICE_ID",
             "STRIPE_FOUNDING_ANNUAL_PRICE_ID",
+            "STRIPE_CLOUD_PORTAL_CONFIGURATION_ID",
         ]
         .into_iter()
         .any(|name| env_nonempty(name).is_some());
@@ -245,6 +249,9 @@ impl Config {
                     webhook_secret,
                     price_id,
                     price_catalogue: billing_price_catalogue,
+                    cloud_portal_configuration_id: env_nonempty(
+                        "STRIPE_CLOUD_PORTAL_CONFIGURATION_ID",
+                    ),
                     cloud_sales_enabled,
                     return_url: billing_return_url(&public_base_url, web_origin.as_deref()),
                 }),
@@ -253,6 +260,16 @@ impl Config {
         } else {
             None
         };
+        if billing
+            .as_ref()
+            .and_then(|value| value.cloud_portal_configuration_id.as_deref())
+            .is_some_and(|value| !is_portal_configuration_id(value))
+        {
+            return Err(Error::Config(
+                "STRIPE_CLOUD_PORTAL_CONFIGURATION_ID must be a Stripe billing portal configuration id"
+                    .into(),
+            ));
+        }
         let stripe_account_id = env_nonempty("STRIPE_ACCOUNT_ID");
         validate_founding_schedule_worker_configuration(
             founding_schedule_worker_enabled,
@@ -273,6 +290,10 @@ impl Config {
             deployment_mode,
             billing.is_some(),
             hosted_catalogue_configured,
+            billing
+                .as_ref()
+                .and_then(|value| value.cloud_portal_configuration_id.as_deref())
+                .is_some(),
         )?;
 
         let telemetry = TelemetryConfig {
@@ -359,6 +380,11 @@ fn validate_founding_schedule_worker_configuration(
             "founding schedule worker requires all four hosted Stripe prices".into(),
         ));
     }
+    if billing.cloud_portal_configuration_id.is_none() {
+        return Err(Error::Config(
+            "founding schedule worker requires STRIPE_CLOUD_PORTAL_CONFIGURATION_ID".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -419,17 +445,23 @@ fn validate_cloud_sales_configuration(
     deployment_mode: DeploymentMode,
     billing_configured: bool,
     hosted_catalogue_configured: bool,
+    safe_portal_configuration_configured: bool,
 ) -> Result<()> {
     if enabled
         && (deployment_mode != DeploymentMode::Cloud
             || !billing_configured
-            || !hosted_catalogue_configured)
+            || !hosted_catalogue_configured
+            || !safe_portal_configuration_configured)
     {
         return Err(Error::Config(format!(
-            "{CLOUD_SALES_ENV}=1 requires SOTTO_DEPLOYMENT_MODE=cloud, complete Stripe credentials, and all four hosted price ids"
+            "{CLOUD_SALES_ENV}=1 requires SOTTO_DEPLOYMENT_MODE=cloud, complete Stripe credentials, all four hosted price ids, and STRIPE_CLOUD_PORTAL_CONFIGURATION_ID"
         )));
     }
     Ok(())
+}
+
+fn is_portal_configuration_id(value: &str) -> bool {
+    value.starts_with("bpc_") && value.len() > 4 && value.trim() == value
 }
 
 fn billing_price_catalogue_from_env() -> Result<Option<BillingPriceIds>> {
@@ -568,11 +600,11 @@ fn env_nonempty(name: &str) -> Option<String> {
 mod tests {
     use super::{
         billing_price_catalogue_from_values, billing_return_url, feature_flag_is_enabled,
-        organisation_deletion_retention_from_env_result, organisation_deletion_worker_is_enabled,
-        parse_organisation_deletion_retention_days, telemetry_ping_enabled,
-        validate_cloud_sales_configuration, validate_deployment_billing_boundary,
-        validate_founding_schedule_worker_configuration, validate_provider_refresh_configuration,
-        BillingConfig, BillingPriceIds, DeploymentMode,
+        is_portal_configuration_id, organisation_deletion_retention_from_env_result,
+        organisation_deletion_worker_is_enabled, parse_organisation_deletion_retention_days,
+        telemetry_ping_enabled, validate_cloud_sales_configuration,
+        validate_deployment_billing_boundary, validate_founding_schedule_worker_configuration,
+        validate_provider_refresh_configuration, BillingConfig, BillingPriceIds, DeploymentMode,
         DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS, MAX_ORGANISATION_DELETION_RETENTION_DAYS,
     };
 
@@ -625,6 +657,7 @@ mod tests {
             webhook_secret: "whsec_test".into(),
             price_id: "price_legacy".into(),
             price_catalogue: None,
+            cloud_portal_configuration_id: None,
             cloud_sales_enabled: false,
             return_url: "https://app.example.test".into(),
         };
@@ -675,21 +708,37 @@ mod tests {
             DeploymentMode::SelfHosted,
             false,
             false,
+            false,
         )
         .is_ok());
+        assert!(validate_cloud_sales_configuration(
+            true,
+            DeploymentMode::SelfHosted,
+            true,
+            true,
+            true
+        )
+        .is_err());
         assert!(
-            validate_cloud_sales_configuration(true, DeploymentMode::SelfHosted, true, true,)
+            validate_cloud_sales_configuration(true, DeploymentMode::Cloud, false, true, true)
                 .is_err()
         );
         assert!(
-            validate_cloud_sales_configuration(true, DeploymentMode::Cloud, false, true,).is_err()
+            validate_cloud_sales_configuration(true, DeploymentMode::Cloud, true, false, true)
+                .is_err()
         );
         assert!(
-            validate_cloud_sales_configuration(true, DeploymentMode::Cloud, true, false,).is_err()
+            validate_cloud_sales_configuration(true, DeploymentMode::Cloud, true, true, false)
+                .is_err()
         );
         assert!(
-            validate_cloud_sales_configuration(true, DeploymentMode::Cloud, true, true,).is_ok()
+            validate_cloud_sales_configuration(true, DeploymentMode::Cloud, true, true, true)
+                .is_ok()
         );
+        assert!(is_portal_configuration_id("bpc_123"));
+        assert!(!is_portal_configuration_id("cus_123"));
+        assert!(!is_portal_configuration_id("bpc_"));
+        assert!(!is_portal_configuration_id(" bpc_123"));
     }
 
     #[test]
@@ -701,20 +750,29 @@ mod tests {
             webhook_secret: "whsec_test".into(),
             price_id: "price_legacy".into(),
             price_catalogue: None,
+            cloud_portal_configuration_id: None,
             cloud_sales_enabled: false,
             return_url: "https://app.example.test".into(),
         };
         assert!(
             validate_founding_schedule_worker_configuration(true, true, Some(&billing)).is_err()
         );
-        let complete = BillingConfig {
+        let catalogue_only = BillingConfig {
             price_catalogue: Some(BillingPriceIds {
                 standard_monthly: "price_standard_month".into(),
                 standard_annual: "price_standard_year".into(),
                 founding_monthly: "price_founding_month".into(),
                 founding_annual: "price_founding_year".into(),
             }),
-            ..billing
+            ..billing.clone()
+        };
+        assert!(
+            validate_founding_schedule_worker_configuration(true, true, Some(&catalogue_only))
+                .is_err()
+        );
+        let complete = BillingConfig {
+            cloud_portal_configuration_id: Some("bpc_test".into()),
+            ..catalogue_only
         };
         assert!(
             validate_founding_schedule_worker_configuration(true, false, Some(&complete)).is_err()

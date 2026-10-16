@@ -468,7 +468,20 @@ pub trait SubscriptionProvider: Send + Sync {
         Err(ProviderError::unsupported("personal_price_validation"))
     }
 
-    async fn create_portal(&self, customer: &str, return_url: &str) -> ProviderResult<String>;
+    async fn validate_cloud_portal_configuration(
+        &self,
+        configuration_id: &str,
+    ) -> ProviderResult<()> {
+        let _ = configuration_id;
+        Ok(())
+    }
+
+    async fn create_portal(
+        &self,
+        customer: &str,
+        return_url: &str,
+        configuration_id: Option<&str>,
+    ) -> ProviderResult<String>;
 
     /// Create a refund against a verified payment reference. The caller owns the durable
     /// correction transaction and must record the receipt before changing any entitlement.
@@ -548,6 +561,7 @@ pub struct BillingState {
     price_catalogue: Option<BillingPriceIds>,
     cloud_sales_enabled: bool,
     founding_schedule_worker_enabled: bool,
+    cloud_portal_configuration_id: Option<String>,
     personal_coverage: Option<PersonalCoverageRuntime>,
 }
 
@@ -576,6 +590,19 @@ impl BillingState {
         self.founding_schedule_worker_enabled
     }
 
+    pub fn cloud_portal_configuration_id(&self) -> Option<&str> {
+        self.cloud_portal_configuration_id.as_deref()
+    }
+
+    pub async fn validate_cloud_portal_configuration(&self) -> ProviderResult<()> {
+        let configuration_id = self
+            .cloud_portal_configuration_id()
+            .ok_or_else(ProviderError::malformed_response)?;
+        self.provider
+            .validate_cloud_portal_configuration(configuration_id)
+            .await
+    }
+
     pub fn with_founding_schedule_worker_enabled(mut self, enabled: bool) -> Self {
         self.founding_schedule_worker_enabled = enabled;
         self
@@ -591,6 +618,7 @@ impl BillingState {
             webhook_secret: config.webhook_secret,
             return_url: config.return_url,
             price_catalogue: config.price_catalogue,
+            cloud_portal_configuration_id: config.cloud_portal_configuration_id,
             cloud_sales_enabled: config.cloud_sales_enabled,
             founding_schedule_worker_enabled: false,
             personal_coverage: None,
@@ -650,6 +678,7 @@ impl BillingState {
             price_catalogue: None,
             cloud_sales_enabled,
             founding_schedule_worker_enabled: true,
+            cloud_portal_configuration_id: cloud_sales_enabled.then(|| "bpc_test".into()),
             personal_coverage: None,
         }
     }
@@ -663,6 +692,7 @@ impl BillingState {
             price_catalogue: config.price_catalogue,
             cloud_sales_enabled: config.cloud_sales_enabled,
             founding_schedule_worker_enabled: false,
+            cloud_portal_configuration_id: config.cloud_portal_configuration_id,
             personal_coverage: None,
         }
     }
@@ -1183,11 +1213,33 @@ impl SubscriptionProvider for StripeBilling {
         )
     }
 
-    async fn create_portal(&self, customer: &str, return_url: &str) -> ProviderResult<String> {
-        let form = vec![
-            ("customer".to_string(), customer.to_string()),
-            ("return_url".to_string(), return_url.to_string()),
-        ];
+    async fn validate_cloud_portal_configuration(
+        &self,
+        configuration_id: &str,
+    ) -> ProviderResult<()> {
+        let value = stripe_get(
+            &self.api_key,
+            &format!("billing_portal/configurations/{configuration_id}"),
+        )
+        .await?;
+        validate_cloud_portal_configuration(
+            &value,
+            configuration_id,
+            self.api_key.starts_with("sk_live_") || self.api_key.starts_with("rk_live_"),
+        )
+    }
+
+    async fn create_portal(
+        &self,
+        customer: &str,
+        return_url: &str,
+        configuration_id: Option<&str>,
+    ) -> ProviderResult<String> {
+        if let Some(configuration_id) = configuration_id {
+            self.validate_cloud_portal_configuration(configuration_id)
+                .await?;
+        }
+        let form = portal_session_form(customer, return_url, configuration_id);
         let session = stripe_post(&self.api_key, "billing_portal/sessions", &form).await?;
         session["url"]
             .as_str()
@@ -1378,7 +1430,12 @@ impl SubscriptionProvider for E2eBilling {
         )
     }
 
-    async fn create_portal(&self, _customer: &str, return_url: &str) -> ProviderResult<String> {
+    async fn create_portal(
+        &self,
+        _customer: &str,
+        return_url: &str,
+        _configuration_id: Option<&str>,
+    ) -> ProviderResult<String> {
         self.page_url("portal", &[("return_url", return_url)])
     }
 
@@ -1730,7 +1787,6 @@ async fn sponsored_quote(
     let catalogue = billing
         .price_catalogue()
         .ok_or_else(|| Error::NotConfigured("hosted sponsored billing is not configured".into()))?;
-    validate_personal_catalogue(billing, catalogue).await?;
     let access = org::access(&state.pool, &org_id, &user.user_id).await?;
     access.require_write()?;
     if !access.role().can_manage_members() {
@@ -1747,6 +1803,11 @@ async fn sponsored_quote(
             return Err(Error::NotFound("sponsored beneficiary not found".into()));
         }
     }
+    billing
+        .validate_cloud_portal_configuration()
+        .await
+        .map_err(ProviderError::into_error)?;
+    validate_personal_catalogue(billing, catalogue).await?;
     let now = sponsored_billing::current_epoch();
     let (offer, founding_remaining_places) = if action == SponsoredSeatAction::Remove {
         (requested_offer, None)
@@ -1839,6 +1900,12 @@ async fn sponsored_checkout(
         .ok_or_else(|| Error::NotConfigured("hosted sponsored billing is not configured".into()))?;
     let action = SponsoredSeatAction::parse(&input.action).map_err(Error::from)?;
     let offer = billing_offer(&input.offer)?;
+    if billing.cloud_sales_enabled() {
+        billing
+            .validate_cloud_portal_configuration()
+            .await
+            .map_err(ProviderError::into_error)?;
+    }
     validate_personal_catalogue(billing, catalogue).await?;
     let request = SponsoredSeatRequest {
         action,
@@ -2430,6 +2497,10 @@ async fn personal_quote(
         .price_catalogue()
         .ok_or_else(|| Error::NotConfigured("hosted personal billing is not configured".into()))?;
     let requested_offer = billing_offer(&query.offer)?;
+    billing
+        .validate_cloud_portal_configuration()
+        .await
+        .map_err(ProviderError::into_error)?;
     let requested_interval = FoundingOffer::for_billing_offer_interval(requested_offer);
     validate_personal_catalogue(billing, catalogue).await?;
     let now = billing_epoch();
@@ -2536,6 +2607,12 @@ async fn personal_checkout(
         .price_catalogue()
         .ok_or_else(|| Error::NotConfigured("hosted personal billing is not configured".into()))?;
     let offer = billing_offer(&request.offer)?;
+    if billing.cloud_sales_enabled() {
+        billing
+            .validate_cloud_portal_configuration()
+            .await
+            .map_err(ProviderError::into_error)?;
+    }
     validate_personal_catalogue(billing, catalogue).await?;
     let price_id = catalogue.id_for(offer).to_string();
     billing_operations::validate_return_url(&billing.return_url, &request.return_url)
@@ -3044,7 +3121,11 @@ async fn personal_portal(
     tx.rollback().await?;
     let portal_url = billing
         .provider
-        .create_portal(&customer, &app_url(&billing.return_url))
+        .create_portal(
+            &customer,
+            &app_url(&billing.return_url),
+            billing.cloud_portal_configuration_id(),
+        )
         .await
         .map_err(ProviderError::into_error)?;
     Ok(Json(PersonalLifecycleView {
@@ -3214,6 +3295,10 @@ async fn create_checkout(
     // briefly pins a pool connection and serialises this organisation's writes; that is the
     // deliberate trade-off for closing the race.
     require_billing_admin(&mut tx, &org_id, &user.user_id).await?;
+    billing
+        .validate_cloud_portal_configuration()
+        .await
+        .map_err(ProviderError::into_error)?;
 
     // Reuse the org's Stripe customer if one exists, so a cancel/resubscribe doesn't fork billing
     // history; otherwise Checkout creates one and the webhook records it.
@@ -3261,7 +3346,11 @@ async fn create_portal(
 
     let url = billing
         .provider
-        .create_portal(&customer, &app_url(&billing.return_url))
+        .create_portal(
+            &customer,
+            &app_url(&billing.return_url),
+            billing.cloud_portal_configuration_id(),
+        )
         .await
         .map_err(ProviderError::into_error)?;
     tx.commit().await?;
@@ -3561,6 +3650,41 @@ fn validate_stripe_personal_price(
         return Err(ProviderError::malformed_response());
     }
     Ok(())
+}
+
+fn validate_cloud_portal_configuration(
+    value: &serde_json::Value,
+    configuration_id: &str,
+    expected_livemode: bool,
+) -> ProviderResult<()> {
+    if value["id"].as_str() != Some(configuration_id)
+        || value["object"].as_str() != Some("billing_portal.configuration")
+        || value["active"].as_bool() != Some(true)
+        || value["livemode"].as_bool() != Some(expected_livemode)
+        || value["features"]["subscription_update"]["enabled"].as_bool() != Some(false)
+        || value["features"]["payment_method_update"]["enabled"].as_bool() != Some(true)
+        || value["features"]["subscription_cancel"]["enabled"].as_bool() != Some(true)
+        || value["features"]["subscription_cancel"]["mode"].as_str() != Some("at_period_end")
+        || value["features"]["subscription_cancel"]["proration_behavior"].as_str() != Some("none")
+    {
+        return Err(ProviderError::malformed_response());
+    }
+    Ok(())
+}
+
+fn portal_session_form(
+    customer: &str,
+    return_url: &str,
+    configuration_id: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut form = vec![
+        ("customer".to_string(), customer.to_string()),
+        ("return_url".to_string(), return_url.to_string()),
+    ];
+    if let Some(configuration_id) = configuration_id {
+        form.push(("configuration".to_string(), configuration_id.to_string()));
+    }
+    form
 }
 
 /// Delete one Stripe resource with an idempotency key and the explicit cancellation form.
@@ -8058,6 +8182,7 @@ mod tests {
             webhook_secret: "whsec_repair".into(),
             price_id: "price_legacy".into(),
             price_catalogue: None,
+            cloud_portal_configuration_id: None,
             cloud_sales_enabled: false,
             return_url: "https://getsotto.test".into(),
         });
@@ -8194,7 +8319,7 @@ mod tests {
             provider_origin: "http://127.0.0.1:8099/".into(),
         };
         let url = provider
-            .create_portal("cus-test", "http://127.0.0.1:5199/app")
+            .create_portal("cus-test", "http://127.0.0.1:5199/app", None)
             .await
             .unwrap();
         let parsed = Url::parse(&url).unwrap();
@@ -8416,6 +8541,82 @@ mod tests {
             true
         )
         .is_err());
+    }
+
+    #[test]
+    fn cloud_portal_requires_payment_updates_and_period_end_cancellation_without_plan_changes() {
+        let configuration = serde_json::json!({
+            "id": "bpc_cloud_safe",
+            "object": "billing_portal.configuration",
+            "active": true,
+            "livemode": false,
+            "features": {
+                "payment_method_update": {"enabled": true},
+                "subscription_cancel": {
+                    "enabled": true,
+                    "mode": "at_period_end",
+                    "proration_behavior": "none"
+                },
+                "subscription_update": {"enabled": false}
+            }
+        });
+        assert!(
+            validate_cloud_portal_configuration(&configuration, "bpc_cloud_safe", false).is_ok()
+        );
+
+        for (path, invalid) in [
+            ("active", serde_json::json!(false)),
+            ("livemode", serde_json::json!(true)),
+            (
+                "features.subscription_update.enabled",
+                serde_json::json!(true),
+            ),
+            (
+                "features.payment_method_update.enabled",
+                serde_json::json!(false),
+            ),
+            (
+                "features.subscription_cancel.enabled",
+                serde_json::json!(false),
+            ),
+            (
+                "features.subscription_cancel.mode",
+                serde_json::json!("immediately"),
+            ),
+            (
+                "features.subscription_cancel.proration_behavior",
+                serde_json::json!("always_invoice"),
+            ),
+        ] {
+            let mut candidate = configuration.clone();
+            let mut target = &mut candidate;
+            let mut segments = path.split('.').peekable();
+            while let Some(segment) = segments.next() {
+                if segments.peek().is_none() {
+                    target[segment] = invalid.clone();
+                } else {
+                    target = &mut target[segment];
+                }
+            }
+            assert!(
+                validate_cloud_portal_configuration(&candidate, "bpc_cloud_safe", false).is_err(),
+                "unsafe portal configuration accepted at {path}"
+            );
+        }
+        assert!(validate_cloud_portal_configuration(&configuration, "bpc_other", false).is_err());
+    }
+
+    #[test]
+    fn cloud_portal_session_uses_the_configured_safe_configuration() {
+        let form = portal_session_form("cus_123", "https://app.sotto.test/cloud", Some("bpc_safe"));
+        assert!(form.contains(&("configuration".into(), "bpc_safe".into())));
+        assert!(form.contains(&("customer".into(), "cus_123".into())));
+        assert!(form.contains(&("return_url".into(), "https://app.sotto.test/cloud".into())));
+        assert!(
+            !portal_session_form("cus_123", "https://app.sotto.test", None)
+                .iter()
+                .any(|(key, _)| key == "configuration")
+        );
     }
 
     #[test]
