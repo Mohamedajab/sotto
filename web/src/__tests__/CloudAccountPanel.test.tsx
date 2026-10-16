@@ -14,6 +14,7 @@ vi.mock("../api", () => ({
   fetchCloudExportChunk: vi.fn(),
   fetchCloudNotices: vi.fn(),
   fetchEligibility: vi.fn(),
+  fetchPersonalLifecycle: vi.fn(),
   fetchPersonalQuote: vi.fn(),
   fetchPersonalOperation: vi.fn(),
   requestPersonalRefund: vi.fn(),
@@ -55,7 +56,13 @@ function quote(offer: api.PersonalBillingTerm): api.PersonalQuote {
 describe("CloudAccountPanel", () => {
   beforeEach(() => vi.resetAllMocks());
 
-  beforeEach(() => vi.mocked(api.fetchCloudNotices).mockResolvedValue([]));
+  beforeEach(() => {
+    vi.mocked(api.fetchCloudNotices).mockResolvedValue([]);
+    vi.mocked(api.fetchPersonalLifecycle).mockResolvedValue({
+      state: "active", paidThroughDate: null, cancelAtPeriodEnd: false, portalUrl: null,
+      foundingPriceEndEpoch: null, standardRenewalAmountPence: null, foundingTransitionStatus: null, foundingTransitionReason: null,
+    });
+  });
 
   it("retries a failed selected-term quote through repeated failure and successful recovery", async () => {
     vi.mocked(api.fetchEligibility).mockResolvedValue({
@@ -254,7 +261,7 @@ describe("CloudAccountPanel", () => {
     vi.mocked(api.fetchPersonalQuote).mockResolvedValue({
       offer: "founding_monthly", amountPence: 199, currency: "gbp", interval: "month", taxTreatment: "shown_at_checkout",
       quoteVersion: 1, quoteExpiresAtEpoch: 2_000_000_000, founding: true,
-      foundingRemainingPlaces: 12, foundingTerm: "through the founding monthly term", nextRenewalAmountPence: 299,
+      foundingRemainingPlaces: 12, foundingTerm: "for the first 12 monthly billing periods", nextRenewalAmountPence: 299,
     });
 
     render(<CloudAccountPanel />);
@@ -262,6 +269,26 @@ describe("CloudAccountPanel", () => {
     expect(await screen.findByText(/£1\.99 per month/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /secure checkout/i })).toBeInTheDocument();
     expect(screen.getByText(/12 places remain/)).toBeInTheDocument();
+    expect(screen.getByText(/standard price after the founding term is £2\.99/i)).toBeInTheDocument();
+  });
+
+  it("shows the founding boundary without claiming an unconfirmed schedule is active", async () => {
+    vi.mocked(api.fetchEligibility).mockResolvedValue({
+      ...base, state: "paid", payer: "personal",
+    });
+    vi.mocked(api.fetchPersonalLifecycle).mockResolvedValue({
+      state: "active", paidThroughDate: "2027-01-31", cancelAtPeriodEnd: false, portalUrl: null,
+      foundingPriceEndEpoch: Date.UTC(2027, 0, 31) / 1000,
+      standardRenewalAmountPence: 299,
+      foundingTransitionStatus: "unresolved",
+      foundingTransitionReason: "provider_authentication",
+    });
+
+    render(<CloudAccountPanel />);
+
+    expect(await screen.findByText(/Founding price applies until 31\/01\/2027/i)).toBeInTheDocument();
+    expect(screen.getByText(/not yet confirmed; we are checking it/i)).toBeInTheDocument();
+    expect(screen.getByText(/Stripe credentials or permissions need attention/i)).toBeInTheDocument();
   });
 
   it("keeps a pending checkout recoverable", async () => {

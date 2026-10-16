@@ -219,11 +219,16 @@ impl SubscriptionProvider for TestProvider {
         Ok(self.observation.clone())
     }
 
-    async fn personal_subscription_period_end(
+    async fn personal_subscription_period(
         &self,
         _subscription_id: &str,
-    ) -> ProviderResult<Option<i64>> {
-        Ok(self.personal_period_end)
+    ) -> ProviderResult<Option<sotto_server::billing::PersonalSubscriptionPeriod>> {
+        Ok(self.personal_period_end.map(|end_epoch| {
+            sotto_server::billing::PersonalSubscriptionPeriod {
+                start_epoch: end_epoch - 30 * 24 * 60 * 60,
+                end_epoch,
+            }
+        }))
     }
 
     async fn cancel_subscription(
@@ -1786,6 +1791,11 @@ async fn delayed_personal_checkout_payment_honours_timely_founding_reservation()
     assert_eq!(account_state, "active");
     assert_eq!(reservation_state, "confirmed");
 
+    sqlx::query("DELETE FROM billing_founding_schedule_jobs WHERE beneficiary_id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("clean founding schedule job");
     sqlx::query("DELETE FROM billing_founding_awards WHERE beneficiary_id = $1")
         .bind(&user_id)
         .execute(&pool)

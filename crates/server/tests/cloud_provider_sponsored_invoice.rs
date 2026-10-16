@@ -920,6 +920,11 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
     .execute(&mut *cleanup)
     .await
     .unwrap();
+    sqlx::query("DELETE FROM billing_founding_schedule_jobs WHERE beneficiary_id = $1")
+        .bind(&founding_user)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
     sqlx::query("DELETE FROM billing_founding_awards WHERE beneficiary_id = $1")
         .bind(&founding_user)
         .execute(&mut *cleanup)

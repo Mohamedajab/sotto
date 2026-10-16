@@ -7,6 +7,7 @@ import {
   fetchCloudExportChunk,
   fetchCloudNotices,
   fetchEligibility,
+  fetchPersonalLifecycle,
   fetchPersonalOperation,
   fetchPersonalQuote,
   requestPersonalRefund,
@@ -23,6 +24,21 @@ import {
 function message(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 function pounds(pence: number): string { return new Intl.NumberFormat("en-GB", { style: "currency", currency: "GBP" }).format(pence / 100); }
 function date(epoch: number | null): string | null { return epoch === null ? null : new Date(epoch * 1000).toLocaleDateString("en-GB"); }
+function foundingTransitionReason(code: string | null): string | null {
+  switch (code) {
+    case "provider_authentication": return "Stripe credentials or permissions need attention.";
+    case "provider_missing": return "The billing provider could not find the subscription.";
+    case "provider_malformed": return "The provider schedule could not be verified.";
+    case "provider_retryable": return "The provider could not confirm the schedule yet.";
+    case "local_binding_missing": return "The subscription link needs to be reconciled.";
+    case "local_evidence_invalid": return "The billing period could not be verified.";
+    case "invoice_price_mismatch": return "The renewal price did not match the expected transition.";
+    case "invoice_boundary_missing": return "The renewal period did not include a verified boundary.";
+    case "provider_conflict":
+    case "provider_unknown": return "The provider result needs to be checked.";
+    default: return code === null ? null : "The transition needs to be checked.";
+  }
+}
 
 export function CloudAccountPanel() {
   const [eligibility, setEligibility] = useState<EligibilityView | null>(null);
@@ -97,6 +113,14 @@ export function CloudAccountPanel() {
   useEffect(() => {
     if (eligibility?.state === "pending_initial_payment") void refreshOperation();
   }, [eligibility?.state]);
+  useEffect(() => {
+    if (eligibility?.payer !== "personal") return;
+    let current = true;
+    void fetchPersonalLifecycle()
+      .then((next) => { if (current) setLifecycle(next); })
+      .catch(() => { if (current) setLifecycle(null); });
+    return () => { current = false; };
+  }, [eligibility?.payer, eligibility?.state]);
 
   async function checkout() {
     if (quote === null || quoteLoading || !quote.offer.endsWith(`_${offer}`)) return;
@@ -156,7 +180,7 @@ export function CloudAccountPanel() {
     <p className="muted">Billing and recovery controls are available here without unlocking your vault. Sotto Cloud stores only encrypted vault material.</p>
     {error !== null && <p role="alert">{error}</p>}{notice !== null && <p className="notice" role="status">{notice}</p>}
     {notices.length > 0 && <section aria-labelledby="notices-heading"><h2 id="notices-heading">Account notices</h2><ul>{notices.map((item) => <li key={item.noticeId}><strong>{item.content.title}</strong><p>{item.content.detail}</p>{item.content.deadlineEpoch !== null && <p className="muted">Deadline: {date(item.content.deadlineEpoch)}</p>}{item.status === "failed" && <p role="alert">This notice could not be delivered{item.lastErrorCode === null ? "." : ` (${item.lastErrorCode}).`}</p>}</li>)}</ul></section>}
-    <section aria-labelledby="status-heading"><h2 id="status-heading">Hosted access</h2><p><strong>{eligibility.state.replaceAll("_", " ")}</strong>{paidThrough !== null ? ` · paid through ${paidThrough}` : ""}</p>{recoveryUntil !== null && <p className="muted">Recovery is available until {recoveryUntil}.</p>}{eligibility.payer === null && eligibility.state === "paid" && <p className="muted">Your hosted access is sponsored or provided by another billing record. There is no personal upgrade to buy.</p>}{eligibility.state === "unavailable" && <p>Billing evidence is temporarily unavailable. Checkout is hidden until the account can be checked safely.</p>}</section>
+    <section aria-labelledby="status-heading"><h2 id="status-heading">Hosted access</h2><p><strong>{eligibility.state.replaceAll("_", " ")}</strong>{paidThrough !== null ? ` · paid through ${paidThrough}` : ""}</p>{recoveryUntil !== null && <p className="muted">Recovery is available until {recoveryUntil}.</p>}{eligibility.payer === null && eligibility.state === "paid" && <p className="muted">Your hosted access is sponsored or provided by another billing record. There is no personal upgrade to buy.</p>}{eligibility.state === "unavailable" && <p>Billing evidence is temporarily unavailable. Checkout is hidden until the account can be checked safely.</p>}{lifecycle?.foundingTransitionStatus !== null && lifecycle?.foundingTransitionStatus !== undefined && <p className="muted">{lifecycle.foundingPriceEndEpoch !== null && lifecycle.standardRenewalAmountPence !== null ? <>Founding price applies until {date(lifecycle.foundingPriceEndEpoch)}. The standard price after that is {pounds(lifecycle.standardRenewalAmountPence)}. </> : <>The founding transition date is not verified. </>}{lifecycle.foundingTransitionStatus === "scheduled" ? "Transition scheduled with the billing provider." : lifecycle.foundingTransitionStatus === "not_required" ? "No transition is needed because this subscription is ending." : <>The standard-price transition is not yet confirmed; we are checking it. {foundingTransitionReason(lifecycle.foundingTransitionReason)}</>}</p>}</section>
     {eligibility.actions.billing && <section aria-labelledby="billing-heading">
       <h2 id="billing-heading">Choose hosted billing</h2>
       <label>Term <select value={offer} disabled={busy} onChange={(e) => setOffer(e.target.value as PersonalBillingTerm)}><option value="monthly">Monthly</option><option value="annual">Annual</option></select></label>
@@ -164,7 +188,7 @@ export function CloudAccountPanel() {
       {quoteError !== null && <><p role="alert">{quoteError}</p><button disabled={busy || quoteLoading} onClick={() => setQuoteAttempt((attempt) => attempt + 1)}>Retry billing quote</button></>}
       {quote !== null && quote.offer.endsWith(`_${offer}`) && <>
         <p>{pounds(quote.amountPence)} per {quote.interval}. Tax is shown at checkout.</p>
-        {quote.founding && <p className="muted">Founding price: {quote.foundingRemainingPlaces ?? 0} places remain; {quote.foundingTerm}. Renews at {pounds(quote.nextRenewalAmountPence)}.</p>}
+        {quote.founding && <p className="muted">Founding price: {quote.foundingRemainingPlaces ?? 0} places remain; {quote.foundingTerm}. The standard price after the founding term is {pounds(quote.nextRenewalAmountPence)}.</p>}
         <button className="primary" disabled={busy || quoteLoading} onClick={() => void checkout()}>{busy ? "Opening checkout…" : "Continue to secure checkout"}</button>
       </>}
     </section>}

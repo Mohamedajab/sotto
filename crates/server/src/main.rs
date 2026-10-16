@@ -85,7 +85,8 @@ async fn run() -> Result<()> {
             }
             #[cfg(not(feature = "e2e-mock-billing"))]
             {
-                let mut state = BillingState::from_config(billing.clone());
+                let mut state = BillingState::from_config(billing.clone())
+                    .with_founding_schedule_worker_enabled(config.founding_schedule_worker_enabled);
                 if config.provider_refresh_ingest_enabled
                     || config.provider_refresh_worker_enabled
                     || config.provider_refresh_reconciliation_enabled
@@ -202,6 +203,10 @@ async fn run() -> Result<()> {
         config.machine_eligibility_enforcement_enabled
     );
     println!(
+        "founding schedule worker: {}",
+        config.founding_schedule_worker_enabled
+    );
+    println!(
         "sponsored billing event handling: {}",
         std::env::var("SOTTO_SPONSORED_BILLING_ENABLED").as_deref() == Ok("1")
     );
@@ -222,7 +227,46 @@ async fn run() -> Result<()> {
         );
     }
     if config.organisation_deletion_worker_enabled {
-        sotto_server::org_deletion_worker::spawn(pool.clone(), worker_provider);
+        sotto_server::org_deletion_worker::spawn(pool.clone(), worker_provider.clone());
+    }
+    if config.founding_schedule_worker_enabled {
+        #[cfg(not(feature = "e2e-mock-billing"))]
+        {
+            let provider = worker_provider.as_ref().ok_or_else(|| {
+                Error::Config("founding schedule worker requires Stripe billing".into())
+            })?;
+            let catalogue = config
+                .billing
+                .as_ref()
+                .and_then(|billing| billing.price_catalogue.as_ref())
+                .ok_or_else(|| {
+                    Error::Config(
+                        "founding schedule worker requires the hosted price catalogue".into(),
+                    )
+                })?;
+            for offer in BillingOffer::ALL {
+                provider
+                    .validate_personal_price(catalogue.id_for(offer), offer)
+                    .await
+                    .map_err(|_| {
+                        Error::Config(
+                            "founding schedule worker could not verify the Stripe price catalogue"
+                                .into(),
+                        )
+                    })?;
+            }
+        }
+        let provider = worker_provider.ok_or_else(|| {
+            Error::Config("founding schedule worker requires Stripe billing".into())
+        })?;
+        let catalogue = config
+            .billing
+            .as_ref()
+            .and_then(|billing| billing.price_catalogue.clone())
+            .ok_or_else(|| {
+                Error::Config("founding schedule worker requires the hosted price catalogue".into())
+            })?;
+        sotto_server::founding_schedule_worker::spawn(pool.clone(), provider, catalogue);
     }
     if config.provider_refresh_worker_enabled {
         let Some((coverage, sponsored_coverage, stripe)) = personal_coverage_runtime.clone() else {

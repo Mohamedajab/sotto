@@ -63,6 +63,12 @@ Hosted catalogue variables are `STRIPE_STANDARD_MONTHLY_PRICE_ID`,
 `STRIPE_STANDARD_ANNUAL_PRICE_ID`, `STRIPE_FOUNDING_MONTHLY_PRICE_ID`, and
 `STRIPE_FOUNDING_ANNUAL_PRICE_ID`. Compose passes them separately from the legacy
 `STRIPE_PRICE_ID`. The catalogue must be complete; partial configuration fails at boot.
+Founding prices remain unavailable unless `SOTTO_FOUNDING_SCHEDULE_WORKER_ENABLED=1`; the switch
+defaults to `0` and requires a complete hosted catalogue plus
+`SOTTO_FOUNDING_SCHEDULE_PREFLIGHT_VERIFIED=1`. Keep both switches at `0` until the founding
+interval-change policy is decided and the complete schedule and renewal flow, including restricted
+key write permissions, has passed a Stripe test-mode rehearsal. Set the preflight value to `1` only
+after recording that evidence. The worker switch does not enable Cloud sales by itself.
 
 Hosted paid-invoice coverage intake and its refresh worker are staged separately and default off:
 `SOTTO_PROVIDER_REFRESH_INGEST_ENABLED=0` and `SOTTO_PROVIDER_REFRESH_WORKER_ENABLED=0`. These

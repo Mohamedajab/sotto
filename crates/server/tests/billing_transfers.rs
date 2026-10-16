@@ -41,6 +41,11 @@ async fn cleanup(pool: &PgPool, fixture: &str) {
     .execute(pool)
     .await
     .expect("clean transfer intents");
+    sqlx::query("DELETE FROM billing_founding_schedule_jobs WHERE beneficiary_id LIKE $1")
+        .bind(&pattern)
+        .execute(pool)
+        .await
+        .expect("clean founding schedule jobs");
     sqlx::query("DELETE FROM billing_founding_awards WHERE beneficiary_id LIKE $1")
         .bind(&pattern)
         .execute(pool)
@@ -248,7 +253,19 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
     .fetch_one(&pool)
     .await
     .expect("load founding payer");
-    assert_eq!(payer, ("sponsor".into(), org));
+    assert_eq!(payer, ("sponsor".into(), org.clone()));
+    let schedule_job: (String, String, String) = sqlx::query_as(
+        "SELECT payer_kind, payer_id, provider_subscription_id \
+         FROM billing_founding_schedule_jobs WHERE award_id = $1",
+    )
+    .bind(&award)
+    .fetch_one(&pool)
+    .await
+    .expect("founding transition follows the destination subscription");
+    assert_eq!(
+        schedule_job,
+        ("sponsor".into(), org.clone(), "sub_destination".into())
+    );
 
     let mut tx = pool.begin().await.expect("begin callback replay");
     record_destination_prepared(

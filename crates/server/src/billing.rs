@@ -54,6 +54,7 @@ use crate::cloud_provider_stripe_sponsored_store::{
 use crate::config::BillingConfig;
 use crate::error::{Error, Result};
 use crate::founding_allocator::{self, FoundingDate, FoundingOffer};
+use crate::founding_schedule;
 use crate::personal_billing;
 use crate::sponsored_billing::{self, SponsoredSeatAction, SponsoredSeatRequest};
 use crate::state::AppState;
@@ -301,14 +302,14 @@ pub struct SponsoredSubscriptionItem {
     pub quantity: i64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct SponsoredSubscriptionItemRequest {
     pub provider_price_id: String,
     pub quantity: i64,
 }
 
 /// A bounded or open-ended future phase for the organisation's sponsored subscription.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SponsoredSubscriptionPhase {
     pub start_at_epoch: i64,
     pub end_at_epoch: Option<i64>,
@@ -325,6 +326,12 @@ pub struct SponsoredSubscriptionSnapshot {
     pub current_period_end: Option<i64>,
     pub schedule_id: Option<String>,
     pub items: Vec<SponsoredSubscriptionItem>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PersonalSubscriptionPeriod {
+    pub start_epoch: i64,
+    pub end_epoch: i64,
 }
 
 /// The durable identifiers returned while creating the initial hosted subscription.
@@ -422,6 +429,17 @@ pub trait SubscriptionProvider: Send + Sync {
         Err(ProviderError::unsupported("sponsored_subscription_update"))
     }
 
+    /// Schedule a personal subscription's founding-to-standard transition without adding
+    /// organisation metadata to its Stripe subscription.
+    async fn update_personal_subscription(
+        &self,
+        _subscription_id: &str,
+        _phases: &[SponsoredSubscriptionPhase],
+        _idempotency_key: &str,
+    ) -> ProviderResult<SponsoredSubscriptionSnapshot> {
+        Err(ProviderError::unsupported("personal_subscription_schedule"))
+    }
+
     async fn get_sponsored_subscription(
         &self,
         _subscription_id: &str,
@@ -476,10 +494,10 @@ pub trait SubscriptionProvider: Send + Sync {
     ) -> ProviderResult<SubscriptionObservation>;
 
     /// Read the provider's current period end for a newly paid personal subscription.
-    async fn personal_subscription_period_end(
+    async fn personal_subscription_period(
         &self,
         _subscription_id: &str,
-    ) -> ProviderResult<Option<i64>> {
+    ) -> ProviderResult<Option<PersonalSubscriptionPeriod>> {
         Ok(None)
     }
 
@@ -529,6 +547,7 @@ pub struct BillingState {
     return_url: String,
     price_catalogue: Option<BillingPriceIds>,
     cloud_sales_enabled: bool,
+    founding_schedule_worker_enabled: bool,
     personal_coverage: Option<PersonalCoverageRuntime>,
 }
 
@@ -553,6 +572,15 @@ impl BillingState {
         self.cloud_sales_enabled
     }
 
+    pub fn founding_schedule_worker_enabled(&self) -> bool {
+        self.founding_schedule_worker_enabled
+    }
+
+    pub fn with_founding_schedule_worker_enabled(mut self, enabled: bool) -> Self {
+        self.founding_schedule_worker_enabled = enabled;
+        self
+    }
+
     pub fn from_config(config: BillingConfig) -> Self {
         let provider = StripeBilling {
             api_key: config.api_key.clone(),
@@ -564,6 +592,7 @@ impl BillingState {
             return_url: config.return_url,
             price_catalogue: config.price_catalogue,
             cloud_sales_enabled: config.cloud_sales_enabled,
+            founding_schedule_worker_enabled: false,
             personal_coverage: None,
         }
     }
@@ -620,6 +649,7 @@ impl BillingState {
             return_url,
             price_catalogue: None,
             cloud_sales_enabled,
+            founding_schedule_worker_enabled: true,
             personal_coverage: None,
         }
     }
@@ -632,6 +662,7 @@ impl BillingState {
             return_url: config.return_url,
             price_catalogue: config.price_catalogue,
             cloud_sales_enabled: config.cloud_sales_enabled,
+            founding_schedule_worker_enabled: false,
             personal_coverage: None,
         }
     }
@@ -948,9 +979,23 @@ impl SubscriptionProvider for StripeBilling {
             &self.api_key,
             &format!("subscription_schedules/{schedule_id}"),
             &form,
-            idempotency_key,
+            &schedule_update_idempotency_key(idempotency_key, &normalized),
         )
         .await?;
+        let schedule = stripe_get(
+            &self.api_key,
+            &format!("subscription_schedules/{schedule_id}"),
+        )
+        .await?;
+        if !stripe_schedule_contains_phases(
+            &schedule,
+            current_start,
+            current_end,
+            &current.items,
+            &normalized,
+        ) {
+            return Err(ProviderError::malformed_response());
+        }
         self.get_sponsored_subscription(subscription_id).await
     }
 
@@ -960,6 +1005,144 @@ impl SubscriptionProvider for StripeBilling {
     ) -> ProviderResult<SponsoredSubscriptionSnapshot> {
         let value = stripe_get(&self.api_key, &format!("subscriptions/{subscription_id}")).await?;
         sponsored_subscription_snapshot(&value, subscription_id)
+    }
+
+    async fn update_personal_subscription(
+        &self,
+        subscription_id: &str,
+        phases: &[SponsoredSubscriptionPhase],
+        idempotency_key: &str,
+    ) -> ProviderResult<SponsoredSubscriptionSnapshot> {
+        if subscription_id.is_empty()
+            || phases.is_empty()
+            || phases.iter().any(|phase| {
+                phase.start_at_epoch < 0
+                    || phase
+                        .end_at_epoch
+                        .is_some_and(|end| end <= phase.start_at_epoch)
+                    || phase.items.len() != 1
+                    || phase
+                        .items
+                        .iter()
+                        .any(|item| item.provider_price_id.is_empty() || item.quantity != 1)
+            })
+            || phases
+                .windows(2)
+                .any(|window| window[0].end_at_epoch != Some(window[1].start_at_epoch))
+        {
+            return Err(ProviderError::malformed_response());
+        }
+        let current = self.get_sponsored_subscription(subscription_id).await?;
+        let schedule_id = match current.schedule_id.clone() {
+            Some(schedule_id) => schedule_id,
+            None => {
+                let schedule = stripe_post_with_idempotency(
+                    &self.api_key,
+                    "subscription_schedules",
+                    &[("from_subscription".into(), subscription_id.into())],
+                    &format!("{idempotency_key}-schedule"),
+                )
+                .await?;
+                schedule["id"]
+                    .as_str()
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(ProviderError::malformed_response)?
+                    .to_string()
+            }
+        };
+        let current_start = current
+            .current_period_start
+            .ok_or_else(ProviderError::malformed_response)?;
+        let current_end = current
+            .current_period_end
+            .ok_or_else(ProviderError::malformed_response)?;
+        let phase_at_end = phases
+            .iter()
+            .find(|phase| {
+                phase.start_at_epoch <= current_end
+                    && phase.end_at_epoch.is_none_or(|end| current_end < end)
+            })
+            .or_else(|| {
+                phases
+                    .iter()
+                    .find(|phase| phase.start_at_epoch == current_end)
+            })
+            .ok_or_else(ProviderError::malformed_response)?;
+        let mut normalized = vec![SponsoredSubscriptionPhase {
+            start_at_epoch: current_end,
+            end_at_epoch: phase_at_end.end_at_epoch,
+            items: phase_at_end.items.clone(),
+        }];
+        normalized.extend(
+            phases
+                .iter()
+                .filter(|phase| phase.start_at_epoch > current_end)
+                .cloned(),
+        );
+        if normalized
+            .windows(2)
+            .any(|window| window[0].end_at_epoch != Some(window[1].start_at_epoch))
+        {
+            return Err(ProviderError::malformed_response());
+        }
+        let mut form = vec![
+            ("end_behavior".into(), "release".into()),
+            ("proration_behavior".into(), "none".into()),
+            ("phases[0][start_date]".into(), current_start.to_string()),
+            ("phases[0][end_date]".into(), current_end.to_string()),
+        ];
+        for (index, item) in current.items.iter().enumerate() {
+            form.push((
+                format!("phases[0][items][{index}][price]"),
+                item.provider_price_id.clone(),
+            ));
+            form.push((
+                format!("phases[0][items][{index}][quantity]"),
+                item.quantity.to_string(),
+            ));
+        }
+        for (phase_index, phase) in normalized.iter().enumerate() {
+            let index = phase_index + 1;
+            form.push((
+                format!("phases[{index}][start_date]"),
+                phase.start_at_epoch.to_string(),
+            ));
+            if let Some(end) = phase.end_at_epoch {
+                form.push((format!("phases[{index}][end_date]"), end.to_string()));
+            }
+            for (item_index, item) in phase.items.iter().enumerate() {
+                form.push((
+                    format!("phases[{index}][items][{item_index}][price]"),
+                    item.provider_price_id.clone(),
+                ));
+                form.push((
+                    format!("phases[{index}][items][{item_index}][quantity]"),
+                    item.quantity.to_string(),
+                ));
+            }
+        }
+        stripe_post_with_idempotency(
+            &self.api_key,
+            &format!("subscription_schedules/{schedule_id}"),
+            &form,
+            &schedule_update_idempotency_key(idempotency_key, &normalized),
+        )
+        .await?;
+        let schedule = stripe_get(
+            &self.api_key,
+            &format!("subscription_schedules/{schedule_id}"),
+        )
+        .await?;
+        if !stripe_schedule_contains_phases(
+            &schedule,
+            current_start,
+            current_end,
+            &current.items,
+            &normalized,
+        ) {
+            return Err(ProviderError::malformed_response());
+        }
+        self.get_sponsored_subscription(subscription_id).await
     }
 
     async fn cancel_sponsored_subscription(
@@ -1080,15 +1263,15 @@ impl SubscriptionProvider for StripeBilling {
         }
     }
 
-    async fn personal_subscription_period_end(
+    async fn personal_subscription_period(
         &self,
         subscription_id: &str,
-    ) -> ProviderResult<Option<i64>> {
+    ) -> ProviderResult<Option<PersonalSubscriptionPeriod>> {
         let object = stripe_get(&self.api_key, &format!("subscriptions/{subscription_id}")).await?;
         if object["id"].as_str() != Some(subscription_id) {
             return Err(ProviderError::malformed_response());
         }
-        Ok(subscription_period_end(&object))
+        personal_subscription_period_from_object(&object)
     }
 
     async fn cancel_subscription(
@@ -1263,6 +1446,7 @@ pub fn router() -> Router<AppState> {
             "/billing/personal/operations/{operation_id}",
             get(personal_operation),
         )
+        .route("/billing/personal/lifecycle", get(personal_lifecycle))
         .route("/billing/personal/portal", post(personal_portal))
         .route("/billing/personal/cancel", post(personal_cancel))
         .route("/billing/personal/refunds", post(personal_refund_request))
@@ -1419,6 +1603,14 @@ fn billing_offer(value: &str) -> Result<BillingOffer> {
         .ok_or_else(|| Error::BadRequest("unsupported billing offer".into()))
 }
 
+fn parse_founding_offer(value: &str) -> Result<FoundingOffer> {
+    match value {
+        "founding_monthly" => Ok(FoundingOffer::Monthly),
+        "founding_annual" => Ok(FoundingOffer::Annual),
+        _ => Err(Error::Internal("founding award offer is corrupt".into())),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct SponsoredQuoteRequest {
     action: String,
@@ -1450,6 +1642,10 @@ struct SponsoredSeatView {
     effective_from: i64,
     effective_until: Option<i64>,
     state: String,
+    founding_price_end_epoch: Option<i64>,
+    standard_renewal_amount_pence: Option<i64>,
+    founding_transition_status: Option<String>,
+    founding_transition_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1493,6 +1689,14 @@ async fn sponsored_seats(
                 effective_from: seat.effective_from,
                 effective_until: seat.effective_until,
                 state: seat.state.as_str().into(),
+                founding_price_end_epoch: seat.founding_price_end_epoch,
+                standard_renewal_amount_pence: seat.founding_offer.and_then(|offer| {
+                    FoundingOffer::from_billing_offer(offer)
+                        .map(FoundingOffer::standard_billing_offer)
+                        .map(BillingOffer::expected_amount_pence)
+                }),
+                founding_transition_status: seat.founding_transition_status,
+                founding_transition_reason: seat.founding_transition_reason,
             })
             .collect(),
     ))
@@ -1548,12 +1752,13 @@ async fn sponsored_quote(
         (requested_offer, None)
     } else {
         let mut tx = state.pool.begin().await?;
-        let selected = founding_allocator::select_offer(
+        let selected = select_founding_aware_offer(
             &mut tx,
             &request.beneficiary_ids[0],
             FoundingOffer::for_billing_offer_interval(requested_offer),
             None,
             now,
+            billing.founding_schedule_worker_enabled(),
         )
         .await
         .map_err(|error| Error::Internal(error.to_string()))?;
@@ -1597,8 +1802,8 @@ async fn sponsored_quote(
         founding: FoundingOffer::from_billing_offer(offer).is_some(),
         founding_remaining_places,
         founding_term: FoundingOffer::from_billing_offer(offer).map(|offer| match offer {
-            FoundingOffer::Monthly => "for the first monthly billing term",
-            FoundingOffer::Annual => "for the first annual billing term",
+            FoundingOffer::Monthly => "for the first 12 monthly billing periods",
+            FoundingOffer::Annual => "for the first annual billing period",
         }),
         next_renewal_amount_pence: match FoundingOffer::from_billing_offer(offer) {
             Some(FoundingOffer::Monthly) => BillingOffer::StandardMonthly.expected_amount_pence(),
@@ -1681,12 +1886,13 @@ async fn sponsored_checkout(
         }));
     }
     if request.action != SponsoredSeatAction::Remove {
-        let selected_offer = founding_allocator::select_offer(
+        let selected_offer = select_founding_aware_offer(
             &mut tx,
             incoming_beneficiary,
             FoundingOffer::for_billing_offer_interval(offer),
             Some(&operation.operation_id),
             now,
+            billing.founding_schedule_worker_enabled(),
         )
         .await
         .map_err(|error| Error::Internal(error.to_string()))?;
@@ -1951,26 +2157,36 @@ async fn sponsored_provider_items(
 /// Build the complete future seat schedule from Sotto's interval ledger. Stripe's current
 /// quantities describe only the provider's present phase; rebuilding a schedule from them loses
 /// an earlier removal or a later finite seat boundary whenever two changes are pending together.
-async fn sponsored_provider_phases(
+type SponsoredScheduleSeatRow = (
+    String,
+    String,
+    String,
+    i64,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+);
+type SponsoredSchedulePendingChange = (String, String, Option<i64>);
+
+pub(crate) async fn sponsored_provider_phases(
     pool: &sqlx::PgPool,
     organization_id: &str,
     catalogue: &BillingPriceIds,
     now_epoch: i64,
 ) -> Result<Vec<SponsoredSubscriptionPhase>> {
-    let mut rows: Vec<(String, String, i64, Option<i64>)> = sqlx::query_as(
-        "SELECT beneficiary_id, offer, effective_from, effective_until \
-         FROM billing_sponsored_seats \
-         WHERE organization_id = $1 AND state IN ('active', 'pending', 'scheduled_removal') \
-         ORDER BY effective_from, seat_id",
+    let rows: Vec<SponsoredScheduleSeatRow> = sqlx::query_as(
+        "SELECT seat.beneficiary_id, seat.offer, seat.state, seat.effective_from, seat.effective_until, \
+                award.original_end_epoch, award.offer \
+         FROM billing_sponsored_seats AS seat \
+         LEFT JOIN billing_founding_awards AS award ON award.beneficiary_id = seat.beneficiary_id \
+           AND award.payer_kind = 'sponsor' AND award.payer_id = seat.organization_id \
+         WHERE seat.organization_id = $1 AND seat.state IN ('active', 'pending', 'scheduled_removal') \
+         ORDER BY seat.effective_from, seat.seat_id",
     )
     .bind(organization_id)
     .fetch_all(pool)
     .await?;
-
-    // Removal and replacement rows are not marked scheduled_removal until the provider accepts
-    // their schedule. Apply every still-live operation in memory so a second mutation cannot
-    // rebuild Stripe's schedule without an earlier pending change.
-    let pending_changes: Vec<(String, String, Option<i64>)> = sqlx::query_as(
+    let pending_changes: Vec<SponsoredSchedulePendingChange> = sqlx::query_as(
         "SELECT beneficiary_id, action, effective_until \
          FROM billing_sponsored_operations \
          WHERE organization_id = $1 AND state IN ('pending', 'checkout_created', 'provider_pending') \
@@ -1979,21 +2195,64 @@ async fn sponsored_provider_phases(
     .bind(organization_id)
     .fetch_all(pool)
     .await?;
+    compile_sponsored_provider_phases(rows, &pending_changes, catalogue, now_epoch)
+}
+
+fn compile_sponsored_provider_phases(
+    mut rows: Vec<SponsoredScheduleSeatRow>,
+    pending_changes: &[SponsoredSchedulePendingChange],
+    catalogue: &BillingPriceIds,
+    now_epoch: i64,
+) -> Result<Vec<SponsoredSubscriptionPhase>> {
+    if rows
+        .iter()
+        .any(|(_, offer, state, _, _, founding_end, award_offer)| {
+            let unawarded_pending_founding = state == "pending"
+                && award_offer.is_none()
+                && billing_offer(offer)
+                    .ok()
+                    .and_then(FoundingOffer::from_billing_offer)
+                    .is_some();
+            !unawarded_pending_founding
+                && (award_offer.is_some()
+                    || billing_offer(offer)
+                        .ok()
+                        .and_then(FoundingOffer::from_billing_offer)
+                        .is_some())
+                && founding_end.is_none()
+        })
+    {
+        return Err(Error::Internal(
+            "founding sponsored seat has no verified transition boundary".into(),
+        ));
+    }
+
+    // Removal and replacement rows are not marked scheduled_removal until the provider accepts
+    // their schedule. Apply every still-live operation in memory so a second mutation cannot
+    // rebuild Stripe's schedule without an earlier pending change.
     for (beneficiary_id, _, effective_until) in pending_changes {
         for row in &mut rows {
-            if row.0 == beneficiary_id {
-                row.3 = effective_until;
+            if row.0 == *beneficiary_id {
+                row.4 = *effective_until;
             }
         }
     }
 
     let mut boundaries = std::collections::BTreeSet::from([now_epoch]);
-    for (_, _, effective_from, effective_until) in &rows {
+    for (_, _, _, effective_from, effective_until, founding_end, award_offer) in &rows {
         if *effective_from > now_epoch {
             boundaries.insert(*effective_from);
         }
         if let Some(effective_until) = effective_until.filter(|until| *until > now_epoch) {
             boundaries.insert(effective_until);
+        }
+        if award_offer.is_some() {
+            if let Some(founding_end) = founding_end {
+                let founding_end = founding_price_boundary(*founding_end)?;
+                if founding_end > now_epoch {
+                    boundaries.insert(founding_end);
+                }
+            }
         }
     }
     let boundaries: Vec<i64> = boundaries.into_iter().collect();
@@ -2001,13 +2260,34 @@ async fn sponsored_provider_phases(
     for (index, start_at_epoch) in boundaries.iter().copied().enumerate() {
         let end_at_epoch = boundaries.get(index + 1).copied();
         let mut quantities = std::collections::BTreeMap::<String, i64>::new();
-        for (_, offer, effective_from, effective_until) in &rows {
+        for (_, offer, state, effective_from, effective_until, founding_end, award_offer) in &rows {
             if *effective_from <= start_at_epoch
                 && effective_until
                     .map(|effective_until| start_at_epoch < effective_until)
                     .unwrap_or(true)
             {
-                let quantity = quantities.entry(offer.clone()).or_default();
+                let stored_offer = billing_offer(offer)?;
+                let founding_offer = award_offer
+                    .as_deref()
+                    .map(parse_founding_offer)
+                    .transpose()?;
+                let offer = if *state == "pending"
+                    && founding_offer.is_none()
+                    && FoundingOffer::from_billing_offer(stored_offer).is_some()
+                {
+                    stored_offer
+                } else {
+                    expected_founding_invoice_offer(
+                        stored_offer,
+                        founding_offer,
+                        founding_end.map(founding_price_boundary).transpose()?,
+                        start_at_epoch,
+                    )
+                    .ok_or_else(|| {
+                        Error::Internal("founding sponsored seat has no transition boundary".into())
+                    })?
+                };
+                let quantity = quantities.entry(offer.as_str().to_string()).or_default();
                 *quantity = quantity
                     .checked_add(1)
                     .ok_or_else(|| Error::BadRequest("sponsored seat count is too large".into()))?;
@@ -2030,6 +2310,91 @@ async fn sponsored_provider_phases(
         });
     }
     Ok(phases)
+}
+
+pub(crate) fn founding_price_boundary(value: i64) -> Result<i64> {
+    if value < 0 {
+        return Err(Error::Internal("founding price boundary is corrupt".into()));
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+fn founding_transition_offer(
+    offer: BillingOffer,
+    founding_end_epoch: i64,
+    phase_start_epoch: i64,
+) -> BillingOffer {
+    if phase_start_epoch < founding_end_epoch {
+        return offer;
+    }
+    FoundingOffer::from_billing_offer(offer)
+        .map(FoundingOffer::standard_billing_offer)
+        .unwrap_or(offer)
+}
+
+fn expected_founding_invoice_offer(
+    stored_offer: BillingOffer,
+    founding_offer: Option<FoundingOffer>,
+    founding_end_epoch: Option<i64>,
+    period_start_epoch: i64,
+) -> Option<BillingOffer> {
+    match founding_offer.or_else(|| FoundingOffer::from_billing_offer(stored_offer)) {
+        Some(founding) => {
+            let boundary = founding_end_epoch?;
+            Some(if period_start_epoch < boundary {
+                founding.billing_offer()
+            } else {
+                founding.standard_billing_offer()
+            })
+        }
+        None => Some(stored_offer),
+    }
+}
+
+fn expected_sponsored_invoice_offer(
+    stored_offer: BillingOffer,
+    founding_offer: Option<FoundingOffer>,
+    founding_end_epoch: Option<i64>,
+    seat_state: &str,
+    period_start_epoch: i64,
+) -> Option<BillingOffer> {
+    if seat_state == "pending"
+        && founding_offer.is_none()
+        && FoundingOffer::from_billing_offer(stored_offer).is_some()
+    {
+        // The first paid invoice is what creates the award boundary. Until it does, a pending
+        // founding seat must be matched against the founding price it requested.
+        Some(stored_offer)
+    } else {
+        expected_founding_invoice_offer(
+            stored_offer,
+            founding_offer,
+            founding_end_epoch,
+            period_start_epoch,
+        )
+    }
+}
+
+async fn select_founding_aware_offer(
+    tx: &mut Transaction<'_, Postgres>,
+    beneficiary_id: &str,
+    requested_interval: FoundingOffer,
+    operation_id: Option<&str>,
+    now_epoch: i64,
+    transitions_enabled: bool,
+) -> std::result::Result<BillingOffer, founding_allocator::FoundingAllocatorError> {
+    if !transitions_enabled {
+        return Ok(requested_interval.standard_billing_offer());
+    }
+    founding_allocator::select_offer(
+        tx,
+        beneficiary_id,
+        requested_interval,
+        operation_id,
+        now_epoch,
+    )
+    .await
 }
 
 fn billing_epoch() -> i64 {
@@ -2101,10 +2466,16 @@ async fn personal_quote(
             "this person already has sponsored hosted coverage".into(),
         ));
     }
-    let offer =
-        founding_allocator::select_offer(&mut tx, &user.user_id, requested_interval, None, now)
-            .await
-            .map_err(|error| Error::Internal(error.to_string()))?;
+    let offer = select_founding_aware_offer(
+        &mut tx,
+        &user.user_id,
+        requested_interval,
+        None,
+        now,
+        billing.founding_schedule_worker_enabled(),
+    )
+    .await
+    .map_err(|error| Error::Internal(error.to_string()))?;
     let amount_pence = offer.expected_amount_pence();
     let interval = offer.expected_interval();
     let founding = FoundingOffer::from_billing_offer(offer);
@@ -2115,8 +2486,8 @@ async fn personal_quote(
         (
             Some(status.remaining_places),
             Some(match founding_offer {
-                FoundingOffer::Monthly => "for the first monthly billing term",
-                FoundingOffer::Annual => "for the first annual billing term",
+                FoundingOffer::Monthly => "for the first 12 monthly billing periods",
+                FoundingOffer::Annual => "for the first annual billing period",
             }),
             status.standard_amount_pence,
         )
@@ -2188,12 +2559,13 @@ async fn personal_checkout(
     let mut checkout_expires_at_epoch = None;
     let operation = match operation {
         BeginOperation::Created(operation) => {
-            let selected_offer = founding_allocator::select_offer(
+            let selected_offer = select_founding_aware_offer(
                 &mut tx,
                 &user.user_id,
                 FoundingOffer::for_billing_offer_interval(offer),
                 Some(&operation.operation_id),
                 billing_epoch(),
+                billing.founding_schedule_worker_enabled(),
             )
             .await
             .map_err(|error| Error::Internal(error.to_string()))?;
@@ -2347,6 +2719,10 @@ struct PersonalLifecycleView {
     paid_through_date: Option<String>,
     cancel_at_period_end: bool,
     portal_url: Option<String>,
+    founding_price_end_epoch: Option<i64>,
+    standard_renewal_amount_pence: Option<i64>,
+    founding_transition_status: Option<String>,
+    founding_transition_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2664,6 +3040,7 @@ async fn personal_portal(
     let customer = account.stripe_customer_id.clone().ok_or_else(|| {
         Error::Conflict("personal billing has not received a paid customer yet".into())
     })?;
+    let founding = personal_founding_transition(&mut tx, &user.user_id).await?;
     tx.rollback().await?;
     let portal_url = billing
         .provider
@@ -2676,7 +3053,82 @@ async fn personal_portal(
         paid_through_date: account.paid_through_date,
         cancel_at_period_end: account.cancel_at_period_end,
         portal_url: Some(portal_url),
+        founding_price_end_epoch: founding.end_epoch,
+        standard_renewal_amount_pence: founding.standard_amount_pence,
+        founding_transition_status: founding.status,
+        founding_transition_reason: founding.reason,
     }))
+}
+
+async fn personal_lifecycle(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> Result<Json<PersonalLifecycleView>> {
+    let mut tx = state.pool.begin().await?;
+    let account = personal_billing::load_account(&mut tx, &user.user_id)
+        .await
+        .map_err(personal_billing_error)?
+        .ok_or_else(|| Error::NotFound("personal billing account not found".into()))?;
+    let founding = personal_founding_transition(&mut tx, &user.user_id).await?;
+    tx.commit().await?;
+    Ok(Json(PersonalLifecycleView {
+        state: account.state.as_str().into(),
+        stripe_subscription_id: account.stripe_subscription_id,
+        paid_through_date: account.paid_through_date,
+        cancel_at_period_end: account.cancel_at_period_end,
+        portal_url: None,
+        founding_price_end_epoch: founding.end_epoch,
+        standard_renewal_amount_pence: founding.standard_amount_pence,
+        founding_transition_status: founding.status,
+        founding_transition_reason: founding.reason,
+    }))
+}
+
+struct FoundingTransitionView {
+    end_epoch: Option<i64>,
+    standard_amount_pence: Option<i64>,
+    status: Option<String>,
+    reason: Option<String>,
+}
+
+async fn personal_founding_transition(
+    tx: &mut Transaction<'_, Postgres>,
+    beneficiary_id: &str,
+) -> Result<FoundingTransitionView> {
+    let row = sqlx::query(
+        "SELECT award.offer, award.original_end_epoch, \
+                CASE WHEN account.cancel_at_period_end OR account.state = 'canceled' \
+                     THEN 'not_required' ELSE COALESCE(schedule.state, 'unresolved') END AS schedule_state, \
+                CASE WHEN account.cancel_at_period_end OR account.state = 'canceled' THEN NULL \
+                     WHEN schedule.state = 'unresolved' THEN schedule.last_error_code \
+                     WHEN schedule.job_id IS NULL THEN 'local_evidence_invalid' \
+                     ELSE NULL END AS schedule_reason \
+         FROM billing_founding_awards AS award \
+         LEFT JOIN billing_founding_schedule_jobs AS schedule ON schedule.award_id = award.award_id \
+         LEFT JOIN billing_personal_accounts AS account ON account.user_id = award.beneficiary_id \
+         WHERE award.beneficiary_id = $1",
+    )
+    .bind(beneficiary_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else {
+        return Ok(FoundingTransitionView {
+            end_epoch: None,
+            standard_amount_pence: None,
+            status: None,
+            reason: None,
+        });
+    };
+    let offer = parse_founding_offer(&row.try_get::<String, _>("offer")?)?;
+    let end_epoch: Option<i64> = row.try_get("original_end_epoch")?;
+    let status: Option<String> = row.try_get("schedule_state")?;
+    let reason: Option<String> = row.try_get("schedule_reason")?;
+    Ok(FoundingTransitionView {
+        end_epoch,
+        standard_amount_pence: Some(offer.standard_billing_offer().expected_amount_pence()),
+        status: Some(status.unwrap_or_else(|| "unresolved".into())),
+        reason,
+    })
 }
 
 async fn personal_cancel(
@@ -2696,6 +3148,7 @@ async fn personal_cancel(
         .map_err(personal_billing_error)?
         .ok_or_else(|| Error::NotFound("personal billing account not found".into()))?;
     if account.cancel_at_period_end {
+        let founding = personal_founding_transition(&mut tx, &user.user_id).await?;
         tx.rollback().await?;
         return Ok(Json(PersonalLifecycleView {
             state: account.state.as_str().into(),
@@ -2703,6 +3156,10 @@ async fn personal_cancel(
             paid_through_date: account.paid_through_date,
             cancel_at_period_end: true,
             portal_url: None,
+            founding_price_end_epoch: founding.end_epoch,
+            standard_renewal_amount_pence: founding.standard_amount_pence,
+            founding_transition_status: founding.status,
+            founding_transition_reason: founding.reason,
         }));
     }
     let subscription_id = account.stripe_subscription_id.clone().ok_or_else(|| {
@@ -2722,6 +3179,7 @@ async fn personal_cancel(
     .bind(&user.user_id)
     .execute(&mut *update_tx)
     .await?;
+    let founding = personal_founding_transition(&mut update_tx, &user.user_id).await?;
     update_tx.commit().await?;
     Ok(Json(PersonalLifecycleView {
         state: account.state.as_str().into(),
@@ -2729,6 +3187,10 @@ async fn personal_cancel(
         paid_through_date: account.paid_through_date,
         cancel_at_period_end: true,
         portal_url: None,
+        founding_price_end_epoch: founding.end_epoch,
+        standard_renewal_amount_pence: founding.standard_amount_pence,
+        founding_transition_status: founding.status,
+        founding_transition_reason: founding.reason,
     }))
 }
 
@@ -2969,6 +3431,101 @@ async fn stripe_get(api_key: &str, path: &str) -> ProviderResult<serde_json::Val
         .await
         .map_err(|_| ProviderError::transport())?;
     stripe_response(response).await
+}
+
+fn stripe_schedule_contains_phases(
+    schedule: &serde_json::Value,
+    current_start: i64,
+    current_end: i64,
+    current_items: &[SponsoredSubscriptionItem],
+    expected_phases: &[SponsoredSubscriptionPhase],
+) -> bool {
+    let Some(actual) = schedule["phases"].as_array() else {
+        return false;
+    };
+    if actual.iter().any(|phase| {
+        let Some(start) = phase["start_date"].as_i64() else {
+            return true;
+        };
+        let Some(end) = phase["end_date"].as_i64() else {
+            return true;
+        };
+        end <= start
+    }) {
+        return false;
+    }
+    // Stripe may return completed schedule phases, though it can omit them. Compare the active
+    // phase and future plan, excluding only history whose end is at or before this period starts.
+    let current_phases: Vec<_> = actual
+        .iter()
+        .filter(|phase| {
+            phase["end_date"]
+                .as_i64()
+                .is_some_and(|end| end > current_start)
+        })
+        .collect();
+    let active = SponsoredSubscriptionPhase {
+        start_at_epoch: current_start,
+        end_at_epoch: Some(current_end),
+        items: current_items
+            .iter()
+            .map(|item| SponsoredSubscriptionItemRequest {
+                provider_price_id: item.provider_price_id.clone(),
+                quantity: item.quantity,
+            })
+            .collect(),
+    };
+    current_phases.len() == expected_phases.len() + 1
+        && stripe_schedule_phase_matches(current_phases[0], &active, None)
+        && expected_phases.iter().enumerate().all(|(index, expected)| {
+            let next_start = expected_phases
+                .get(index + 1)
+                .map(|phase| phase.start_at_epoch);
+            stripe_schedule_phase_matches(current_phases[index + 1], expected, next_start)
+        })
+}
+
+fn stripe_schedule_phase_matches(
+    actual: &serde_json::Value,
+    expected: &SponsoredSubscriptionPhase,
+    next_phase_start: Option<i64>,
+) -> bool {
+    actual["start_date"].as_i64() == Some(expected.start_at_epoch)
+        && match expected.end_at_epoch {
+            Some(end) => actual["end_date"].as_i64() == Some(end),
+            None => actual["end_date"]
+                .as_i64()
+                .is_some_and(|end| match next_phase_start {
+                    Some(next_start) => end == next_start,
+                    None => end > expected.start_at_epoch,
+                }),
+        }
+        && stripe_schedule_items_match(&actual["items"], &expected.items)
+}
+
+fn stripe_schedule_items_match(
+    actual: &serde_json::Value,
+    expected: &[SponsoredSubscriptionItemRequest],
+) -> bool {
+    let Some(actual) = actual.as_array() else {
+        return false;
+    };
+    actual.len() == expected.len()
+        && expected.iter().all(|expected| {
+            actual.iter().any(|item| {
+                let price_id = item["price"]
+                    .as_str()
+                    .or_else(|| item["price"]["id"].as_str());
+                price_id == Some(expected.provider_price_id.as_str())
+                    && item["quantity"].as_i64() == Some(expected.quantity)
+            })
+        })
+}
+
+fn schedule_update_idempotency_key(base: &str, phases: &[SponsoredSubscriptionPhase]) -> String {
+    let encoded = serde_json::to_vec(phases).expect("schedule phases serialize");
+    let digest = Sha256::digest(encoded);
+    format!("{base}:update:{digest:x}")
 }
 
 fn validate_stripe_personal_price(
@@ -3282,11 +3839,11 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
 
     let object = &event.data.object;
     let subscription_id = event_subscription_id(&event);
-    let personal_period_end = if is_personal_checkout_event(&event) {
+    let personal_period = if is_personal_checkout_event(&event) {
         if let Some(subscription_id) = subscription_id.as_deref() {
             billing
                 .provider
-                .personal_subscription_period_end(subscription_id)
+                .personal_subscription_period(subscription_id)
                 .await
                 .map_err(ProviderError::into_error)?
         } else {
@@ -3326,7 +3883,7 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
                 object,
                 event.created,
                 event.kind == "checkout.session.async_payment_succeeded",
-                personal_period_end,
+                personal_period,
                 sponsored_snapshot.as_ref(),
             )
             .await?;
@@ -3380,7 +3937,7 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
                     object,
                     event.created,
                     event.kind == "checkout.session.async_payment_succeeded",
-                    personal_period_end,
+                    personal_period,
                     sponsored_snapshot.as_ref(),
                 )
                 .await?
@@ -4035,6 +4592,7 @@ struct PreparedSponsoredInvoiceSeat {
     seat_id: String,
     operation_id: String,
     offer: BillingOffer,
+    registered_offer: BillingOffer,
     provider_item_id: String,
     price_id: String,
     desired_effective_until: Option<i64>,
@@ -4176,12 +4734,15 @@ async fn prepare_sponsored_invoice_coverage(
     };
     let event = sponsored_verified_event(event, raw_event, &subscription_id, &invoice_id)?;
     let seats = sqlx::query(
-        "SELECT seat.seat_id, seat.beneficiary_id, seat.offer, seat.effective_from, \
+        "SELECT seat.seat_id, seat.beneficiary_id, seat.offer, award.offer AS founding_offer, \
+                award.original_end_epoch, seat.effective_from, \
                 seat.effective_until, seat.state, seat.operation_id, seat.provider_item_id, \
                 seat.allocation_id, operation.state AS operation_state, operation.offer AS operation_offer, \
                 operation.provider_item_id AS operation_provider_item_id \
          FROM billing_sponsored_seats AS seat \
          JOIN billing_sponsored_operations AS operation ON operation.operation_id = seat.operation_id \
+         LEFT JOIN billing_founding_awards AS award ON award.beneficiary_id = seat.beneficiary_id \
+           AND award.payer_kind = 'sponsor' AND award.payer_id = seat.organization_id \
          WHERE seat.organization_id = $1 \
            AND operation.state IN ('active','provider_pending') \
            AND operation.provider_subscription_id = $4 \
@@ -4222,7 +4783,29 @@ async fn prepare_sponsored_invoice_coverage(
         };
         for seat in &seats {
             let seat_offer: String = seat.try_get("offer")?;
-            if seat_offer != offer.as_str() {
+            let stored_offer = billing_offer(&seat_offer)?;
+            let founding_offer: Option<String> = seat.try_get("founding_offer")?;
+            let founding_offer = founding_offer
+                .as_deref()
+                .map(parse_founding_offer)
+                .transpose()?;
+            let founding_end_epoch: Option<i64> = seat.try_get("original_end_epoch")?;
+            let seat_state: String = seat.try_get("state")?;
+            let Some(expected_offer) = expected_sponsored_invoice_offer(
+                stored_offer,
+                founding_offer,
+                founding_end_epoch,
+                &seat_state,
+                line.period_start(),
+            ) else {
+                let event = event.clone();
+                return Ok(SponsoredInvoiceCoveragePreparation::Rejected {
+                    context,
+                    event: Box::new(event),
+                    reason: "founding_invoice_boundary_missing",
+                });
+            };
+            if expected_offer != offer {
                 continue;
             }
             let seat_from: i64 = seat.try_get("effective_from")?;
@@ -4339,6 +4922,7 @@ async fn prepare_sponsored_invoice_coverage(
                 seat_id,
                 operation_id,
                 offer,
+                registered_offer: stored_offer,
                 provider_item_id: line.provider_item_id().to_owned(),
                 price_id: line.price_id().to_owned(),
                 desired_effective_until,
@@ -4487,6 +5071,10 @@ async fn prepare_personal_invoice_coverage(
     let row = sqlx::query(
         "SELECT user_id, operation_id, allocation_reference, stripe_coverage_binding_required, \
                 offer, stripe_customer_id, \
+                (SELECT offer FROM billing_founding_awards \
+                 WHERE beneficiary_id = billing_personal_accounts.user_id) AS founding_offer, \
+                (SELECT original_end_epoch FROM billing_founding_awards \
+                 WHERE beneficiary_id = billing_personal_accounts.user_id) AS founding_end_epoch, \
                 stripe_subscription_id FROM billing_personal_accounts \
          WHERE allocation_reference = $1",
     )
@@ -4513,6 +5101,12 @@ async fn prepare_personal_invoice_coverage(
     let operation_id: String = row.try_get("operation_id")?;
     let stored_reference: String = row.try_get("allocation_reference")?;
     let offer: String = row.try_get("offer")?;
+    let founding_offer: Option<String> = row.try_get("founding_offer")?;
+    let founding_offer = founding_offer
+        .as_deref()
+        .map(parse_founding_offer)
+        .transpose()?;
+    let founding_end_epoch: Option<i64> = row.try_get("founding_end_epoch")?;
     let Some(customer_id) = row.try_get::<Option<String>, _>("stripe_customer_id")? else {
         return Err(Error::Internal(
             "personal invoice checkout is not yet linked".into(),
@@ -4650,6 +5244,16 @@ async fn prepare_personal_invoice_coverage(
             ));
         }
     };
+    let Some(expected_invoice_offer) = expected_founding_invoice_offer(
+        billing_offer(&offer)?,
+        founding_offer,
+        founding_end_epoch,
+        evidence.period_start,
+    ) else {
+        return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+            "founding_boundary_missing",
+        ));
+    };
     if evidence.invoice_id != observation.invoice_id()
         || evidence.customer_id != observation.customer_id()
         || evidence.subscription_id != observation.subscription_id()
@@ -4661,7 +5265,11 @@ async fn prepare_personal_invoice_coverage(
         || evidence.period_start != observation.period_start()
         || evidence.period_end != observation.period_end()
         || evidence.payment_intent_id != settlement.payment_intent_id()
-        || !billing_offer_matches_price(billing.price_catalogue(), &offer, &evidence.price_id)
+        || !billing_offer_matches_price(
+            billing.price_catalogue(),
+            expected_invoice_offer.as_str(),
+            &evidence.price_id,
+        )
     {
         return Ok(PersonalInvoiceCoveragePreparation::Rejected(
             "invoice_evidence_changed",
@@ -4900,10 +5508,9 @@ async fn accept_sponsored_invoice_coverage(
         }
         let updated = sqlx::query(
             "UPDATE billing_sponsored_seats \
-             SET allocation_id = $2, provider_item_id = $3, updated_at = now() \
+             SET allocation_id = $2, provider_item_id = $3, offer = $8, updated_at = now() \
              WHERE seat_id = $1 AND beneficiary_id = $4 AND offer = $5 \
                AND effective_from = $6 AND effective_until IS NOT DISTINCT FROM $7 \
-               AND (provider_item_id IS NULL OR provider_item_id = $3) \
                AND (allocation_id IS NULL OR allocation_id = $2) \
                AND state IN ('pending','active','scheduled_removal','replaced','canceled') \
                AND EXISTS(SELECT 1 FROM billing_sponsored_operations operation \
@@ -4914,9 +5521,10 @@ async fn accept_sponsored_invoice_coverage(
         .bind(&allocation.allocation_id)
         .bind(&seat.provider_item_id)
         .bind(&allocation.beneficiary_id)
-        .bind(seat.offer.as_str())
+        .bind(seat.registered_offer.as_str())
         .bind(allocation.effective_from)
         .bind(seat.desired_effective_until)
+        .bind(seat.offer.as_str())
         .execute(&mut **tx)
         .await?;
         if updated.rows_affected() != 1 {
@@ -5364,7 +5972,7 @@ async fn checkout_completed(
     object: &serde_json::Value,
     event_created: i64,
     async_payment_succeeded: bool,
-    personal_period_end: Option<i64>,
+    personal_period: Option<PersonalSubscriptionPeriod>,
     sponsored_snapshot: Option<&SponsoredSubscriptionSnapshot>,
 ) -> Result<()> {
     // Sessions this server creates always carry the org id; anything else isn't ours to act on.
@@ -5385,7 +5993,7 @@ async fn checkout_completed(
             event_created,
             operation_id,
             async_payment_succeeded,
-            personal_period_end,
+            personal_period,
         )
         .await;
     }
@@ -5423,7 +6031,10 @@ async fn checkout_completed(
                 (snapshot.items.len() == 1).then(|| snapshot.items[0].provider_item_id.clone())
             }),
         };
-        if record_sponsored_founding_award(tx, operation_id, &evidence, event_created).await? {
+        let period_start = sponsored_snapshot.and_then(|snapshot| snapshot.current_period_start);
+        if record_sponsored_founding_award(tx, operation_id, &evidence, period_start, event_created)
+            .await?
+        {
             return Ok(());
         }
         sponsored_billing::complete_paid_checkout(tx, operation_id, &evidence)
@@ -5479,7 +6090,7 @@ async fn personal_checkout_completed(
     event_created: i64,
     operation_id: &str,
     async_payment_succeeded: bool,
-    personal_period_end: Option<i64>,
+    personal_period: Option<PersonalSubscriptionPeriod>,
 ) -> Result<()> {
     if !async_payment_succeeded && object["payment_status"].as_str() != Some("paid") {
         // A completed Checkout session is not itself authority. The account remains pending until
@@ -5514,32 +6125,50 @@ async fn personal_checkout_completed(
     .ok_or_else(|| Error::Config("personal checkout operation is not registered".into()))?;
     let user_id: String = account.try_get("user_id")?;
     let offer = billing_offer(&account.try_get::<String, _>("offer")?)?;
-    let paid_on = founding_allocator::FoundingDate::from_unix_seconds(event_created)
+    let period_start_epoch = personal_period
+        .map(|period| period.start_epoch)
+        .unwrap_or(event_created);
+    let paid_on = founding_allocator::FoundingDate::from_unix_seconds(period_start_epoch)
         .map_err(|_| Error::Config("personal checkout timestamp is invalid".into()))?;
     let interval_offer = match offer {
         BillingOffer::StandardMonthly | BillingOffer::FoundingMonthly => FoundingOffer::Monthly,
         BillingOffer::StandardAnnual | BillingOffer::FoundingAnnual => FoundingOffer::Annual,
     };
-    let paid_through = if let Some(period_end) = personal_period_end {
-        founding_allocator::FoundingDate::from_unix_seconds(period_end)
+    let paid_through = if let Some(period) = personal_period {
+        founding_allocator::FoundingDate::from_unix_seconds(period.end_epoch)
             .map_err(|_| Error::Config("personal subscription period end is invalid".into()))?
     } else {
         paid_on.add_term(interval_offer)
     };
     if FoundingOffer::from_billing_offer(offer).is_some() {
+        if personal_period.is_none() {
+            return Err(Error::Config(
+                "founding personal checkout has no verified subscription period".into(),
+            ));
+        }
         let reservation_id = format!("founding:{operation_id}");
-        match founding_allocator::confirm_payment(
+        match founding_allocator::confirm_payment_with_period_start(
             tx,
             &reservation_id,
             payment_reference,
             paid_on,
+            period_start_epoch,
             event_created,
         )
         .await
         .map_err(|error| Error::Internal(error.to_string()))?
         {
-            founding_allocator::ConfirmationOutcome::Awarded(_)
-            | founding_allocator::ConfirmationOutcome::AlreadyAwarded(_) => {}
+            founding_allocator::ConfirmationOutcome::Awarded(award) => {
+                crate::founding_schedule::enqueue(tx, &award, subscription)
+                    .await
+                    .map_err(|_| {
+                        Error::Internal("founding transition could not be queued".into())
+                    })?;
+            }
+            // A replay can carry an obsolete subscription after a payer transfer. The durable
+            // job was retargeted with the transfer itself; never retarget it from duplicate
+            // provider evidence.
+            founding_allocator::ConfirmationOutcome::AlreadyAwarded(_) => {}
             founding_allocator::ConfirmationOutcome::RefundRequired => {
                 let refund = personal_billing::record_refund_required(
                     tx,
@@ -5885,6 +6514,44 @@ fn subscription_period_end(object: &serde_json::Value) -> Option<i64> {
         .max()
 }
 
+fn personal_subscription_period_from_object(
+    object: &serde_json::Value,
+) -> ProviderResult<Option<PersonalSubscriptionPeriod>> {
+    let Some(start_epoch) = subscription_period_start(object) else {
+        return Ok(None);
+    };
+    let Some(end_epoch) = subscription_period_end(object) else {
+        return Ok(None);
+    };
+    if end_epoch <= start_epoch {
+        return Err(ProviderError::malformed_response());
+    }
+    Ok(Some(PersonalSubscriptionPeriod {
+        start_epoch,
+        end_epoch,
+    }))
+}
+
+fn invoice_period_start(object: &serde_json::Value) -> Option<i64> {
+    let lines = object["lines"]["data"].as_array()?;
+    lines
+        .iter()
+        .filter(|line| {
+            line["parent"]["type"].as_str() == Some("subscription_item_details")
+                || line["type"].as_str() == Some("subscription")
+        })
+        .filter_map(|line| line["period"]["start"].as_i64())
+        .filter(|start| *start >= 0)
+        .min()
+        .or_else(|| {
+            lines
+                .iter()
+                .filter_map(|line| line["period"]["start"].as_i64())
+                .filter(|start| *start >= 0)
+                .min()
+        })
+}
+
 /// Invoice.period_end describes the usage period that produced the invoice and therefore looks
 /// backwards for subscription invoices. The subscription line's period.end is the service term
 /// the paid invoice covers; the top-level field remains a compatibility fallback for old payloads.
@@ -5950,23 +6617,36 @@ async fn invoice_paid(
     let Some(subscription_id) = invoice_subscription_id(object) else {
         return Ok(());
     };
-    if sponsored_billing_enabled()
-        && sponsored_invoice_paid(tx, object, subscription_id, event_created, catalogue).await?
-    {
-        match verified_sponsored_invoice {
-            Some(SponsoredInvoiceCoveragePreparation::Prepared(prepared)) => {
-                accept_sponsored_invoice_coverage(tx, prepared).await?;
+    if sponsored_billing_enabled() {
+        let sponsored_organization =
+            sponsored_invoice_paid(tx, object, subscription_id, event_created, catalogue).await?;
+        if let Some(organization_id) = sponsored_organization {
+            match verified_sponsored_invoice {
+                Some(SponsoredInvoiceCoveragePreparation::Prepared(prepared)) => {
+                    accept_sponsored_invoice_coverage(tx, prepared).await?;
+                }
+                Some(SponsoredInvoiceCoveragePreparation::Rejected {
+                    context,
+                    event,
+                    reason,
+                }) => {
+                    reject_sponsored_invoice_coverage(tx, context, event, reason).await?;
+                }
+                Some(SponsoredInvoiceCoveragePreparation::NotApplicable) | None => {}
             }
-            Some(SponsoredInvoiceCoveragePreparation::Rejected {
-                context,
-                event,
-                reason,
-            }) => {
-                reject_sponsored_invoice_coverage(tx, context, event, reason).await?;
+            if let Some(catalogue) = catalogue {
+                reconcile_sponsored_founding_invoice(
+                    tx,
+                    &organization_id,
+                    subscription_id,
+                    object,
+                    &sponsored_invoice_items(object),
+                    catalogue,
+                )
+                .await?;
             }
-            Some(SponsoredInvoiceCoveragePreparation::NotApplicable) | None => {}
+            return Ok(());
         }
-        return Ok(());
     }
     let personal: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM billing_personal_accounts \
@@ -6004,6 +6684,75 @@ async fn invoice_paid(
     )
     .await
     .map_err(personal_billing_error)?;
+    reconcile_personal_founding_invoice(tx, object, subscription_id, catalogue).await?;
+    Ok(())
+}
+
+async fn reconcile_personal_founding_invoice(
+    tx: &mut Transaction<'_, Postgres>,
+    object: &serde_json::Value,
+    subscription_id: &str,
+    catalogue: Option<&BillingPriceIds>,
+) -> Result<()> {
+    let Some(row) = sqlx::query(
+        "SELECT account.user_id, award.award_id, award.offer AS founding_offer, \
+                award.original_end_epoch \
+         FROM billing_personal_accounts AS account \
+         JOIN billing_founding_awards AS award ON award.beneficiary_id = account.user_id \
+         WHERE account.stripe_subscription_id = $1 \
+           AND award.payer_kind = 'personal' AND award.payer_id = account.user_id",
+    )
+    .bind(subscription_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    else {
+        return Ok(());
+    };
+    let award_id: String = row.try_get("award_id")?;
+    let failure = if let Some(period_start) = invoice_period_start(object) {
+        if let Some(end_epoch) = row.try_get::<Option<i64>, _>("original_end_epoch")? {
+            let founding_offer =
+                parse_founding_offer(&row.try_get::<String, _>("founding_offer")?)?;
+            if let Some(catalogue) = catalogue {
+                let expected = if period_start < founding_price_boundary(end_epoch)? {
+                    founding_offer.billing_offer()
+                } else {
+                    founding_offer.standard_billing_offer()
+                };
+                let line_items = sponsored_invoice_items(object);
+                if line_items.len() == 1
+                    && line_items[0].1 == catalogue.id_for(expected)
+                    && line_items[0].2 == 1
+                {
+                    let user_id: String = row.try_get("user_id")?;
+                    sqlx::query(
+                        "UPDATE billing_personal_accounts SET offer = $3, updated_at = now() \
+                         WHERE user_id = $1 AND stripe_subscription_id = $2",
+                    )
+                    .bind(user_id)
+                    .bind(subscription_id)
+                    .bind(expected.as_str())
+                    .execute(&mut **tx)
+                    .await?;
+                    return Ok(());
+                }
+                Some("invoice_price_mismatch")
+            } else {
+                Some("invoice_price_mismatch")
+            }
+        } else {
+            Some("invoice_boundary_missing")
+        }
+    } else {
+        Some("invoice_boundary_missing")
+    };
+    if let Some(failure) = failure {
+        founding_schedule::mark_invoice_unresolved(tx, &award_id, failure)
+            .await
+            .map_err(|_| {
+                Error::Internal("founding transition could not be marked unresolved".into())
+            })?;
+    }
     Ok(())
 }
 
@@ -6013,7 +6762,7 @@ async fn sponsored_invoice_paid(
     subscription_id: &str,
     event_created: i64,
     catalogue: Option<&BillingPriceIds>,
-) -> Result<bool> {
+) -> Result<Option<String>> {
     let Some(catalogue) = catalogue else {
         return Err(Error::NotConfigured(
             "sponsored billing price catalogue is not configured".into(),
@@ -6027,7 +6776,7 @@ async fn sponsored_invoice_paid(
     .fetch_optional(&mut **tx)
     .await?;
     if known_subscription.is_none() {
-        return Ok(false);
+        return Ok(None);
     }
     founding_allocator::lock_capacity(tx)
         .await
@@ -6040,7 +6789,7 @@ async fn sponsored_invoice_paid(
     .fetch_optional(&mut **tx)
     .await?;
     let Some(organization_id) = organization_id else {
-        return Ok(false);
+        return Ok(None);
     };
     let payment_reference = object["payment_intent"]
         .as_str()
@@ -6048,6 +6797,7 @@ async fn sponsored_invoice_paid(
         .ok_or_else(|| Error::Config("paid sponsored invoice has no payment reference".into()))?;
     let period_end = invoice_period_end(object)
         .ok_or_else(|| Error::Config("paid sponsored invoice has no period end".into()))?;
+    let period_start = invoice_period_start(object);
     let paid_at = object["status_transitions"]["paid_at"]
         .as_i64()
         .or_else(|| object["created"].as_i64())
@@ -6112,14 +6862,168 @@ async fn sponsored_invoice_paid(
             payment_reference: payment_reference.to_string(),
             provider_item_id,
         };
-        if record_sponsored_founding_award(tx, &operation_id, &evidence, paid_at).await? {
+        if record_sponsored_founding_award(tx, &operation_id, &evidence, period_start, paid_at)
+            .await?
+        {
             continue;
         }
         sponsored_billing::complete_paid_checkout(tx, &operation_id, &evidence)
             .await
             .map_err(Error::from)?;
     }
-    Ok(true)
+    Ok(Some(organization_id))
+}
+
+async fn reconcile_sponsored_founding_invoice(
+    tx: &mut Transaction<'_, Postgres>,
+    organization_id: &str,
+    subscription_id: &str,
+    invoice: &serde_json::Value,
+    line_items: &[(String, String, i64)],
+    catalogue: &BillingPriceIds,
+) -> Result<()> {
+    let Some(period_start) = invoice_period_start(invoice) else {
+        return mark_sponsored_founders_unresolved(
+            tx,
+            organization_id,
+            subscription_id,
+            "invoice_boundary_missing",
+        )
+        .await;
+    };
+    let Some(period_end) = invoice_period_end(invoice) else {
+        return mark_sponsored_founders_unresolved(
+            tx,
+            organization_id,
+            subscription_id,
+            "invoice_boundary_missing",
+        )
+        .await;
+    };
+    type SponsoredInvoiceSeatRow = (
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+    );
+    let rows: Vec<SponsoredInvoiceSeatRow> = sqlx::query_as(
+            "SELECT seat.seat_id, seat.beneficiary_id, seat.offer, award.award_id, \
+                    award.offer, award.original_end_epoch \
+             FROM billing_sponsored_seats AS seat \
+             JOIN billing_sponsored_operations AS operation ON operation.operation_id = seat.operation_id \
+             LEFT JOIN billing_founding_awards AS award ON award.beneficiary_id = seat.beneficiary_id \
+               AND award.payer_kind = 'sponsor' AND award.payer_id = seat.organization_id \
+             WHERE seat.organization_id = $1 AND operation.provider_subscription_id = $2 \
+               AND operation.state IN ('active','provider_pending') \
+               AND seat.state IN ('pending','active','scheduled_removal','replaced','canceled') \
+               AND seat.effective_from < $4 \
+               AND (seat.effective_until IS NULL OR seat.effective_until > $3)",
+        )
+        .bind(organization_id)
+        .bind(subscription_id)
+        .bind(period_start)
+        .bind(period_end)
+        .fetch_all(&mut **tx)
+        .await?;
+
+    let mut expected_quantities = std::collections::BTreeMap::<String, i64>::new();
+    let mut updates = Vec::new();
+    let mut boundary_errors = std::collections::BTreeSet::new();
+    let mut founder_awards = std::collections::BTreeSet::new();
+    for (seat_id, _, stored_offer, award_id, award_offer, end_epoch) in &rows {
+        let stored_offer = billing_offer(stored_offer)?;
+        let expected_offer = match (award_id, award_offer, end_epoch) {
+            (Some(award_id), Some(offer), Some(end_epoch)) => {
+                founder_awards.insert(award_id.clone());
+                let offer = parse_founding_offer(offer)?;
+                Some(expected_founding_invoice_offer(
+                    stored_offer,
+                    Some(offer),
+                    Some(founding_price_boundary(*end_epoch)?),
+                    period_start,
+                ))
+            }
+            (Some(award_id), _, _) => {
+                founder_awards.insert(award_id.clone());
+                boundary_errors.insert(award_id.clone());
+                None
+            }
+            (None, _, _) => Some(Some(stored_offer)),
+        };
+        let Some(expected_offer) = expected_offer.flatten() else {
+            continue;
+        };
+        let quantity = expected_quantities
+            .entry(catalogue.id_for(expected_offer).to_string())
+            .or_default();
+        *quantity = quantity
+            .checked_add(1)
+            .ok_or_else(|| Error::BadRequest("sponsored invoice seat count is too large".into()))?;
+        if award_id.is_some() {
+            updates.push((seat_id.clone(), expected_offer));
+        }
+    }
+    if !founder_awards.is_empty() {
+        let mut actual_quantities = std::collections::BTreeMap::<String, i64>::new();
+        for (_, price_id, quantity) in line_items {
+            let quantity_sum = actual_quantities.entry(price_id.clone()).or_default();
+            *quantity_sum = quantity_sum.checked_add(*quantity).ok_or_else(|| {
+                Error::BadRequest("sponsored invoice quantity is too large".into())
+            })?;
+        }
+        if boundary_errors.is_empty() && actual_quantities == expected_quantities {
+            for (seat_id, offer) in updates {
+                sqlx::query("UPDATE billing_sponsored_seats SET offer = $2 WHERE seat_id = $1")
+                    .bind(seat_id)
+                    .bind(offer.as_str())
+                    .execute(&mut **tx)
+                    .await?;
+            }
+        } else {
+            for award_id in founder_awards {
+                let code = if boundary_errors.contains(&award_id) {
+                    "invoice_boundary_missing"
+                } else {
+                    "invoice_price_mismatch"
+                };
+                founding_schedule::mark_invoice_unresolved(tx, &award_id, code)
+                    .await
+                    .map_err(|_| {
+                        Error::Internal("founding transition could not be marked unresolved".into())
+                    })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn mark_sponsored_founders_unresolved(
+    tx: &mut Transaction<'_, Postgres>,
+    organization_id: &str,
+    subscription_id: &str,
+    error_code: &'static str,
+) -> Result<()> {
+    let awards: Vec<String> = sqlx::query_scalar(
+        "SELECT award.award_id FROM billing_founding_awards AS award \
+         JOIN billing_sponsored_seats AS seat ON seat.beneficiary_id = award.beneficiary_id \
+         JOIN billing_sponsored_operations AS operation ON operation.operation_id = seat.operation_id \
+         WHERE seat.organization_id = $1 AND operation.provider_subscription_id = $2 \
+           AND operation.state IN ('active','provider_pending')",
+    )
+    .bind(organization_id)
+    .bind(subscription_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    for award_id in awards {
+        founding_schedule::mark_invoice_unresolved(tx, &award_id, error_code)
+            .await
+            .map_err(|_| {
+                Error::Internal("founding transition could not be marked unresolved".into())
+            })?;
+    }
+    Ok(())
 }
 
 /// Confirm a sponsor's founding reservation before activating its named seat. Returns true when
@@ -6128,6 +7032,7 @@ async fn record_sponsored_founding_award(
     tx: &mut Transaction<'_, Postgres>,
     operation_id: &str,
     evidence: &sponsored_billing::SponsoredProviderEvidence,
+    period_start_epoch: Option<i64>,
     paid_at_epoch: i64,
 ) -> Result<bool> {
     founding_allocator::lock_capacity(tx)
@@ -6143,31 +7048,40 @@ async fn record_sponsored_founding_award(
     if FoundingOffer::from_billing_offer(offer).is_none() {
         return Ok(false);
     }
-    let paid_on = founding_allocator::FoundingDate::from_unix_seconds(paid_at_epoch)
+    let period_start_epoch = period_start_epoch.ok_or_else(|| {
+        Error::Config("sponsored founding payment has no verified period start".into())
+    })?;
+    let paid_on = founding_allocator::FoundingDate::from_unix_seconds(period_start_epoch)
         .map_err(|_| Error::Config("sponsored founding payment timestamp is invalid".into()))?;
     // One organisation invoice can pay for several named founding seats. Keep the allocator's
     // globally unique payment claim specific to this operation while retaining the unmodified
     // provider reference in the sponsored operation for refund handling.
     let allocation_payment_reference = format!("{}:{operation_id}", evidence.payment_reference);
-    match founding_allocator::confirm_payment(
+    match founding_allocator::confirm_payment_with_period_start(
         tx,
         &format!("founding:{operation_id}"),
         &allocation_payment_reference,
         paid_on,
+        period_start_epoch,
         paid_at_epoch,
     )
     .await
     .map_err(|error| Error::Internal(error.to_string()))?
     {
-        founding_allocator::ConfirmationOutcome::Awarded(_)
-        | founding_allocator::ConfirmationOutcome::AlreadyAwarded(_) => Ok(false),
+        founding_allocator::ConfirmationOutcome::Awarded(award) => {
+            crate::founding_schedule::enqueue(tx, &award, &evidence.subscription_id)
+                .await
+                .map_err(|_| Error::Internal("founding transition could not be queued".into()))?;
+        }
+        founding_allocator::ConfirmationOutcome::AlreadyAwarded(_) => {}
         founding_allocator::ConfirmationOutcome::RefundRequired => {
             sponsored_billing::record_founding_refund_required(tx, operation_id, evidence)
                 .await
                 .map_err(Error::from)?;
-            Ok(true)
+            return Ok(true);
         }
     }
+    Ok(false)
 }
 
 fn sponsored_invoice_items(object: &serde_json::Value) -> Vec<(String, String, i64)> {
@@ -6466,6 +7380,349 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    #[test]
+    fn founding_price_moves_to_standard_at_the_award_boundary() {
+        let boundary = FoundingDate::parse("2027-01-31")
+            .expect("date is valid")
+            .to_unix_seconds();
+
+        assert_eq!(
+            founding_transition_offer(BillingOffer::FoundingMonthly, boundary, boundary - 1),
+            BillingOffer::FoundingMonthly
+        );
+        assert_eq!(
+            founding_transition_offer(BillingOffer::FoundingMonthly, boundary, boundary),
+            BillingOffer::StandardMonthly
+        );
+        assert_eq!(
+            founding_transition_offer(BillingOffer::StandardAnnual, boundary, boundary),
+            BillingOffer::StandardAnnual
+        );
+        assert_eq!(
+            expected_founding_invoice_offer(
+                BillingOffer::StandardMonthly,
+                Some(FoundingOffer::Monthly),
+                Some(boundary),
+                boundary - 1,
+            ),
+            Some(BillingOffer::FoundingMonthly)
+        );
+        assert_eq!(
+            expected_founding_invoice_offer(
+                BillingOffer::FoundingMonthly,
+                Some(FoundingOffer::Monthly),
+                Some(boundary),
+                boundary,
+            ),
+            Some(BillingOffer::StandardMonthly)
+        );
+        assert_eq!(
+            expected_founding_invoice_offer(
+                BillingOffer::FoundingMonthly,
+                Some(FoundingOffer::Monthly),
+                None,
+                boundary,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn first_sponsored_founding_invoice_uses_the_pending_seats_requested_price() {
+        assert_eq!(
+            expected_sponsored_invoice_offer(
+                BillingOffer::FoundingMonthly,
+                None,
+                None,
+                "pending",
+                1_800_000_000,
+            ),
+            Some(BillingOffer::FoundingMonthly)
+        );
+        assert_eq!(
+            expected_sponsored_invoice_offer(
+                BillingOffer::FoundingMonthly,
+                None,
+                None,
+                "active",
+                1_800_000_000,
+            ),
+            None,
+            "an active founding seat without an award remains corrupt evidence"
+        );
+    }
+
+    #[test]
+    fn sponsored_phases_keep_independent_founder_boundaries_and_pending_removals() {
+        let catalogue = BillingPriceIds {
+            standard_monthly: "price_standard_monthly".into(),
+            standard_annual: "price_standard_annual".into(),
+            founding_monthly: "price_founding_monthly".into(),
+            founding_annual: "price_founding_annual".into(),
+        };
+        let rows = vec![
+            (
+                "monthly-founder".into(),
+                "founding_monthly".into(),
+                "active".into(),
+                900,
+                None,
+                Some(2_000),
+                Some("founding_monthly".into()),
+            ),
+            (
+                "annual-founder".into(),
+                "founding_annual".into(),
+                "active".into(),
+                900,
+                None,
+                Some(3_000),
+                Some("founding_annual".into()),
+            ),
+            (
+                "standard-seat".into(),
+                "standard_monthly".into(),
+                "active".into(),
+                900,
+                None,
+                None,
+                None,
+            ),
+            (
+                "removing-seat".into(),
+                "standard_monthly".into(),
+                "active".into(),
+                900,
+                None,
+                None,
+                None,
+            ),
+        ];
+        let pending = vec![("removing-seat".into(), "remove".into(), Some(2_500))];
+        let phases = compile_sponsored_provider_phases(rows, &pending, &catalogue, 1_000)
+            .expect("compile all independent seat boundaries");
+
+        assert_eq!(phases.len(), 4);
+        assert_eq!(phases[0].start_at_epoch, 1_000);
+        assert_eq!(phases[0].end_at_epoch, Some(2_000));
+        assert_eq!(phases[0].items.len(), 3);
+        assert!(phases[0].items.contains(&SponsoredSubscriptionItemRequest {
+            provider_price_id: "price_founding_monthly".into(),
+            quantity: 1,
+        }));
+        assert!(phases[0].items.contains(&SponsoredSubscriptionItemRequest {
+            provider_price_id: "price_founding_annual".into(),
+            quantity: 1,
+        }));
+        assert!(phases[0].items.contains(&SponsoredSubscriptionItemRequest {
+            provider_price_id: "price_standard_monthly".into(),
+            quantity: 2,
+        }));
+        assert_eq!(phases[1].start_at_epoch, 2_000);
+        assert!(phases[1].items.contains(&SponsoredSubscriptionItemRequest {
+            provider_price_id: "price_standard_monthly".into(),
+            quantity: 3,
+        }));
+        assert_eq!(phases[2].start_at_epoch, 2_500);
+        assert!(phases[2].items.contains(&SponsoredSubscriptionItemRequest {
+            provider_price_id: "price_standard_monthly".into(),
+            quantity: 2,
+        }));
+        assert_eq!(phases[3].start_at_epoch, 3_000);
+        assert!(phases[3].items.contains(&SponsoredSubscriptionItemRequest {
+            provider_price_id: "price_standard_annual".into(),
+            quantity: 1,
+        }));
+    }
+
+    #[test]
+    fn pending_founding_sponsored_seat_keeps_its_requested_price_before_award() {
+        let catalogue = BillingPriceIds {
+            standard_monthly: "price_standard_monthly".into(),
+            standard_annual: "price_standard_annual".into(),
+            founding_monthly: "price_founding_monthly".into(),
+            founding_annual: "price_founding_annual".into(),
+        };
+        let rows = vec![(
+            "pending-founder".into(),
+            "founding_monthly".into(),
+            "pending".into(),
+            900,
+            None,
+            None,
+            None,
+        )];
+        let phases = compile_sponsored_provider_phases(rows, &[], &catalogue, 1_000)
+            .expect("unpaid pending seat can be scheduled before its award exists");
+        assert_eq!(phases.len(), 1);
+        assert_eq!(
+            phases[0].items,
+            vec![SponsoredSubscriptionItemRequest {
+                provider_price_id: "price_founding_monthly".into(),
+                quantity: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn stripe_schedule_readback_must_match_price_boundary_and_quantity() {
+        let current_items = vec![SponsoredSubscriptionItem {
+            provider_item_id: "si_1".into(),
+            provider_price_id: "price_founding_monthly".into(),
+            quantity: 1,
+        }];
+        let expected = vec![SponsoredSubscriptionPhase {
+            start_at_epoch: 1_800_000_000,
+            end_at_epoch: None,
+            items: vec![SponsoredSubscriptionItemRequest {
+                provider_price_id: "price_standard_monthly".into(),
+                quantity: 1,
+            }],
+        }];
+        let accepted = serde_json::json!({
+            "phases": [
+                {
+                    "start_date": 1_600_000_000,
+                    "end_date": 1_700_000_000,
+                    "items": [{"price": "price_standard_monthly", "quantity": 1}]
+                },
+                {
+                    "start_date": 1_700_000_000,
+                    "end_date": 1_800_000_000,
+                    "items": [{"price": {"id": "price_founding_monthly"}, "quantity": 1}]
+                },
+                {
+                    "start_date": 1_800_000_000,
+                    "end_date": 2_100_000_000,
+                    "items": [{"price": {"id": "price_standard_monthly"}, "quantity": 1}]
+                }
+            ]
+        });
+        assert!(stripe_schedule_contains_phases(
+            &accepted,
+            1_700_000_000,
+            1_800_000_000,
+            &current_items,
+            &expected
+        ));
+
+        let drifted = serde_json::json!({
+            "phases": [
+                {
+                    "start_date": 1_700_000_000,
+                    "end_date": 1_800_000_000,
+                    "items": [{"price": "price_founding_monthly", "quantity": 1}]
+                },
+                {
+                    "start_date": 1_800_000_000,
+                    "end_date": 2_100_000_000,
+                    "items": [{"price": "price_founding_monthly", "quantity": 1}]
+                }
+            ]
+        });
+        assert!(!stripe_schedule_contains_phases(
+            &drifted,
+            1_700_000_000,
+            1_800_000_000,
+            &current_items,
+            &expected
+        ));
+
+        let unexpected_future = serde_json::json!({
+            "phases": [
+                {
+                    "start_date": 1_700_000_000,
+                    "end_date": 1_800_000_000,
+                    "items": [{"price": "price_founding_monthly", "quantity": 1}]
+                },
+                {
+                    "start_date": 1_800_000_000,
+                    "end_date": 1_900_000_000,
+                    "items": [{"price": "price_standard_monthly", "quantity": 1}]
+                },
+                {
+                    "start_date": 1_900_000_000,
+                    "end_date": 2_100_000_000,
+                    "items": [{"price": "price_founding_monthly", "quantity": 1}]
+                }
+            ]
+        });
+        assert!(!stripe_schedule_contains_phases(
+            &unexpected_future,
+            1_700_000_000,
+            1_800_000_000,
+            &current_items,
+            &expected
+        ));
+
+        let expected_with_contiguous_open_phase = vec![
+            SponsoredSubscriptionPhase {
+                start_at_epoch: 1_800_000_000,
+                end_at_epoch: None,
+                items: vec![SponsoredSubscriptionItemRequest {
+                    provider_price_id: "price_founding_monthly".into(),
+                    quantity: 1,
+                }],
+            },
+            SponsoredSubscriptionPhase {
+                start_at_epoch: 1_900_000_000,
+                end_at_epoch: None,
+                items: vec![SponsoredSubscriptionItemRequest {
+                    provider_price_id: "price_standard_monthly".into(),
+                    quantity: 1,
+                }],
+            },
+        ];
+        let gapped_open_phase = serde_json::json!({
+            "phases": [
+                {
+                    "start_date": 1_700_000_000,
+                    "end_date": 1_800_000_000,
+                    "items": [{"price": "price_founding_monthly", "quantity": 1}]
+                },
+                {
+                    "start_date": 1_800_000_000,
+                    "end_date": 1_850_000_000,
+                    "items": [{"price": "price_founding_monthly", "quantity": 1}]
+                },
+                {
+                    "start_date": 1_900_000_000,
+                    "end_date": 2_100_000_000,
+                    "items": [{"price": "price_standard_monthly", "quantity": 1}]
+                }
+            ]
+        });
+        assert!(!stripe_schedule_contains_phases(
+            &gapped_open_phase,
+            1_700_000_000,
+            1_800_000_000,
+            &current_items,
+            &expected_with_contiguous_open_phase
+        ));
+
+        let invalid_final_boundary = serde_json::json!({
+            "phases": [
+                {
+                    "start_date": 1_700_000_000,
+                    "end_date": 1_800_000_000,
+                    "items": [{"price": "price_founding_monthly", "quantity": 1}]
+                },
+                {
+                    "start_date": 1_800_000_000,
+                    "end_date": 1_800_000_000,
+                    "items": [{"price": "price_standard_monthly", "quantity": 1}]
+                }
+            ]
+        });
+        assert!(!stripe_schedule_contains_phases(
+            &invalid_final_boundary,
+            1_700_000_000,
+            1_800_000_000,
+            &current_items,
+            &expected
+        ));
+    }
 
     #[test]
     fn malformed_paid_invoice_shape_becomes_an_unresolved_repair() {
@@ -7243,6 +8500,32 @@ mod tests {
         });
         assert_eq!(invoice_period_end(&invoice), Some(1_950_000_000));
         assert_eq!(invoice_subscription_id(&invoice), Some("sub-1"));
+    }
+
+    #[test]
+    fn personal_subscription_period_rejects_non_increasing_boundaries() {
+        let valid = serde_json::json!({
+            "items": {"data": [{"current_period_start": 100, "current_period_end": 200}]}
+        });
+        assert_eq!(
+            personal_subscription_period_from_object(&valid).unwrap(),
+            Some(PersonalSubscriptionPeriod {
+                start_epoch: 100,
+                end_epoch: 200,
+            })
+        );
+
+        for end in [100, 99] {
+            let malformed = serde_json::json!({
+                "items": {"data": [{"current_period_start": 100, "current_period_end": end}]}
+            });
+            assert_eq!(
+                personal_subscription_period_from_object(&malformed)
+                    .unwrap_err()
+                    .kind,
+                ProviderErrorKind::Unknown
+            );
+        }
     }
 
     #[test]

@@ -461,7 +461,7 @@ describe("TeamPanel billing request ownership", () => {
       quoteExpiresAtEpoch: 2_000_000_000,
       founding: true,
       foundingRemainingPlaces: 42,
-      foundingTerm: "for the first monthly billing term",
+      foundingTerm: "for the first 12 monthly billing periods",
       nextRenewalAmountPence: 299,
     });
     vi.mocked(api.createSponsoredCheckout).mockResolvedValue({
@@ -510,7 +510,7 @@ describe("TeamPanel billing request ownership", () => {
       quoteExpiresAtEpoch: 2_000_000_000,
       founding: true,
       foundingRemainingPlaces: 42,
-      foundingTerm: "for the first monthly billing term",
+      foundingTerm: "for the first 12 monthly billing periods",
       nextRenewalAmountPence: 299,
     });
     vi.mocked(api.createSponsoredCheckout).mockRejectedValueOnce(new Error("server error (409)"));
@@ -544,7 +544,7 @@ describe("TeamPanel billing request ownership", () => {
       quoteExpiresAtEpoch: 2_000_000_000,
       founding: true,
       foundingRemainingPlaces: 42,
-      foundingTerm: "for the first monthly billing term",
+      foundingTerm: "for the first 12 monthly billing periods",
       nextRenewalAmountPence: 299,
     });
     vi.mocked(api.createSponsoredCheckout)

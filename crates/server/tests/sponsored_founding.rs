@@ -355,7 +355,7 @@ async fn verified_sponsored_invoice_awards_founder_before_activating_the_seat() 
                 "subscription_item": provider_item_id,
                 "price": { "id": "price_founding_monthly" },
                 "quantity": 2,
-                "period": { "end": period_end },
+                "period": { "start": now - 60, "end": period_end },
                 "parent": { "type": "subscription_item_details" }
             }]},
             "parent": { "type": "subscription_details", "subscription_details": { "subscription": subscription_id } }
@@ -761,6 +761,11 @@ async fn verified_sponsored_invoice_awards_founder_before_activating_the_seat() 
         .execute(&pool)
         .await
         .expect("clean terminal founding reservation");
+    sqlx::query("DELETE FROM billing_founding_schedule_jobs WHERE beneficiary_id = $1")
+        .bind(&beneficiary_id)
+        .execute(&pool)
+        .await
+        .expect("clean founding schedule job");
     sqlx::query("DELETE FROM billing_founding_awards WHERE beneficiary_id = $1")
         .bind(&beneficiary_id)
         .execute(&pool)

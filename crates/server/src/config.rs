@@ -64,6 +64,8 @@ const PROVIDER_REFRESH_RECONCILIATION_ENV: &str = "SOTTO_PROVIDER_REFRESH_RECONC
 const CLOUD_ACTION_ENFORCEMENT_ENV: &str = "SOTTO_CLOUD_ACTION_ENFORCEMENT";
 const MACHINE_ELIGIBILITY_ENFORCEMENT_ENV: &str = "SOTTO_MACHINE_ELIGIBILITY_ENFORCEMENT";
 const CLOUD_SALES_ENV: &str = "SOTTO_CLOUD_SALES_ENABLED";
+const FOUNDING_SCHEDULE_WORKER_ENV: &str = "SOTTO_FOUNDING_SCHEDULE_WORKER_ENABLED";
+const FOUNDING_SCHEDULE_PREFLIGHT_ENV: &str = "SOTTO_FOUNDING_SCHEDULE_PREFLIGHT_VERIFIED";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -102,6 +104,8 @@ pub struct Config {
     /// Whether new hosted subscriptions may be quoted or purchased. Existing billing management
     /// and verified webhooks stay available when this is off.
     pub cloud_sales_enabled: bool,
+    /// Whether verified founding awards may be scheduled to transition to standard Stripe prices.
+    pub founding_schedule_worker_enabled: bool,
 }
 
 /// Anonymous version-ping telemetry settings (see [`crate::telemetry`]).
@@ -186,6 +190,13 @@ impl Config {
         let deployment_mode = DeploymentMode::from_env_result(std::env::var(DeploymentMode::ENV))?;
         let cloud_sales_enabled =
             feature_flag_is_enabled(std::env::var(CLOUD_SALES_ENV).ok().as_deref());
+        let founding_schedule_worker_enabled =
+            feature_flag_is_enabled(std::env::var(FOUNDING_SCHEDULE_WORKER_ENV).ok().as_deref());
+        let founding_schedule_preflight_verified = feature_flag_is_enabled(
+            std::env::var(FOUNDING_SCHEDULE_PREFLIGHT_ENV)
+                .ok()
+                .as_deref(),
+        );
         let stripe_variables_present = [
             "STRIPE_API_KEY",
             "STRIPE_WEBHOOK_SECRET",
@@ -243,6 +254,11 @@ impl Config {
             None
         };
         let stripe_account_id = env_nonempty("STRIPE_ACCOUNT_ID");
+        validate_founding_schedule_worker_configuration(
+            founding_schedule_worker_enabled,
+            founding_schedule_preflight_verified,
+            billing.as_ref(),
+        )?;
         if hosted_catalogue_configured && billing.is_none() {
             // The hosted catalogue is dormant until the hosted billing route lands. Keep one
             // complete Stripe configuration boundary for now so legacy billing cannot silently
@@ -318,8 +334,32 @@ impl Config {
             cloud_action_enforcement_enabled,
             machine_eligibility_enforcement_enabled,
             cloud_sales_enabled,
+            founding_schedule_worker_enabled,
         })
     }
+}
+
+fn validate_founding_schedule_worker_configuration(
+    enabled: bool,
+    preflight_verified: bool,
+    billing: Option<&BillingConfig>,
+) -> Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+    if !preflight_verified {
+        return Err(Error::Config(
+            "founding schedule worker requires SOTTO_FOUNDING_SCHEDULE_PREFLIGHT_VERIFIED=1 after Stripe test-mode schedule and interval-policy verification".into(),
+        ));
+    }
+    let billing = billing
+        .ok_or_else(|| Error::Config("founding schedule worker requires Stripe billing".into()))?;
+    if billing.price_catalogue.is_none() {
+        return Err(Error::Config(
+            "founding schedule worker requires all four hosted Stripe prices".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_provider_refresh_configuration(
@@ -531,7 +571,8 @@ mod tests {
         organisation_deletion_retention_from_env_result, organisation_deletion_worker_is_enabled,
         parse_organisation_deletion_retention_days, telemetry_ping_enabled,
         validate_cloud_sales_configuration, validate_deployment_billing_boundary,
-        validate_provider_refresh_configuration, BillingConfig, BillingPriceIds, DeploymentMode,
+        validate_founding_schedule_worker_configuration, validate_provider_refresh_configuration,
+        BillingConfig, BillingPriceIds, DeploymentMode,
         DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS, MAX_ORGANISATION_DELETION_RETENTION_DAYS,
     };
 
@@ -648,6 +689,38 @@ mod tests {
         );
         assert!(
             validate_cloud_sales_configuration(true, DeploymentMode::Cloud, true, true,).is_ok()
+        );
+    }
+
+    #[test]
+    fn founding_schedule_worker_is_opt_in_and_requires_the_hosted_catalogue() {
+        assert!(validate_founding_schedule_worker_configuration(false, false, None).is_ok());
+        assert!(validate_founding_schedule_worker_configuration(true, false, None).is_err());
+        let billing = BillingConfig {
+            api_key: "rk_test_secret".into(),
+            webhook_secret: "whsec_test".into(),
+            price_id: "price_legacy".into(),
+            price_catalogue: None,
+            cloud_sales_enabled: false,
+            return_url: "https://app.example.test".into(),
+        };
+        assert!(
+            validate_founding_schedule_worker_configuration(true, true, Some(&billing)).is_err()
+        );
+        let complete = BillingConfig {
+            price_catalogue: Some(BillingPriceIds {
+                standard_monthly: "price_standard_month".into(),
+                standard_annual: "price_standard_year".into(),
+                founding_monthly: "price_founding_month".into(),
+                founding_annual: "price_founding_year".into(),
+            }),
+            ..billing
+        };
+        assert!(
+            validate_founding_schedule_worker_configuration(true, false, Some(&complete)).is_err()
+        );
+        assert!(
+            validate_founding_schedule_worker_configuration(true, true, Some(&complete)).is_ok()
         );
     }
 
