@@ -60,6 +60,7 @@ fn app(pool: PgPool) -> Router {
                 founding_monthly: "price_founding_monthly".into(),
                 founding_annual: "price_founding_annual".into(),
             }),
+            cloud_portal_configuration_id: Some("bpc_test".into()),
             cloud_sales_enabled: true,
             return_url: "https://app.sotto.test".into(),
         })),

@@ -84,6 +84,7 @@ fn app(pool: PgPool, configured: bool) -> Router {
                 webhook_secret: WEBHOOK_SECRET.into(),
                 price_id: "price_test".into(),
                 price_catalogue: None,
+                cloud_portal_configuration_id: Some("bpc_test".into()),
                 cloud_sales_enabled: true,
                 return_url: "https://app.sotto.test".into(),
             })
@@ -208,7 +209,12 @@ impl SubscriptionProvider for TestProvider {
         Ok("https://stripe.test/checkout".into())
     }
 
-    async fn create_portal(&self, _customer: &str, _return_url: &str) -> ProviderResult<String> {
+    async fn create_portal(
+        &self,
+        _customer: &str,
+        _return_url: &str,
+        _configuration_id: Option<&str>,
+    ) -> ProviderResult<String> {
         Ok("https://stripe.test/portal".into())
     }
 
