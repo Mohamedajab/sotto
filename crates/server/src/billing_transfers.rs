@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::billing_catalogue::BillingOffer;
 use crate::error::Error;
 use crate::founding_allocator;
+use crate::founding_schedule;
 use crate::org;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -714,7 +715,12 @@ pub async fn complete_source_adjustment(
         {
             return Err(TransferError::FoundingPayerConflict);
         }
-        founding_allocator::transfer_payer_with_kind(
+        let destination_subscription_id = transfer
+            .destination_provider_subscription_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(TransferError::CorruptState)?;
+        let award = founding_allocator::transfer_payer_with_kind(
             tx,
             award_id,
             source_kind,
@@ -723,6 +729,7 @@ pub async fn complete_source_adjustment(
             destination_payer,
         )
         .await?;
+        founding_schedule::enqueue(tx, &award, destination_subscription_id).await?;
     }
     sqlx::query(
         "UPDATE billing_transfer_intents SET state = 'completed', \

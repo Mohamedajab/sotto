@@ -2,6 +2,14 @@
 
 *Deutsche Übersetzung der [README.md](README.md). Der englische Originaltext ist die maßgebliche Version und gilt bei Abweichungen.*
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="web/public/mark-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="web/public/mark-light.svg">
+    <img src="web/public/mark-dark.svg" alt="Sotto" width="64" height="64">
+  </picture>
+</p>
+
 # Sotto
 
 Ende-zu-Ende-verschlüsselte Secret-Synchronisierung für Entwicklerteams. Schluss mit `.env` per Slack.
@@ -24,7 +32,7 @@ Maschinen-Token für CI und Kontowiederherstellung bei Schlüsselverlust.
 | Komponente | Jetzt verfügbar |
 | --- | --- |
 | Krypto-Kern | KDF, XChaCha20-Poly1305 AEAD + AAD, Key-Wrapping, X25519-Sealed-Box-Grants, die Tresor-Hierarchie der Umgebungen, Rewrap von Datenschlüsseln (Rotation), Share-Link-Krypto und Schlüsselkodierung, mit gemeinsamen Referenzvektoren für native und WASM-Builds |
-| CLI | `init`, lokale Secret-Verwaltung, Injektion per `run`, Synchronisierung mit `login`/`push`/`pull`, `setup` für neue Geräte, `share`; Teams: `org create/ls/invite/members/remove`, `grant`, `clone`, `rotate`, Maschinen-`token create/ls/revoke` (mit `SOTTO_TOKEN`-Modus für CI), `reset` bei verlorenem Notfall-Kit |
+| CLI | `init`, lokale Secret-Verwaltung, Injektion per `run`, Synchronisierung mit `login`/`push`/`pull`, `setup` für neue Geräte, `share`; Teams: `org create/ls/invite/members/remove/plan`, `grant`, `clone`, `rotate`, Maschinen-`token create/ls/revoke` (mit `SOTTO_TOKEN`-Modus für CI), `reset` bei verlorenem Notfall-Kit |
 | Server | OAuth-Anmeldung + Sitzungen, Konto- und Snapshot-Synchronisierung (versionierte Schreibvorgänge, ETag), Organisationen + Mitgliedschaften + Rollen, Tresorschlüssel-Grants pro Mitglied, transaktionale Schlüsselrotation, Maschinen-Token, Konto-Zurücksetzung und Share-Links - nur Chiffrat |
 | Web | Anmeldung (Cookie-Sitzung), Entsperren im Browser + Tresorentschlüsselung mit dem eigenen Grant, Erstellen und Empfangen von Einmal-Links und ein Team-Panel: Organisationen, Mitglieder, Einladung per E-Mail, Teilen einer Umgebung mit einem Mitglied |
 
@@ -110,12 +118,23 @@ sotto export --format dotenv --reveal   # print a .env; refuses a terminal witho
 sotto run -- npm start       # inject the environment's secrets into any command
 sotto login && sotto push    # optional: sync ciphertext via the hosted instance (getsotto.co.uk)
 sotto get DATABASE_URL -c    # copy a secret without printing it; clipboard clears after 45s when unchanged
-sotto share DATABASE_URL     # one-time link; copied automatically in an interactive terminal
-sotto share DATABASE_URL --views 3
-sotto share DATABASE_URL --expire 3600   # lifetime in seconds
+sotto share DATABASE_URL     # choose view and lifetime limits in an interactive terminal
+sotto share DATABASE_URL --views 3 --expire 3600   # skip both limit prompts
 ```
 
-Standardmäßig erlaubt eine Freigabe einen Aufruf und hat kein Ablaufdatum; der Link verfällt nach dem letzten Aufruf.
+In einem interaktiven Terminal öffnet jede ausgelassene Freigabegrenze ein eigenes Menü. Das
+Aufrufmenü bietet 1, 2, 3, 5 oder 10 Aufrufe sowie einen benutzerdefinierten Wert; das
+Gültigkeitsmenü bietet kein Ablaufdatum, 1 Stunde, 1 Tag, 7 Tage, 30 Tage oder eine
+benutzerdefinierte Anzahl von Sekunden. Benutzerdefinierte Werte müssen 1 bis 100 Aufrufe oder 1
+bis 2592000 Sekunden umfassen. Die Angabe von `DATABASE_URL` überspringt nur die Secret-Auswahl:
+`--views` überspringt das Aufrufmenü und `--expire` unabhängig davon das Gültigkeitsmenü. Drücke
+Esc oder Strg-C in einem Auswahlmenü, um abzubrechen, ohne eine Freigabe zu erstellen.
+
+Die nicht interaktive Verwendung erfordert einen ausdrücklichen Secret-Namen. Wird eine Grenze
+ausgelassen, gilt deren Standardwert: ein Aufruf und kein Ablaufdatum. Um alle drei Auswahlmenüs
+in einem interaktiven Terminal zu überspringen, gib den Namen und beide Grenzen an, zum Beispiel
+`sotto share DATABASE_URL --views 3 --expire 3600`. Aufforderungen zum Entsperren und zur Eingabe
+einer Passphrase können weiterhin erscheinen.
 
 Zum interaktiven Durchsuchen der Secrets siehe die [Dashboard-Anleitung](#interaktives-dashboard).
 
@@ -142,6 +161,7 @@ lässt aber Schlüssel unverändert, die nur in der Zielumgebung vorhanden sind.
 
 Der Export schreibt Klartext und benötigt daher in einem Terminal `--reveal`, genau wie `sotto get`.
 Verwende `sotto share --no-copy`, um das interaktive Kopieren zu deaktivieren, oder `--copy`, um es ausdrücklich anzufordern.
+Diese Optionen steuern nur die Zwischenablage; `--no-copy` überspringt die Freigabegrenzen-Menüs nicht.
 Das Löschen der Zwischenablage erfolgt nach bestem Bemühen: Das Ersetzen des Inhalts schützt den neuen Wert,
 während Zwischenablage-Manager, Ruhezustand oder ein beendeter Hilfsprozess eine Kopie behalten können.
 
@@ -156,14 +176,110 @@ Arbeit im Team:
 sotto org create acme                      # prints the org id
 sotto init --org <org-id>                  # an org-owned project
 sotto org invite <org-id> dev@example.com  # invite an existing Sotto user
+sotto org plan <org-id>                    # tier, trial, and limits for this organisation
 sotto grant <user-id>                      # share the active environment (they run `sotto clone`)
 sotto token create --name ci               # SOTTO_TOKEN: run/export in CI, no password needed
 ```
 
-Maschinen-Tokens laufen ab. Ein neues Token gilt 90 Tage, sofern du nicht `--expires-in-days` mit
-einem Wert von 1 bis 365 angibst, und `sotto token ls` zeigt, wann jedes endet. Zwei Wochen vorher
-geben `sotto run` und `sotto export` eine Warnung im CI-Log aus. Um ein Token zu ersetzen, erstelle
-ein neues, aktualisiere das CI-Secret und widerrufe dann das alte mit `sotto token revoke`.
+`sotto org plan <org-id>` liest die aktuelle Berechtigungsansicht des konfigurierten Servers für
+diese Organisation. Du musst angemeldet sein (`sotto login`); der lokale Tresor muss nicht
+entsperrt sein. Es zeigt die zugewiesene Stufe, die wirksame Stufe (deren Limits jetzt gelten), ein
+optionales Trial-Ende sowie entweder Mitglieder- und Organisationsprojekt-Limits oder
+`limits: none (Team)`.
+
+Illustrative Free-Ausgabe:
+
+```text
+tier:      free
+effective: free
+limits:    3 members, 1 org project(s)
+```
+
+Illustrative Team-Ausgabe:
+
+```text
+tier:      team
+effective: team
+limits:    none (Team)
+```
+
+Diese Beispiele sind illustrativ; echte Organisationen können andere Stufen, Trials und Limits
+zeigen.
+
+Maschinen-Tokens laufen ab. Ein neues Token gilt 90 Tage, sofern du nicht `--expires-in-days`
+mit einem Wert von 1 bis 365 angibst; `sotto token ls` zeigt, wann jedes abläuft. Zwei Wochen
+vorher geben `sotto run` und `sotto export` eine Warnung im CI-Log aus.
+
+Token-Befehle verwenden den Zugriff des angemeldeten Benutzers und die ausgewählte Umgebung. In
+einer Organisationsumgebung dürfen nur Admins oder Eigentümer Maschinen-Token verwalten. Die
+Liste enthält nur Metadaten aktiver Token: widerrufene und abgelaufene Token werden ausgelassen,
+und das einmal bei `sotto token create` ausgegebene Zugangstoken lässt sich über die Liste nicht
+wiederherstellen. Das JSON enthält `token_id`, `name`, `created_by`, `beneficiary_id`,
+`beneficiary_status`, `expires_at` und `expires_in_days`; Ablauf-Felder können null sein.
+Die `token_id` ist die ID für den Widerruf, nicht der Token-Name oder das `SOTTO_TOKEN`-Secret.
+
+Mit diesen Befehlen kannst du Token anzeigen, ersetzen und widerrufen. Die Umgebungs-Auswahl
+gilt nur für diesen Befehl:
+
+```sh
+sotto token ls
+sotto token ls --json
+sotto --env staging token ls --json
+sotto token create --name ci
+sotto token revoke <token-id>
+```
+
+Um ein CI-Token zu ersetzen, ermittle zuerst die alte ID in der Liste, erstelle ein Ersatz-Token,
+aktualisiere das CI-Secret und prüfe, ob die CI es verwendet, und widerrufe dann die alte ID mit
+`sotto token revoke <token-id>`. Der Widerruf verhindert sofort, dass sich dieses Token bei
+der API authentifiziert, rotiert aber nicht den Umgebungsschlüssel. Für eine
+Organisationsumgebung beachte bei Bedarf die vorhandenen Hinweise zu `sotto rotate`. Weder
+Widerruf noch Rotation können bereits kopierten Klartext löschen.
+
+### Cloud-Status
+
+Um den konfigurierten Server und die Cloud-Berechtigung deines Kontos zu prüfen, melde dich zuerst an:
+
+```sh
+sotto login
+sotto cloud status
+sotto cloud status --json
+```
+
+Der Befehl benötigt eine aktive Anmeldung, entsperrt aber weder den lokalen Tresor noch öffnet er einen Browser. Er zeigt den konfigurierten `server`, die `server_info` des Servers, die `eligibility` des Kontos und nur dann eine `billing_url`, wenn der zurückgegebene Status verfügbare Abrechnung meldet. Die lesbare Ausgabe zeigt außerdem `actions`, `next_actions` und optionale Werte für `paid_through_epoch`, `recovery_until_epoch` oder `export_until_epoch`. Fehlt `server_info` oder `eligibility`, stellt ein älterer Server diesen Endpoint nicht bereit; daraus folgt nicht, dass der Zugriff erlaubt oder verweigert ist.
+
+Das JSON-Format eignet sich für Skripte. Die Struktur auf oberster Ebene sieht so aus:
+
+```json
+{
+  "server": "https://getsotto.co.uk",
+  "billing_url": "https://getsotto.co.uk/cloud",
+  "server_info": {
+    "deployment_mode": "cloud",
+    "entitlement_model": "person"
+  },
+  "eligibility": {
+    "model": "person_eligibility_v1",
+    "state": "paid",
+    "deployment_mode": "cloud",
+    "account_initialized": true,
+    "billing_available": true,
+    "paid_through_epoch": 1798761600,
+    "recovery_until_epoch": null,
+    "export_until_epoch": null,
+    "actions": {
+      "setup": false,
+      "billing": false,
+      "export": false,
+      "revoke": true
+    },
+    "next_actions": ["revoke"],
+    "payer": "personal"
+  }
+}
+```
+
+Das Beispiel ist synthetisch; `actions` und die optionalen Zeitwerte stammen aus dem zurückgegebenen Kontostatus, und ältere Server können für einen der beiden Endpoints null liefern. `sotto cloud status` meldet nur den Status und kann eine Abrechnungs-URL ausgeben. Der Befehl startet keinen Kauf und ändert die Berechtigung nicht. Für Diagnosen des lokalen Tresors und der Umgebungen verwende `sotto status`; diese Ansicht ist von den Server- und Kontoinformationen oben getrennt.
 
 ### Interaktives Dashboard
 
@@ -192,6 +308,36 @@ Drücke `t`, um Themes mit einer Live-Vorschau durchzugehen. Mit den Pfeiltasten
 Theme. Drücke `Enter`, um deine Wahl zu speichern, oder `Esc`, um abzubrechen. Die
 [Vorrangregeln für Themes](#ausgabe-themes) erklären, wie Befehlsoptionen und Umgebungsvariablen
 die gespeicherte Einstellung beeinflussen.
+
+### Lokalen Status prüfen
+
+Mit `sotto status` siehst du, ob eine lokale Identität vorhanden ist, ob die Sitzung entsperrt ist
+und welches Projekt mit welcher Umgebung das aktuelle Verzeichnis auswählt. Der Befehl liest den
+lokalen Zustand. Er prüft weder die Serververbindung noch, ob alle gespeicherten Secrets entschlüsselbar sind.
+
+```sh
+sotto status
+sotto status --json
+```
+
+Verwende `sotto status --json` in Skripten. `initialized` zeigt an, ob eine lokale Identität vorhanden ist,
+und `unlocked`, ob ein Hauptschlüssel zwischengespeichert ist. `project` enthält `name` und `environment`
+aus der nächsten `sotto.toml` oder ist außerhalb eines konfigurierten Projekts `null`. Ein erfolgreicher
+Befehl kann `unlocked: false` melden. Skripte, die eine entsperrte Sitzung benötigen, müssen dieses Feld prüfen.
+
+Diese JSON-Beispiele dienen nur zur Veranschaulichung. Mit einer `sotto.toml`, aber ohne lokale Identität:
+
+```json
+{"initialized":false,"project":{"environment":"dev","name":"demo"},"unlocked":false}
+```
+
+Ohne `sotto.toml` und ohne lokale Identität:
+
+```json
+{"initialized":false,"project":null,"unlocked":false}
+```
+
+Fehlt `sotto.toml`, ist kein Projekt ausgewählt. Eine fehlerhafte oder unlesbare Datei führt zu einem Fehler.
 
 ### Ausgabe-Themes
 
