@@ -7,9 +7,11 @@ use uuid::Uuid;
 
 use sotto_server::billing_catalogue::BillingOffer;
 use sotto_server::billing_transfers::{
-    accept_transfer, begin_source_adjustment, begin_transfer, complete_source_adjustment,
-    lock_and_check_no_live_transfer, mark_failed, record_destination_paid,
-    record_destination_prepared, withdraw_transfer, BeginTransfer, TransferError, TransferPayer,
+    accept_transfer, begin_source_adjustment, begin_transfer, claim_transfer_for_execution,
+    claim_transfer_for_manual_recovery, complete_source_adjustment, complete_source_restoration,
+    finish_execution_lease, lock_and_check_no_live_transfer, mark_failed, record_destination_paid,
+    record_destination_prepared, release_execution_lease, request_source_restoration,
+    withdraw_transfer, BeginTransfer, TransferError, TransferExecutionFailure, TransferPayer,
     TransferRequest, TransferState,
 };
 use sotto_server::db;
@@ -104,12 +106,18 @@ fn personal_to_sponsor_request(
     org: &str,
     key: &str,
 ) -> TransferRequest {
+    let fixture = actor
+        .strip_prefix("transfer-test-")
+        .and_then(|value| value.strip_suffix("-user"));
     TransferRequest {
         actor_user_id: actor.into(),
         counterparty_user_id: actor.into(),
         beneficiary_id: beneficiary.into(),
         source_kind: TransferPayer::Personal,
         source_organization_id: None,
+        source_provider_subscription_id: fixture
+            .map(|fixture| format!("sub_transfer_source_{fixture}"))
+            .unwrap_or_else(|| "sub_transfer_source".into()),
         destination_kind: TransferPayer::Sponsor,
         destination_organization_id: Some(org.into()),
         offer: BillingOffer::FoundingMonthly,
@@ -249,6 +257,102 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
     };
     tx.commit().await.expect("commit transfer");
 
+    let lease = claim_transfer_for_execution(&pool, &transfer.transfer_id)
+        .await
+        .expect("claim accepted transfer")
+        .expect("accepted transfer is due");
+    assert_eq!(lease.transfer.transfer_id, transfer.transfer_id);
+    assert_eq!(lease.transfer.execution_attempt_count, 1);
+    assert!(claim_transfer_for_execution(&pool, &transfer.transfer_id)
+        .await
+        .expect("live lease prevents a second claim")
+        .is_none());
+    assert!(release_execution_lease(
+        &pool,
+        &transfer.transfer_id,
+        &lease.lease_token,
+        TransferExecutionFailure::RetryableProvider,
+    )
+    .await
+    .expect("release retryable lease"));
+    assert!(claim_transfer_for_execution(&pool, &transfer.transfer_id)
+        .await
+        .expect("backoff prevents an early retry")
+        .is_none());
+    sqlx::query(
+        "UPDATE billing_transfer_intents SET execution_next_attempt_at = now() - interval '1 second' \
+         WHERE transfer_id = $1",
+    )
+    .bind(&transfer.transfer_id)
+    .execute(&pool)
+    .await
+    .expect("make retry due using the database clock");
+    let retry = claim_transfer_for_execution(&pool, &transfer.transfer_id)
+        .await
+        .expect("claim after retry delay")
+        .expect("transfer becomes due after its delay");
+    assert_ne!(lease.lease_token, retry.lease_token);
+    assert_eq!(retry.transfer.execution_attempt_count, 2);
+    assert_eq!(
+        retry.transfer.provider_idempotency_key, transfer.provider_idempotency_key,
+        "a retry keeps the same provider operation identity"
+    );
+    sqlx::query(
+        "UPDATE billing_transfer_intents SET execution_lease_until = now() - interval '1 second' \
+         WHERE transfer_id = $1",
+    )
+    .bind(&transfer.transfer_id)
+    .execute(&pool)
+    .await
+    .expect("expire the worker lease using the database clock");
+    let reclaimed = claim_transfer_for_execution(&pool, &transfer.transfer_id)
+        .await
+        .expect("expired lease is reclaimable")
+        .expect("the transfer can be recovered");
+    assert_ne!(retry.lease_token, reclaimed.lease_token);
+    assert!(
+        !finish_execution_lease(&pool, &transfer.transfer_id, &retry.lease_token)
+            .await
+            .expect("stale worker cannot clear the new lease")
+    );
+    assert!(
+        finish_execution_lease(&pool, &transfer.transfer_id, &reclaimed.lease_token)
+            .await
+            .expect("current worker clears its own lease")
+    );
+
+    let rejected_attempt = claim_transfer_for_execution(&pool, &transfer.transfer_id)
+        .await
+        .expect("claim provider step")
+        .expect("transfer remains due after lease completion");
+    release_execution_lease(
+        &pool,
+        &transfer.transfer_id,
+        &rejected_attempt.lease_token,
+        TransferExecutionFailure::ProviderRejected,
+    )
+    .await
+    .expect("park a definitively rejected provider step for review");
+    assert!(claim_transfer_for_execution(&pool, &transfer.transfer_id)
+        .await
+        .expect("manual review blocks automatic polling")
+        .is_none());
+    let manual_retry = claim_transfer_for_manual_recovery(&pool, &transfer.transfer_id)
+        .await
+        .expect("explicit reconciliation can claim manual review")
+        .expect("manual recovery is due on demand");
+    finish_execution_lease(&pool, &transfer.transfer_id, &manual_retry.lease_token)
+        .await
+        .expect("manual recovery clears the review marker after success");
+    sqlx::query(
+        "UPDATE billing_transfer_intents SET state = 'pending', result_code = NULL, \
+         execution_next_attempt_at = now() WHERE transfer_id = $1",
+    )
+    .bind(&transfer.transfer_id)
+    .execute(&pool)
+    .await
+    .expect("restore pending fixture for transition coverage");
+
     let sponsored_request = SponsoredSeatRequest {
         action: SponsoredSeatAction::Add,
         beneficiary_id: user.clone(),
@@ -373,15 +477,40 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
     )
     .await
     .expect("record destination preparation");
-    record_destination_paid(&mut tx, &transfer.transfer_id, "pi_destination")
-        .await
-        .expect("record destination payment");
     begin_source_adjustment(&mut tx, &transfer.transfer_id, "source-operation")
         .await
         .expect("begin source adjustment");
     complete_source_adjustment(&mut tx, &transfer.transfer_id, "credit_source")
         .await
-        .expect("complete source adjustment");
+        .expect("record verified source schedule while destination invoice is pending");
+    let awaiting_invoice: String =
+        sqlx::query_scalar("SELECT state FROM billing_transfer_intents WHERE transfer_id = $1")
+            .bind(&transfer.transfer_id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("read pending transfer state");
+    assert_eq!(
+        awaiting_invoice,
+        TransferState::SourceAdjustmentPending.as_str()
+    );
+    let payer_before_invoice: (String, String) = sqlx::query_as(
+        "SELECT payer_kind, payer_id FROM billing_founding_awards WHERE award_id = $1",
+    )
+    .bind(&award)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("founding payer stays unchanged before paid invoice");
+    assert_eq!(payer_before_invoice, ("personal".into(), user.clone()));
+    record_destination_paid(&mut tx, &transfer.transfer_id, "pi_destination")
+        .await
+        .expect("record destination payment after source scheduling");
+    assert!(matches!(
+        record_destination_paid(&mut tx, &transfer.transfer_id, "pi_conflicting").await,
+        Err(TransferError::ResultConflict)
+    ));
+    complete_source_adjustment(&mut tx, &transfer.transfer_id, "credit_source")
+        .await
+        .expect("complete local handover after both provider facts are verified");
     tx.commit().await.expect("commit transfer completion");
 
     let state: String =
@@ -567,6 +696,118 @@ async fn concurrent_live_transfer_is_rejected_and_personal_actor_is_required() {
 }
 
 #[tokio::test]
+async fn source_restoration_keeps_beneficiary_fenced_until_provider_confirmation() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let fixture = Uuid::new_v4().to_string();
+    let user = format!("transfer-test-{fixture}-user");
+    let org = format!("transfer-test-{fixture}-org");
+    let transfer_id = format!("transfer:test-{fixture}");
+    cleanup(&pool, &fixture).await;
+
+    sqlx::query(
+        "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, 'transfer-test', $1)",
+    )
+    .bind(&user)
+    .execute(&pool)
+    .await
+    .expect("insert beneficiary");
+    sqlx::query(
+        "INSERT INTO organizations (id, enc_name, created_by) VALUES ($1, decode('6f7267', 'hex'), $2)",
+    )
+    .bind(&org)
+    .bind(&user)
+    .execute(&pool)
+    .await
+    .expect("insert destination organisation");
+    sqlx::query(
+        "INSERT INTO billing_transfer_intents \
+         (transfer_id, actor_user_id, counterparty_user_id, beneficiary_id, source_kind, \
+          destination_kind, destination_organization_id, offer, quote_version, \
+          quote_expires_at_epoch, effective_from, idempotency_key, request_hash, \
+          provider_idempotency_key, source_provider_subscription_id, \
+          destination_provider_subscription_id, destination_operation_id, source_operation_id, \
+          source_adjustment_reference, state) \
+         VALUES ($1, $2, $2, $2, 'personal', 'sponsor', $3, 'standard_monthly', 1, \
+                 2000000000, 2000000100, $1, $1, $1, 'sub_source', 'sub_destination', \
+                 'op_destination', 'op_source', 'schedule_source', 'source_adjustment_pending')",
+    )
+    .bind(&transfer_id)
+    .bind(&user)
+    .bind(&org)
+    .execute(&pool)
+    .await
+    .expect("insert transfer after source schedule adjustment");
+
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin source restoration request");
+    let restoration =
+        request_source_restoration(&mut tx, &transfer_id, "destination_initial_payment_failed")
+            .await
+            .expect("begin compensating source restoration");
+    assert_eq!(restoration.state, TransferState::SourceRestorationPending);
+    assert_eq!(
+        request_source_restoration(&mut tx, &transfer_id, "destination_initial_payment_failed")
+            .await
+            .expect("repeat restoration request is idempotent")
+            .state,
+        TransferState::SourceRestorationPending
+    );
+    tx.commit()
+        .await
+        .expect("persist restoration pending state");
+
+    let mut tx = pool.begin().await.expect("begin fenced billing mutation");
+    assert!(matches!(
+        lock_and_check_no_live_transfer(&mut tx, &[&user], 1_800_000_001).await,
+        Err(TransferError::AlreadyInProgress)
+    ));
+    tx.rollback().await.expect("rollback fenced mutation");
+
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin provider restoration result");
+    let failed = complete_source_restoration(&mut tx, &transfer_id, "schedule_source_restored")
+        .await
+        .expect("record verified source restoration");
+    assert_eq!(failed.state, TransferState::Failed);
+    assert_eq!(
+        failed.result_code.as_deref(),
+        Some("destination_initial_payment_failed")
+    );
+    assert_eq!(
+        failed.source_restoration_reference.as_deref(),
+        Some("schedule_source_restored")
+    );
+    assert!(matches!(
+        complete_source_restoration(&mut tx, &transfer_id, "different_restoration").await,
+        Err(TransferError::ResultConflict)
+    ));
+    assert_eq!(
+        complete_source_restoration(&mut tx, &transfer_id, "schedule_source_restored")
+            .await
+            .expect("repeat restoration confirmation is idempotent")
+            .state,
+        TransferState::Failed
+    );
+    tx.commit().await.expect("persist failed transfer");
+
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin mutation after restoration");
+    lock_and_check_no_live_transfer(&mut tx, &[&user], 1_800_000_001)
+        .await
+        .expect("verified restoration releases the beneficiary fence");
+    tx.rollback().await.expect("finish mutation check");
+    cleanup(&pool, &fixture).await;
+}
+
+#[tokio::test]
 async fn sponsored_admin_and_beneficiary_can_authorise_leaving_a_sponsorship() {
     let Some(pool) = pool_or_skip().await else {
         return;
@@ -659,6 +900,7 @@ async fn sponsored_admin_and_beneficiary_can_authorise_leaving_a_sponsorship() {
         beneficiary_id: beneficiary.clone(),
         source_kind: TransferPayer::Sponsor,
         source_organization_id: Some(org),
+        source_provider_subscription_id: format!("sub_transfer_source_{fixture}"),
         destination_kind: TransferPayer::Personal,
         destination_organization_id: None,
         offer: BillingOffer::StandardMonthly,
