@@ -53,6 +53,8 @@ export function CloudAccountPanel() {
   const [lifecycle, setLifecycle] = useState<PersonalLifecycle | null>(null);
   const [refund, setRefund] = useState<RefundRequest | null>(null);
   const [operation, setOperation] = useState<PersonalOperation | null>(null);
+  const operationRequestInFlight = useRef(false);
+  const [operationLoading, setOperationLoading] = useState(false);
   const [notices, setNotices] = useState<CloudNotice[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -97,8 +99,11 @@ export function CloudAccountPanel() {
   }, [offer, eligibility?.actions.billing, quoteAttempt]);
 
   async function refreshOperation() {
+    if (operationRequestInFlight.current) return;
     const operationId = sessionStorage.getItem("sotto_personal_operation_id");
     if (operationId === null) return;
+    operationRequestInFlight.current = true;
+    setOperationLoading(true);
     try {
       const next = await fetchPersonalOperation(operationId);
       setOperation(next);
@@ -107,6 +112,9 @@ export function CloudAccountPanel() {
       // A stale browser session must not turn into a billing error. Eligibility remains the
       // source of truth when the operation has already been reconciled or expired.
       sessionStorage.removeItem("sotto_personal_operation_id");
+    } finally {
+      operationRequestInFlight.current = false;
+      setOperationLoading(false);
     }
   }
 
@@ -192,7 +200,7 @@ export function CloudAccountPanel() {
         <button className="primary" disabled={busy || quoteLoading} onClick={() => void checkout()}>{busy ? "Opening checkout…" : "Continue to secure checkout"}</button>
       </>}
     </section>}
-    {eligibility.state === "pending_initial_payment" && <section aria-labelledby="pending-heading"><h2 id="pending-heading">Payment confirmation pending</h2><p>Your checkout is waiting for the verified payment webhook. Hosted access stays unchanged until it arrives.</p>{operation?.checkoutUrl !== null && operation?.checkoutUrl !== undefined && <p><a href={operation.checkoutUrl}>Return to checkout</a></p>}<button disabled={busy} onClick={() => void refreshOperation()}>Refresh payment status</button></section>}
+    {eligibility.state === "pending_initial_payment" && <section aria-labelledby="pending-heading"><h2 id="pending-heading">Payment confirmation pending</h2><p>Your checkout is waiting for the verified payment webhook. Hosted access stays unchanged until it arrives.</p>{operation?.checkoutUrl !== null && operation?.checkoutUrl !== undefined && <p><a href={operation.checkoutUrl}>Return to checkout</a></p>}<button disabled={busy || operationLoading} aria-busy={operationLoading} onClick={() => void refreshOperation()}>{operationLoading ? "Refreshing payment status…" : "Refresh payment status"}</button></section>}
     {(eligibility.state === "paid" || eligibility.state === "renewal_recovery") && <section aria-labelledby="manage-heading"><h2 id="manage-heading">Manage billing</h2><button disabled={busy} onClick={() => void portal()}>Open billing portal</button>{" "}{eligibility.actions.revoke && <button disabled={busy} onClick={() => void cancel()}>Cancel at the end of the paid period</button>}<button disabled={busy} onClick={() => void askRefund()}>Request a refund</button>{lifecycle?.cancelAtPeriodEnd && <p className="muted">Cancellation is scheduled; access remains available until {lifecycle.paidThroughDate ?? "the paid period ends"}.</p>}{refund !== null && <p className="muted">Refund request: {refund.state}. The paid term is preserved by default.</p>}</section>}
     {eligibility.actions.export && <section aria-labelledby="export-heading"><h2 id="export-heading">Recover your encrypted account</h2><p>{exportUntil === null ? "Your export window is open." : `Export before ${exportUntil}.`}</p>{eligibility.accountInitialized ? <button disabled={busy} onClick={() => void exportAccount()}>Download encrypted export</button> : <p>Set up your account before exporting.</p>}</section>}
     <p><a href="/app">Back to vault</a></p>

@@ -184,6 +184,7 @@ async fn run() -> Result<()> {
         organisation_deletion_operator_token: config.organisation_deletion_operator_token,
         cloud_action_enforcement_enabled: config.cloud_action_enforcement_enabled,
         machine_eligibility_enforcement_enabled: config.machine_eligibility_enforcement_enabled,
+        billing_transfers_enabled: config.billing_transfers_enabled,
     };
 
     println!("deployment mode: {}", config.deployment_mode.as_str());
@@ -202,6 +203,7 @@ async fn run() -> Result<()> {
         "machine eligibility enforcement: {}",
         config.machine_eligibility_enforcement_enabled
     );
+    println!("billing transfers: {}", config.billing_transfers_enabled);
     println!(
         "founding schedule worker: {}",
         config.founding_schedule_worker_enabled

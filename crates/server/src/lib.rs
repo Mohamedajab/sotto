@@ -28,6 +28,8 @@ pub mod billing_operations;
 #[doc(hidden)]
 pub mod billing_refunds;
 #[doc(hidden)]
+pub mod billing_transfer_api;
+#[doc(hidden)]
 pub mod billing_transfers;
 #[doc(hidden)]
 pub mod cloud_action_policy;
@@ -138,6 +140,11 @@ pub fn app(state: AppState) -> Router {
     } else {
         Router::new()
     };
+    let billing_transfers = if state.billing_transfers_enabled {
+        billing_transfer_api::router()
+    } else {
+        Router::new()
+    };
     Router::new()
         .merge(health::router())
         .merge(auth::router())
@@ -148,6 +155,7 @@ pub fn app(state: AppState) -> Router {
         .merge(person_eligibility::router())
         .merge(org::router())
         .merge(billing::router())
+        .merge(billing_transfers)
         .merge(machine::router())
         .merge(notifications::router())
         .merge(sync::router())

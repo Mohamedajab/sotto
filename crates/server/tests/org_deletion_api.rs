@@ -78,6 +78,7 @@ fn state_with_retention(pool: PgPool, retention_days: i64) -> AppState {
         telemetry_ingest: false,
         cloud_action_enforcement_enabled: false,
         machine_eligibility_enforcement_enabled: false,
+        billing_transfers_enabled: false,
         pool,
         oauth: None,
         oauth_config: None,
