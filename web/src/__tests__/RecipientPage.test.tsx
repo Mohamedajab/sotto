@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -201,6 +201,9 @@ describe("RecipientPage", () => {
     });
 
     const textarea = await revealSecret();
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: "Shared secret" })).toHaveFocus(),
+    );
     const copy = screen.getByRole("button", { name: "Copy secret" });
     copy.focus();
     fireEvent.click(copy);

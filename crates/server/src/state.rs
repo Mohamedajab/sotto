@@ -37,4 +37,6 @@ pub struct AppState {
     pub cloud_action_enforcement_enabled: bool,
     /// Whether hosted machine retrieval and creation apply the accountable beneficiary policy.
     pub machine_eligibility_enforcement_enabled: bool,
+    /// Whether consented payer-transfer API routes are registered.
+    pub billing_transfers_enabled: bool,
 }

@@ -44,6 +44,7 @@ fn app(pool: PgPool, identity: Identity) -> Router {
         telemetry_ingest: false,
         cloud_action_enforcement_enabled: false,
         machine_eligibility_enforcement_enabled: false,
+        billing_transfers_enabled: false,
         pool,
         oauth: Some(Arc::new(MockOAuth { identity }) as Arc<dyn OAuthProvider>),
         oauth_config: Some(OAuthConfig {

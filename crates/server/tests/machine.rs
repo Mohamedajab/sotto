@@ -44,6 +44,7 @@ fn app_with_policy(
         telemetry_ingest: false,
         cloud_action_enforcement_enabled: false,
         machine_eligibility_enforcement_enabled,
+        billing_transfers_enabled: false,
         pool,
         oauth: None,
         oauth_config: None,
