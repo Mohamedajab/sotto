@@ -54,6 +54,75 @@ pub struct StripeReadLimits {
     pub max_retry_after: Duration,
 }
 
+/// A minimal account event identity returned by Stripe's Events API list endpoint.
+///
+/// The list response is only a discovery hint. Call `event_payload` to retrieve the complete
+/// event through the same authenticated session before applying any business transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StripeEventSummary {
+    pub id: String,
+    pub created: i64,
+    pub event_type: String,
+}
+
+/// One resumable page of Stripe event identities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StripeEventPage {
+    pub events: Vec<StripeEventSummary>,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+}
+
+/// An event fetched through a client that first verified the configured Stripe account.
+///
+/// Its fields are private so API-read provenance cannot be fabricated by a caller or confused
+/// with a signed webhook. The payload still needs semantic/API-version validation before use.
+#[derive(Debug, Clone, PartialEq)]
+#[doc(hidden)]
+pub struct AuthenticatedStripeEvent {
+    event_id: String,
+    account_id: String,
+    environment: ProviderEnvironment,
+    payload: Value,
+}
+
+impl AuthenticatedStripeEvent {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        event_id: &str,
+        account_id: &str,
+        environment: ProviderEnvironment,
+        payload: Value,
+    ) -> Self {
+        Self {
+            event_id: event_id.into(),
+            account_id: account_id.into(),
+            environment,
+            payload,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn event_id(&self) -> &str {
+        &self.event_id
+    }
+
+    #[doc(hidden)]
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    #[doc(hidden)]
+    pub fn environment(&self) -> ProviderEnvironment {
+        self.environment
+    }
+
+    #[doc(hidden)]
+    pub fn payload(&self) -> &Value {
+        &self.payload
+    }
+}
+
 impl Default for StripeReadLimits {
     fn default() -> Self {
         Self {
@@ -380,11 +449,11 @@ impl StripeReadClient {
     /// The repair decoder owns event-shape validation. This method only binds the response to the
     /// requested event identifier and preserves the session's request, byte and deadline bounds.
     #[doc(hidden)]
-    pub async fn event_payload(
+    pub(crate) async fn event_payload(
         &self,
         session: &mut StripeReadSession,
         event_id: &str,
-    ) -> Result<Value, StripeReadError> {
+    ) -> Result<AuthenticatedStripeEvent, StripeReadError> {
         self.ensure_account(session).await?;
         validate_identifier(event_id)?;
         let path = format!("v1/events/{event_id}");
@@ -394,7 +463,150 @@ impl StripeReadClient {
         {
             return Err(StripeReadError::ContextMismatch);
         }
-        Ok(value)
+        validate_mode(
+            value.get("livemode").and_then(Value::as_bool),
+            self.environment,
+        )?;
+        if value
+            .get("account")
+            .is_some_and(|account| !account.is_null())
+            || value
+                .get("context")
+                .is_some_and(|context| !context.is_null())
+            || value
+                .get("created")
+                .and_then(Value::as_i64)
+                .is_none_or(|created| created < 0)
+            || value
+                .get("api_version")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            || !matches!(
+                value.get("type").and_then(Value::as_str),
+                Some("invoice.paid" | "invoice.payment_failed")
+            )
+            || value
+                .get("data")
+                .and_then(Value::as_object)
+                .and_then(|data| data.get("object"))
+                .and_then(Value::as_object)
+                .is_none()
+        {
+            return Err(StripeReadError::MalformedResponse(
+                "event context or identity",
+            ));
+        }
+        Ok(AuthenticatedStripeEvent {
+            event_id: event_id.to_owned(),
+            account_id: self.account_id.clone(),
+            environment: self.environment,
+            payload: value,
+        })
+    }
+
+    /// Read one bounded page of invoice events in a fixed half-open creation-time window.
+    ///
+    /// The caller persists `next_cursor` only after every event on the page has a durable
+    /// disposition. The list endpoint's object payload is intentionally not trusted for billing
+    /// decisions; each summary must be followed by `event_payload`.
+    #[doc(hidden)]
+    pub async fn invoice_events_page(
+        &self,
+        session: &mut StripeReadSession,
+        created_from: i64,
+        created_until: i64,
+        starting_after: Option<&str>,
+        page_size: usize,
+    ) -> Result<StripeEventPage, StripeReadError> {
+        self.ensure_account(session).await?;
+        if created_from < 0 || created_until <= created_from {
+            return Err(StripeReadError::InvalidConfig(
+                "event window must be a nonempty nonnegative interval",
+            ));
+        }
+        if !(1..=100).contains(&page_size) {
+            return Err(StripeReadError::InvalidConfig(
+                "event page size must be between one and one hundred",
+            ));
+        }
+        if let Some(cursor) = starting_after {
+            validate_identifier(cursor)?;
+        }
+        session.add_page(self.limits.max_pages)?;
+        let mut query = vec![
+            ("types[]".to_owned(), "invoice.paid".to_owned()),
+            ("types[]".to_owned(), "invoice.payment_failed".to_owned()),
+            ("created[gte]".to_owned(), created_from.to_string()),
+            ("created[lt]".to_owned(), created_until.to_string()),
+            ("limit".to_owned(), page_size.to_string()),
+        ];
+        if let Some(cursor) = starting_after {
+            query.push(("starting_after".to_owned(), cursor.to_owned()));
+        }
+        let page = self
+            .request_json(session, Method::GET, "v1/events", &query)
+            .await?;
+        if page.get("object").and_then(Value::as_str) != Some("list") {
+            return Err(StripeReadError::MalformedResponse("events.object"));
+        }
+        let has_more = page
+            .get("has_more")
+            .and_then(Value::as_bool)
+            .ok_or(StripeReadError::MalformedResponse("events.has_more"))?;
+        let data = page
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or(StripeReadError::MalformedResponse("events.data"))?;
+        if data.len() > page_size || (has_more && data.is_empty()) {
+            return Err(StripeReadError::InvalidPagination(
+                "event page size or continuation is invalid",
+            ));
+        }
+        session.add_records(data.len(), self.limits.max_records)?;
+        let mut seen = HashSet::new();
+        let mut events = Vec::with_capacity(data.len());
+        for value in data {
+            let id = required_id(value, "events.data.id")?;
+            let created = value
+                .get("created")
+                .and_then(Value::as_i64)
+                .filter(|created| *created >= created_from && *created < created_until)
+                .ok_or(StripeReadError::MalformedResponse("events.data.created"))?;
+            let event_type = value
+                .get("type")
+                .and_then(Value::as_str)
+                .filter(|event_type| {
+                    matches!(*event_type, "invoice.paid" | "invoice.payment_failed")
+                })
+                .ok_or(StripeReadError::MalformedResponse("events.data.type"))?
+                .to_owned();
+            let livemode = value
+                .get("livemode")
+                .and_then(Value::as_bool)
+                .ok_or(StripeReadError::MalformedResponse("events.data.livemode"))?;
+            validate_mode(Some(livemode), self.environment)?;
+            if !seen.insert(id.clone()) {
+                return Err(StripeReadError::InvalidPagination(
+                    "duplicate event id in page",
+                ));
+            }
+            events.push(StripeEventSummary {
+                id,
+                created,
+                event_type,
+            });
+        }
+        let next_cursor = events.last().map(|event| event.id.clone());
+        if has_more && next_cursor.as_deref() == starting_after {
+            return Err(StripeReadError::InvalidPagination(
+                "event cursor did not advance",
+            ));
+        }
+        Ok(StripeEventPage {
+            events,
+            has_more,
+            next_cursor,
+        })
     }
 
     pub async fn subscription_invoices(
@@ -901,8 +1113,18 @@ impl StripeReadClient {
         session: &mut StripeReadSession,
         binding: &StripeAllocationBinding,
     ) -> Result<StripePersonalInvoiceHistoryResult, StripeReadError> {
-        self.subscription(session, binding.subscription_id(), binding.customer_id())
+        let subscription = self
+            .subscription(session, binding.subscription_id(), binding.customer_id())
             .await?;
+        let recovery_currently_eligible =
+            matches!(subscription.status.as_deref(), Some("active" | "past_due"))
+                && subscription.cancel_at_period_end == Some(false)
+                && subscription.cancel_at.is_none()
+                && subscription.cancel_at_present
+                && subscription.canceled_at.is_none()
+                && subscription.canceled_at_present
+                && subscription.ended_at.is_none()
+                && subscription.ended_at_present;
         let invoices = self
             .subscription_invoices(
                 session,
@@ -1039,6 +1261,7 @@ impl StripeReadClient {
                 environment: self.environment,
                 subscription_id: binding.subscription_id().to_owned(),
                 customer_id: binding.customer_id().to_owned(),
+                recovery_currently_eligible,
                 entries,
             },
         ))
@@ -1668,6 +1891,14 @@ pub struct StripeNonPaidInvoice {
 }
 
 impl StripeNonPaidInvoice {
+    #[cfg(test)]
+    pub(crate) fn for_test(invoice_id: &str, status: &str) -> Self {
+        Self {
+            invoice_id: invoice_id.into(),
+            status: status.into(),
+        }
+    }
+
     pub fn invoice_id(&self) -> &str {
         &self.invoice_id
     }
@@ -1691,6 +1922,7 @@ pub struct StripePersonalInvoiceHistory {
     environment: ProviderEnvironment,
     subscription_id: String,
     customer_id: String,
+    recovery_currently_eligible: bool,
     entries: Vec<StripePersonalInvoiceHistoryEntry>,
 }
 
@@ -1715,6 +1947,10 @@ impl StripePersonalInvoiceHistory {
         &self.entries
     }
 
+    pub const fn recovery_currently_eligible(&self) -> bool {
+        self.recovery_currently_eligible
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(
         account_id: &str,
@@ -1723,11 +1959,31 @@ impl StripePersonalInvoiceHistory {
         customer_id: &str,
         entries: Vec<StripePersonalInvoiceHistoryEntry>,
     ) -> Self {
+        Self::for_test_with_recovery(
+            account_id,
+            environment,
+            subscription_id,
+            customer_id,
+            true,
+            entries,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_with_recovery(
+        account_id: &str,
+        environment: ProviderEnvironment,
+        subscription_id: &str,
+        customer_id: &str,
+        recovery_currently_eligible: bool,
+        entries: Vec<StripePersonalInvoiceHistoryEntry>,
+    ) -> Self {
         Self {
             account_id: account_id.into(),
             environment,
             subscription_id: subscription_id.into(),
             customer_id: customer_id.into(),
+            recovery_currently_eligible,
             entries,
         }
     }

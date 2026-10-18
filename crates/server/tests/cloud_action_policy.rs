@@ -46,6 +46,7 @@ fn app(pool: PgPool, deployment_mode: DeploymentMode, enforcement_enabled: bool)
         organisation_deletion_operator_token: None,
         cloud_action_enforcement_enabled: enforcement_enabled,
         machine_eligibility_enforcement_enabled: false,
+        billing_transfers_enabled: false,
     })
 }
 

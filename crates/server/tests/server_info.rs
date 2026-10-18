@@ -11,7 +11,7 @@ use tower::ServiceExt;
 use sotto_server::config::{DeploymentMode, DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS};
 use sotto_server::state::AppState;
 
-fn app(mode: DeploymentMode) -> Router {
+fn app(mode: DeploymentMode, billing_transfers_enabled: bool) -> Router {
     let pool = PgPoolOptions::new()
         .acquire_timeout(Duration::from_millis(50))
         .connect_lazy("postgres://sotto:sotto@127.0.0.1:1/sotto")
@@ -25,6 +25,7 @@ fn app(mode: DeploymentMode) -> Router {
         telemetry_ingest: false,
         cloud_action_enforcement_enabled: false,
         machine_eligibility_enforcement_enabled: false,
+        billing_transfers_enabled,
         organisation_deletion_enabled: false,
         organisation_deletion_retention_days: DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
         organisation_deletion_metrics_token: None,
@@ -38,7 +39,7 @@ async fn reports_mode_without_database_or_credentials() {
         (DeploymentMode::SelfHosted, "self_hosted"),
         (DeploymentMode::Cloud, "cloud"),
     ] {
-        let response = app(mode)
+        let response = app(mode, false)
             .oneshot(
                 Request::builder()
                     .uri("/server/info")
@@ -57,4 +58,34 @@ async fn reports_mode_without_database_or_credentials() {
         assert_eq!(value["entitlement_model"], "organisation_tiers_v1");
         assert_eq!(value.as_object().unwrap().len(), 2);
     }
+}
+
+#[tokio::test]
+async fn payer_transfer_routes_are_not_registered_by_default() {
+    let response = app(DeploymentMode::Cloud, false)
+        .oneshot(
+            Request::builder()
+                .uri("/billing/transfers/quote")
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn enabled_payer_transfer_routes_still_require_a_session() {
+    let response = app(DeploymentMode::Cloud, true)
+        .oneshot(
+            Request::builder()
+                .uri("/billing/transfers")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }

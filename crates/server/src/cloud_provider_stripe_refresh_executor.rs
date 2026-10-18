@@ -161,7 +161,21 @@ impl StripeRefreshExecutor {
                 sources,
             )
             .map_err(|_| "refresh_personal_binding")?;
-            let mut client = StripeHistoryClient::new(self.stripe.clone(), prepared);
+            let mut renewal_failures = Vec::new();
+            for detail in &personal {
+                let failures =
+                    crate::cloud_provider_stripe_renewal_store::load_personal_renewal_failures(
+                        &self.pool,
+                        context,
+                        &detail.allocation,
+                        Default::default(),
+                    )
+                    .await
+                    .map_err(|_| "refresh_personal_renewals")?;
+                renewal_failures.extend(failures);
+            }
+            let mut client = StripeHistoryClient::new(self.stripe.clone(), prepared)
+                .with_renewal_failures(renewal_failures);
             let collection = collect_provider_history(
                 &mut client,
                 context,
@@ -252,7 +266,7 @@ fn refresh_input_matches_stripe(
     personal_coverage: &StripeCoverageConfig,
     sponsored_coverage: &SponsoredStripeCoverageConfig,
 ) -> bool {
-    event_type == "invoice.paid"
+    matches!(event_type, "invoice.paid" | "invoice.payment_failed")
         && context.namespace == crate::cloud_provider_stripe::STRIPE_NAMESPACE
         && context.account_id == personal_coverage.account_id
         && context.account_id == sponsored_coverage.account_id()
