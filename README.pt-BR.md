@@ -204,6 +204,10 @@ mesmo servidor descriptografa no seu navegador, com chaves que nunca saem dos se
 
 Para explorar os segredos interativamente, consulte o [guia do painel](#painel-interativo).
 
+## Fluxos de trabalho com agentes
+
+Agentes de programação locais podem descobrir e executar tarefas declaradas pelo projeto usando o servidor MCP local do Sotto. Consulte o [guia de tarefas para agentes](AGENT-WORKFLOWS.md) para configuração, aprovações e limites de segurança.
+
 ## Usando o Sotto
 
 ### Outro dispositivo

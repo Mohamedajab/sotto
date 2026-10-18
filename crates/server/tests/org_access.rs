@@ -31,6 +31,8 @@ fn app_with_cloud_sales(pool: PgPool, cloud_sales_enabled: bool) -> Router {
         cloud_action_enforcement_enabled: false,
         machine_eligibility_enforcement_enabled: false,
         billing_transfers_enabled: false,
+        billing_transfer_execution_enabled: false,
+        billing_transfer_setup_enabled: false,
         pool,
         oauth: None,
         oauth_config: None,
@@ -49,6 +51,7 @@ fn app_with_cloud_sales(pool: PgPool, cloud_sales_enabled: bool) -> Router {
         organisation_deletion_retention_days: DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
         organisation_deletion_metrics_token: None,
         organisation_deletion_operator_token: None,
+        billing_transfer_operator_token: None,
     };
     sotto_server::app(state)
 }

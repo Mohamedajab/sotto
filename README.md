@@ -201,6 +201,11 @@ decrypts in your browser, with keys that never leave your devices.
 
 To browse secrets interactively, see the [dashboard guide](#interactive-dashboard).
 
+## Agent workflows
+
+Local coding agents can discover and run project-declared tasks through Sotto's local MCP server.
+Read the [agent task guide](AGENT-WORKFLOWS.md) for setup, approval, and the security boundary.
+
 ## Using Sotto
 
 ### Another device

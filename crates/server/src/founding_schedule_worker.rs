@@ -435,6 +435,7 @@ mod tests {
         let snapshot =
             |price: &str, start: i64, end: i64| crate::billing::SponsoredSubscriptionSnapshot {
                 customer_id: Some("cus".into()),
+                default_payment_method_id: None,
                 subscription_id: "sub".into(),
                 status: crate::billing::SubscriptionStatus::Active,
                 cancel_at_period_end: false,

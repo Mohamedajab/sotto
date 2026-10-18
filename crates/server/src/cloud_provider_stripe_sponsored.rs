@@ -406,6 +406,7 @@ pub struct SponsoredInvoiceSettlement {
     currency: String,
     amount_due: i64,
     amount_paid: i64,
+    payment_intent_id: String,
     evidence_reference: String,
     lines: Vec<SponsoredInvoiceLine>,
 }
@@ -421,6 +422,7 @@ impl SponsoredInvoiceSettlement {
         currency: impl Into<String>,
         amount_due: i64,
         amount_paid: i64,
+        payment_intent_id: impl Into<String>,
         evidence_reference: impl Into<String>,
         lines: Vec<SponsoredInvoiceLine>,
     ) -> Result<Self, SponsoredCoverageError> {
@@ -433,6 +435,7 @@ impl SponsoredInvoiceSettlement {
             currency: currency.into(),
             amount_due,
             amount_paid,
+            payment_intent_id: payment_intent_id.into(),
             evidence_reference: evidence_reference.into(),
             lines,
         };
@@ -446,6 +449,10 @@ impl SponsoredInvoiceSettlement {
 
     pub fn evidence_reference(&self) -> &str {
         &self.evidence_reference
+    }
+
+    pub fn payment_intent_id(&self) -> &str {
+        &self.payment_intent_id
     }
 
     pub fn lines(&self) -> &[SponsoredInvoiceLine] {
@@ -466,6 +473,7 @@ impl SponsoredInvoiceSettlement {
             (&self.customer_id, "customer"),
             (&self.subscription_id, "subscription"),
             (&self.currency, "currency"),
+            (&self.payment_intent_id, "payment intent"),
             (&self.evidence_reference, "evidence reference"),
         ] {
             if value.trim().is_empty() {
@@ -943,7 +951,7 @@ mod tests {
 
     fn settlement(lines: Vec<SponsoredInvoiceLine>) -> SponsoredInvoiceSettlement {
         SponsoredInvoiceSettlement::new(
-            "in_1", "cus_1", "sub_1", 100, 200, "gbp", 1_000, 1_000, "evt_1", lines,
+            "in_1", "cus_1", "sub_1", 100, 200, "gbp", 1_000, 1_000, "pi_1", "evt_1", lines,
         )
         .unwrap()
     }

@@ -204,6 +204,10 @@ demselben Server entschlüsselt in deinem Browser, mit Schlüsseln, die deine Ge
 
 Zum interaktiven Durchsuchen der Secrets siehe die [Dashboard-Anleitung](#interaktives-dashboard).
 
+## Agent-Workflows
+
+Lokale Coding-Agenten können projektdefinierte Aufgaben über den lokalen MCP-Server von Sotto finden und ausführen. Die [Anleitung für Agent-Aufgaben](AGENT-WORKFLOWS.md) erklärt Einrichtung, Freigaben und Sicherheitsgrenzen.
+
 ## Sotto verwenden
 
 ### Ein weiteres Gerät

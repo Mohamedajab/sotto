@@ -861,6 +861,7 @@ impl StripeReadClient {
             currency,
             amount_due,
             amount_paid,
+            payment.payment_intent_id().to_owned(),
             format!(
                 "stripe:invoice:{invoice_id}:payment:{}",
                 payment.payment_intent_id()

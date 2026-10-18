@@ -208,6 +208,10 @@ appareils.
 
 Pour parcourir les secrets de façon interactive, consultez le [guide du tableau de bord](#tableau-de-bord-interactif).
 
+## Flux de travail avec des agents
+
+Les agents de programmation locaux peuvent découvrir et exécuter les tâches déclarées par le projet via le serveur MCP local de Sotto. Consultez le [guide des tâches pour agents](AGENT-WORKFLOWS.md) pour la configuration, les approbations et les limites de sécurité.
+
 ## Utiliser Sotto
 
 ### Un autre appareil

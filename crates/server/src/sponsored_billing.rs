@@ -813,7 +813,27 @@ async fn lock_operation_beneficiaries(
     let mut ids = vec![beneficiary_id];
     ids.extend(replacement_beneficiary_id);
     let references = ids.iter().map(String::as_str).collect::<Vec<_>>();
-    billing_transfers::lock_and_check_no_live_transfer(tx, &references, current_epoch()).await?;
+    let transfer_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT transfer_id FROM billing_transfer_intents \
+         WHERE destination_operation_id = $1 AND destination_kind = 'sponsor' \
+           AND state IN ('pending','destination_prepared','destination_paid', \
+                         'source_adjustment_pending','source_restoration_pending','unknown') \
+         UNION \
+         SELECT transfer_id FROM billing_transfer_intents \
+         WHERE transfer_id || ':destination:source' = $1 AND source_kind = 'sponsor' \
+           AND state IN ('pending','destination_prepared','destination_paid', \
+                         'source_adjustment_pending','source_restoration_pending','unknown')",
+    )
+    .bind(operation_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    billing_transfers::lock_and_check_no_live_transfer_except(
+        tx,
+        &references,
+        &transfer_ids,
+        current_epoch(),
+    )
+    .await?;
     Ok(())
 }
 

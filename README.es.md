@@ -205,6 +205,10 @@ servidor que elegiste. En cualquier caso el servidor solo almacena texto cifrado
 
 Para explorar los secretos de forma interactiva, consulta la [guía del panel](#panel-interactivo).
 
+## Flujos de trabajo con agentes
+
+Los agentes de código locales pueden descubrir y ejecutar tareas declaradas por el proyecto mediante el servidor MCP local de Sotto. Consulta la [guía de tareas para agentes](AGENT-WORKFLOWS.md) para ver la configuración, las aprobaciones y los límites de seguridad.
+
 ## Uso de Sotto
 
 ### Otro dispositivo
