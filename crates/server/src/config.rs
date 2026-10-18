@@ -67,6 +67,8 @@ const CLOUD_SALES_ENV: &str = "SOTTO_CLOUD_SALES_ENABLED";
 const FOUNDING_SCHEDULE_WORKER_ENV: &str = "SOTTO_FOUNDING_SCHEDULE_WORKER_ENABLED";
 const FOUNDING_SCHEDULE_PREFLIGHT_ENV: &str = "SOTTO_FOUNDING_SCHEDULE_PREFLIGHT_VERIFIED";
 const BILLING_TRANSFERS_ENV: &str = "SOTTO_BILLING_TRANSFERS_ENABLED";
+const BILLING_TRANSFER_EXECUTION_ENV: &str = "SOTTO_BILLING_TRANSFER_EXECUTION_ENABLED";
+const BILLING_TRANSFER_SETUP_ENV: &str = "SOTTO_BILLING_TRANSFER_SETUP_ENABLED";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -110,6 +112,10 @@ pub struct Config {
     /// Whether authenticated payer-transfer API routes are registered. Defaults off until
     /// provider execution and recovery are ready.
     pub billing_transfers_enabled: bool,
+    /// Whether the durable payer-transfer worker makes Stripe changes. Defaults off.
+    pub billing_transfer_execution_enabled: bool,
+    /// Whether beneficiaries may open the Stripe setup flow for a personal transfer. Defaults off.
+    pub billing_transfer_setup_enabled: bool,
 }
 
 /// Anonymous version-ping telemetry settings (see [`crate::telemetry`]).
@@ -201,6 +207,13 @@ impl Config {
             feature_flag_is_enabled(std::env::var(FOUNDING_SCHEDULE_WORKER_ENV).ok().as_deref());
         let billing_transfers_enabled =
             feature_flag_is_enabled(std::env::var(BILLING_TRANSFERS_ENV).ok().as_deref());
+        let billing_transfer_execution_enabled = feature_flag_is_enabled(
+            std::env::var(BILLING_TRANSFER_EXECUTION_ENV)
+                .ok()
+                .as_deref(),
+        );
+        let billing_transfer_setup_enabled =
+            feature_flag_is_enabled(std::env::var(BILLING_TRANSFER_SETUP_ENV).ok().as_deref());
         let founding_schedule_preflight_verified = feature_flag_is_enabled(
             std::env::var(FOUNDING_SCHEDULE_PREFLIGHT_ENV)
                 .ok()
@@ -306,7 +319,6 @@ impl Config {
             deployment_mode,
             billing.as_ref(),
         )?;
-
         let telemetry = TelemetryConfig {
             ping_enabled: telemetry_ping_enabled(
                 env_nonempty("SOTTO_TELEMETRY").as_deref(),
@@ -340,6 +352,14 @@ impl Config {
             billing.as_ref(),
             stripe_account_id.as_deref(),
         )?;
+        validate_billing_transfer_execution_configuration(
+            billing_transfers_enabled,
+            billing_transfer_execution_enabled,
+            billing_transfer_setup_enabled,
+            provider_refresh_ingest_enabled,
+            deployment_mode,
+            billing.as_ref(),
+        )?;
         let cloud_action_enforcement_enabled =
             feature_flag_is_enabled(std::env::var(CLOUD_ACTION_ENFORCEMENT_ENV).ok().as_deref());
         let machine_eligibility_enforcement_enabled = feature_flag_is_enabled(
@@ -368,6 +388,8 @@ impl Config {
             cloud_sales_enabled,
             founding_schedule_worker_enabled,
             billing_transfers_enabled,
+            billing_transfer_execution_enabled,
+            billing_transfer_setup_enabled,
         })
     }
 }
@@ -488,6 +510,40 @@ fn validate_billing_transfers_configuration(
             "payer transfer routes require cloud mode and all four hosted Stripe prices".into(),
         ));
     }
+    Ok(())
+}
+
+fn validate_billing_transfer_execution_configuration(
+    _api_enabled: bool,
+    execution_enabled: bool,
+    setup_enabled: bool,
+    provider_refresh_ingest_enabled: bool,
+    deployment_mode: DeploymentMode,
+    billing: Option<&BillingConfig>,
+) -> Result<()> {
+    if !execution_enabled && !setup_enabled {
+        return Ok(());
+    }
+    if setup_enabled && !execution_enabled {
+        return Err(Error::Config(format!(
+            "{BILLING_TRANSFER_SETUP_ENV}=1 requires {BILLING_TRANSFER_EXECUTION_ENV}=1"
+        )));
+    }
+    if execution_enabled && !provider_refresh_ingest_enabled {
+        return Err(Error::Config(
+            "payer transfer execution requires SOTTO_PROVIDER_REFRESH_INGEST_ENABLED=1 so paid invoices settle coverage evidence".into(),
+        ));
+    }
+    let billing = billing.ok_or_else(|| {
+        Error::Config("payer transfer execution requires configured Cloud Stripe billing".into())
+    })?;
+    if deployment_mode != DeploymentMode::Cloud || billing.price_catalogue.is_none() {
+        return Err(Error::Config(
+            "payer transfer execution requires cloud mode and all four hosted Stripe prices".into(),
+        ));
+    }
+    // API intake can be disabled independently while an already-started provider operation is
+    // recovered, so execution deliberately does not depend on it.
     Ok(())
 }
 
@@ -633,10 +689,10 @@ mod tests {
         billing_price_catalogue_from_values, billing_return_url, feature_flag_is_enabled,
         is_portal_configuration_id, organisation_deletion_retention_from_env_result,
         organisation_deletion_worker_is_enabled, parse_organisation_deletion_retention_days,
-        telemetry_ping_enabled, validate_billing_transfers_configuration,
-        validate_cloud_sales_configuration, validate_deployment_billing_boundary,
-        validate_founding_schedule_worker_configuration, validate_provider_refresh_configuration,
-        BillingConfig, BillingPriceIds, DeploymentMode,
+        telemetry_ping_enabled, validate_billing_transfer_execution_configuration,
+        validate_billing_transfers_configuration, validate_cloud_sales_configuration,
+        validate_deployment_billing_boundary, validate_founding_schedule_worker_configuration,
+        validate_provider_refresh_configuration, BillingConfig, BillingPriceIds, DeploymentMode,
         DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS, MAX_ORGANISATION_DELETION_RETENTION_DAYS,
     };
 
@@ -761,6 +817,68 @@ mod tests {
             true,
             DeploymentMode::Cloud,
             Some(&billing)
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn payer_transfer_execution_is_independent_and_off_by_default() {
+        assert!(validate_billing_transfer_execution_configuration(
+            false,
+            false,
+            false,
+            false,
+            DeploymentMode::SelfHosted,
+            None,
+        )
+        .is_ok());
+        assert!(validate_billing_transfer_execution_configuration(
+            false,
+            true,
+            false,
+            false,
+            DeploymentMode::Cloud,
+            None,
+        )
+        .is_err());
+        assert!(validate_billing_transfer_execution_configuration(
+            false,
+            false,
+            true,
+            false,
+            DeploymentMode::Cloud,
+            None,
+        )
+        .is_err());
+        assert!(validate_billing_transfer_execution_configuration(
+            false,
+            true,
+            true,
+            false,
+            DeploymentMode::Cloud,
+            None,
+        )
+        .is_err());
+        assert!(validate_billing_transfer_execution_configuration(
+            false,
+            true,
+            false,
+            true,
+            DeploymentMode::Cloud,
+            Some(&BillingConfig {
+                api_key: "rk_test_secret".into(),
+                webhook_secret: "whsec_test".into(),
+                price_id: "price_legacy".into(),
+                price_catalogue: Some(BillingPriceIds {
+                    standard_monthly: "price_standard_month".into(),
+                    standard_annual: "price_standard_year".into(),
+                    founding_monthly: "price_founding_month".into(),
+                    founding_annual: "price_founding_year".into(),
+                }),
+                cloud_portal_configuration_id: None,
+                cloud_sales_enabled: false,
+                return_url: "https://app.example.test".into(),
+            }),
         )
         .is_ok());
     }

@@ -45,6 +45,8 @@ fn app_with_policy(
         cloud_action_enforcement_enabled: false,
         machine_eligibility_enforcement_enabled,
         billing_transfers_enabled: false,
+        billing_transfer_execution_enabled: false,
+        billing_transfer_setup_enabled: false,
         pool,
         oauth: None,
         oauth_config: None,

@@ -39,4 +39,8 @@ pub struct AppState {
     pub machine_eligibility_enforcement_enabled: bool,
     /// Whether consented payer-transfer API routes are registered.
     pub billing_transfers_enabled: bool,
+    /// Whether the opt-in worker may make Stripe changes for already accepted transfers.
+    pub billing_transfer_execution_enabled: bool,
+    /// Whether a beneficiary may create a Checkout setup session for a personal transfer.
+    pub billing_transfer_setup_enabled: bool,
 }

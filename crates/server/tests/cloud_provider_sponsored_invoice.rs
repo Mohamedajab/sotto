@@ -711,6 +711,8 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
         cloud_action_enforcement_enabled: false,
         machine_eligibility_enforcement_enabled: false,
         billing_transfers_enabled: false,
+        billing_transfer_execution_enabled: false,
+        billing_transfer_setup_enabled: false,
         pool: pool.clone(),
         oauth: None,
         oauth_config: None,

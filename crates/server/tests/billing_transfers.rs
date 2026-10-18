@@ -7,14 +7,17 @@ use uuid::Uuid;
 
 use sotto_server::billing_catalogue::BillingOffer;
 use sotto_server::billing_transfers::{
-    accept_transfer, begin_source_adjustment, begin_transfer, claim_transfer_for_execution,
-    claim_transfer_for_manual_recovery, complete_source_adjustment, complete_source_restoration,
-    finish_execution_lease, lock_and_check_no_live_transfer, mark_failed, record_destination_paid,
-    record_destination_prepared, release_execution_lease, request_source_restoration,
-    withdraw_transfer, BeginTransfer, TransferError, TransferExecutionFailure, TransferPayer,
-    TransferRequest, TransferState,
+    accept_transfer, begin_source_adjustment, begin_source_restoration_payment, begin_transfer,
+    claim_transfer_for_execution, claim_transfer_for_manual_recovery, complete_source_adjustment,
+    complete_source_restoration, defer_execution_lease, finish_execution_lease,
+    lock_and_check_no_live_transfer, mark_failed, record_destination_paid,
+    record_destination_prepared, record_destination_schedule, record_destination_setup_completion,
+    record_source_restoration_payment, record_source_restoration_subscription,
+    release_execution_lease, request_source_restoration, withdraw_transfer, BeginTransfer,
+    TransferError, TransferExecutionFailure, TransferPayer, TransferRequest, TransferState,
 };
 use sotto_server::db;
+use sotto_server::founding_allocator::{FoundingDate, FoundingOffer};
 use sotto_server::sponsored_billing::{
     begin_operation, complete_paid_checkout, SponsoredBillingError, SponsoredProviderEvidence,
     SponsoredSeatAction, SponsoredSeatRequest,
@@ -165,6 +168,18 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
     .await
     .expect("insert destination owner");
     sqlx::query(
+        "INSERT INTO billing_sponsored_subscriptions \
+         (organization_id, provider_customer_id, provider_subscription_id, status, \
+          current_period_start, current_period_end) \
+         VALUES ($1, $2, $3, 'active', 1800000000, 1802592000)",
+    )
+    .bind(&org)
+    .bind(format!("cus_transfer_destination_{fixture}"))
+    .bind(format!("sub_transfer_destination_{fixture}"))
+    .execute(&pool)
+    .await
+    .expect("insert destination sponsor subscription at the source boundary");
+    sqlx::query(
         "INSERT INTO billing_operations
          (operation_id, idempotency_key, request_hash, actor_user_id, payer_id, beneficiary_id,
           offer, quote_version, quote_expires_at_epoch, provider_idempotency_key)
@@ -247,6 +262,34 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
     .await
     .expect("finish in-flight fixture operation");
 
+    sqlx::query(
+        "UPDATE billing_sponsored_subscriptions SET current_period_end = 1802592001 \
+         WHERE organization_id = $1",
+    )
+    .bind(&org)
+    .execute(&pool)
+    .await
+    .expect("move destination renewal away from the source boundary");
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin mismatched destination renewal");
+    assert!(matches!(
+        begin_transfer(&mut tx, &request, 1_800_000_000).await,
+        Err(TransferError::DestinationTermChanged)
+    ));
+    tx.rollback()
+        .await
+        .expect("rollback mismatched destination renewal");
+    sqlx::query(
+        "UPDATE billing_sponsored_subscriptions SET current_period_end = 1802592000 \
+         WHERE organization_id = $1",
+    )
+    .bind(&org)
+    .execute(&pool)
+    .await
+    .expect("restore matching destination renewal");
+
     let mut tx = pool.begin().await.expect("begin transfer");
     let created = begin_transfer(&mut tx, &request, 1_800_000_000)
         .await
@@ -257,24 +300,69 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
     };
     tx.commit().await.expect("commit transfer");
 
-    let lease = claim_transfer_for_execution(&pool, &transfer.transfer_id)
+    for deferral in 0..25 {
+        let waiting_lease = claim_transfer_for_execution(&pool, &transfer.transfer_id)
+            .await
+            .expect("claim accepted transfer")
+            .expect("accepted transfer is due");
+        assert_eq!(waiting_lease.transfer.transfer_id, transfer.transfer_id);
+        assert_eq!(
+            waiting_lease.transfer.execution_attempt_count, 0,
+            "a claim after {deferral} invoice deferrals is not a failure"
+        );
+        if deferral == 0 {
+            assert!(claim_transfer_for_execution(&pool, &transfer.transfer_id)
+                .await
+                .expect("live lease prevents a second claim")
+                .is_none());
+        }
+        assert!(
+            defer_execution_lease(&pool, &transfer.transfer_id, &waiting_lease.lease_token, 1,)
+                .await
+                .expect("defer while waiting for the renewal invoice")
+        );
+        sqlx::query(
+            "UPDATE billing_transfer_intents SET execution_next_attempt_at = now() - interval '1 second' \
+             WHERE transfer_id = $1",
+        )
+        .bind(&transfer.transfer_id)
+        .execute(&pool)
         .await
-        .expect("claim accepted transfer")
+        .expect("make deferred transfer due using the database clock");
+    }
+
+    let first_failure = claim_transfer_for_execution(&pool, &transfer.transfer_id)
+        .await
+        .expect("claim accepted transfer after routine deferrals")
         .expect("accepted transfer is due");
-    assert_eq!(lease.transfer.transfer_id, transfer.transfer_id);
-    assert_eq!(lease.transfer.execution_attempt_count, 1);
-    assert!(claim_transfer_for_execution(&pool, &transfer.transfer_id)
-        .await
-        .expect("live lease prevents a second claim")
-        .is_none());
+    assert_eq!(first_failure.transfer.execution_attempt_count, 0);
     assert!(release_execution_lease(
         &pool,
         &transfer.transfer_id,
-        &lease.lease_token,
+        &first_failure.lease_token,
         TransferExecutionFailure::RetryableProvider,
     )
     .await
     .expect("release retryable lease"));
+    let failure_count: i32 = sqlx::query_scalar(
+        "SELECT execution_attempt_count FROM billing_transfer_intents WHERE transfer_id = $1",
+    )
+    .bind(&transfer.transfer_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read consecutive failure count");
+    assert_eq!(failure_count, 1, "only the provider failure is counted");
+    let needs_review: bool = sqlx::query_scalar(
+        "SELECT execution_manual_review_required FROM billing_transfer_intents WHERE transfer_id = $1",
+    )
+    .bind(&transfer.transfer_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read manual review state");
+    assert!(
+        !needs_review,
+        "routine invoice waits do not exhaust retries"
+    );
     assert!(claim_transfer_for_execution(&pool, &transfer.transfer_id)
         .await
         .expect("backoff prevents an early retry")
@@ -291,8 +379,8 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
         .await
         .expect("claim after retry delay")
         .expect("transfer becomes due after its delay");
-    assert_ne!(lease.lease_token, retry.lease_token);
-    assert_eq!(retry.transfer.execution_attempt_count, 2);
+    assert_ne!(first_failure.lease_token, retry.lease_token);
+    assert_eq!(retry.transfer.execution_attempt_count, 1);
     assert_eq!(
         retry.transfer.provider_idempotency_key, transfer.provider_idempotency_key,
         "a retry keeps the same provider operation identity"
@@ -319,6 +407,17 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
         finish_execution_lease(&pool, &transfer.transfer_id, &reclaimed.lease_token)
             .await
             .expect("current worker clears its own lease")
+    );
+    let failure_count: i32 = sqlx::query_scalar(
+        "SELECT execution_attempt_count FROM billing_transfer_intents WHERE transfer_id = $1",
+    )
+    .bind(&transfer.transfer_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read reset failure count");
+    assert_eq!(
+        failure_count, 0,
+        "successful progress resets consecutive failures"
     );
 
     let rejected_attempt = claim_transfer_for_execution(&pool, &transfer.transfer_id)
@@ -493,6 +592,18 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
         awaiting_invoice,
         TransferState::SourceAdjustmentPending.as_str()
     );
+    let expected_destination_period_end =
+        FoundingDate::anchored_term_end_epoch(transfer.effective_from, FoundingOffer::Monthly, 1)
+            .expect("calculate the quoted monthly destination term");
+    sqlx::query(
+        "UPDATE billing_transfer_intents SET destination_expected_period_end = $2 \
+         WHERE transfer_id = $1",
+    )
+    .bind(&transfer.transfer_id)
+    .bind(expected_destination_period_end)
+    .execute(&mut *tx)
+    .await
+    .expect("persist the destination period read back from Stripe");
     let payer_before_invoice: (String, String) = sqlx::query_as(
         "SELECT payer_kind, payer_id FROM billing_founding_awards WHERE award_id = $1",
     )
@@ -501,11 +612,35 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
     .await
     .expect("founding payer stays unchanged before paid invoice");
     assert_eq!(payer_before_invoice, ("personal".into(), user.clone()));
-    record_destination_paid(&mut tx, &transfer.transfer_id, "pi_destination")
-        .await
-        .expect("record destination payment after source scheduling");
+    record_destination_paid(
+        &mut tx,
+        &transfer.transfer_id,
+        "pi_destination",
+        transfer.effective_from,
+        expected_destination_period_end,
+    )
+    .await
+    .expect("record destination payment after source scheduling");
     assert!(matches!(
-        record_destination_paid(&mut tx, &transfer.transfer_id, "pi_conflicting").await,
+        record_destination_paid(
+            &mut tx,
+            &transfer.transfer_id,
+            "pi_conflicting",
+            transfer.effective_from,
+            expected_destination_period_end,
+        )
+        .await,
+        Err(TransferError::ResultConflict)
+    ));
+    assert!(matches!(
+        record_destination_paid(
+            &mut tx,
+            &transfer.transfer_id,
+            "pi_destination",
+            transfer.effective_from,
+            expected_destination_period_end + 1,
+        )
+        .await,
         Err(TransferError::ResultConflict)
     ));
     complete_source_adjustment(&mut tx, &transfer.transfer_id, "credit_source")
@@ -550,11 +685,35 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
     )
     .await
     .expect("matching preparation retry remains idempotent");
-    record_destination_paid(&mut tx, &transfer.transfer_id, "pi_destination")
-        .await
-        .expect("matching payment retry remains idempotent");
+    record_destination_paid(
+        &mut tx,
+        &transfer.transfer_id,
+        "pi_destination",
+        transfer.effective_from,
+        expected_destination_period_end,
+    )
+    .await
+    .expect("matching payment retry remains idempotent");
     assert!(matches!(
-        record_destination_paid(&mut tx, &transfer.transfer_id, "pi_other").await,
+        record_destination_paid(
+            &mut tx,
+            &transfer.transfer_id,
+            "pi_other",
+            transfer.effective_from,
+            expected_destination_period_end,
+        )
+        .await,
+        Err(TransferError::ResultConflict)
+    ));
+    assert!(matches!(
+        record_destination_paid(
+            &mut tx,
+            &transfer.transfer_id,
+            "pi_destination",
+            transfer.effective_from,
+            expected_destination_period_end + 1,
+        )
+        .await,
         Err(TransferError::ResultConflict)
     ));
     assert!(matches!(
@@ -562,6 +721,123 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
         Err(TransferError::InvalidTransition)
     ));
     tx.rollback().await.expect("rollback callback replay");
+
+    sqlx::query(
+        "UPDATE billing_transfer_intents SET state = 'source_adjustment_pending', \
+             result_code = NULL, destination_payment_reference = NULL, destination_period_end = NULL, \
+             execution_manual_review_required = FALSE, last_execution_error_code = NULL, \
+             execution_next_attempt_at = now(), execution_lease_token = 'period-review-lease', \
+             execution_lease_until = now() + interval '60 seconds' \
+         WHERE transfer_id = $1",
+    )
+    .bind(&transfer.transfer_id)
+    .execute(&pool)
+    .await
+    .expect("reset the fixture for an unexpected Stripe period");
+    let mut tx = pool.begin().await.expect("begin provider period mismatch");
+    let parked = record_destination_paid(
+        &mut tx,
+        &transfer.transfer_id,
+        "pi_sponsor_period_mismatch",
+        transfer.effective_from,
+        expected_destination_period_end + 1,
+    )
+    .await
+    .expect("a valid paid invoice must not fail billing ingest on a transfer mismatch");
+    assert!(parked.execution_manual_review_required);
+    assert_eq!(
+        parked.last_execution_error_code.as_deref(),
+        Some("destination_period_end_mismatch")
+    );
+    assert_eq!(
+        parked.destination_period_end,
+        Some(expected_destination_period_end + 1)
+    );
+    tx.commit()
+        .await
+        .expect("commit the invoice period and review flag together");
+    assert!(
+        defer_execution_lease(&pool, &transfer.transfer_id, "period-review-lease", 300,)
+            .await
+            .expect("defer a worker that observed the invoice concurrently")
+    );
+    let remains_parked: bool = sqlx::query_scalar(
+        "SELECT execution_manual_review_required AND \
+             execution_next_attempt_at = 'infinity'::timestamptz \
+         FROM billing_transfer_intents WHERE transfer_id = $1",
+    )
+    .bind(&transfer.transfer_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read the sticky review fence after deferral");
+    assert!(remains_parked);
+    assert!(claim_transfer_for_execution(&pool, &transfer.transfer_id)
+        .await
+        .expect("normal worker never claims a transfer parked for review")
+        .is_none());
+
+    sqlx::query(
+        "UPDATE billing_transfer_intents SET execution_lease_token = 'period-review-finish', \
+             execution_lease_until = now() + interval '60 seconds' \
+         WHERE transfer_id = $1",
+    )
+    .bind(&transfer.transfer_id)
+    .execute(&pool)
+    .await
+    .expect("simulate a worker completing after the review flag was set");
+    assert!(
+        finish_execution_lease(&pool, &transfer.transfer_id, "period-review-finish",)
+            .await
+            .expect("finish the concurrent worker lease")
+    );
+    let remains_parked: bool = sqlx::query_scalar(
+        "SELECT execution_manual_review_required AND \
+             execution_next_attempt_at = 'infinity'::timestamptz \
+         FROM billing_transfer_intents WHERE transfer_id = $1",
+    )
+    .bind(&transfer.transfer_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read the sticky review fence after finish");
+    assert!(remains_parked);
+    assert!(claim_transfer_for_execution(&pool, &transfer.transfer_id)
+        .await
+        .expect("normal worker remains excluded after finish")
+        .is_none());
+
+    sqlx::query(
+        "UPDATE billing_transfer_intents SET destination_payment_reference = NULL, \
+             destination_period_end = NULL, execution_manual_review_required = FALSE, \
+             last_execution_error_code = NULL, execution_next_attempt_at = now(), \
+             execution_lease_token = NULL, execution_lease_until = NULL \
+         WHERE transfer_id = $1",
+    )
+    .bind(&transfer.transfer_id)
+    .execute(&pool)
+    .await
+    .expect("reset the fixture for an unexpected invoice start");
+    let mut tx = pool.begin().await.expect("begin transfer start mismatch");
+    let parked = record_destination_paid(
+        &mut tx,
+        &transfer.transfer_id,
+        "pi_sponsor_start_mismatch",
+        transfer.effective_from + 1,
+        expected_destination_period_end,
+    )
+    .await
+    .expect("an invoice start mismatch must not reject the organisation invoice");
+    assert!(parked.execution_manual_review_required);
+    assert_eq!(
+        parked.last_execution_error_code.as_deref(),
+        Some("destination_period_start_mismatch")
+    );
+    tx.commit()
+        .await
+        .expect("commit the start mismatch for operator review");
+    assert!(claim_transfer_for_execution(&pool, &transfer.transfer_id)
+        .await
+        .expect("period-start mismatch also stays parked")
+        .is_none());
 
     cleanup(&pool, &fixture).await;
 }
@@ -602,6 +878,18 @@ async fn concurrent_live_transfer_is_rejected_and_personal_actor_is_required() {
     .execute(&pool)
     .await
     .expect("insert owner");
+    sqlx::query(
+        "INSERT INTO billing_sponsored_subscriptions \
+         (organization_id, provider_customer_id, provider_subscription_id, status, \
+          current_period_start, current_period_end) \
+         VALUES ($1, $2, $3, 'active', 1800000000, 1802592000)",
+    )
+    .bind(&org)
+    .bind(format!("cus_transfer_destination_{fixture}"))
+    .bind(format!("sub_transfer_destination_{fixture}"))
+    .execute(&pool)
+    .await
+    .expect("insert destination sponsor subscription at the source boundary");
     sqlx::query(
         "INSERT INTO billing_operations
          (operation_id, idempotency_key, request_hash, actor_user_id, payer_id, beneficiary_id,
@@ -771,6 +1059,26 @@ async fn source_restoration_keeps_beneficiary_fenced_until_provider_confirmation
         .begin()
         .await
         .expect("begin provider restoration result");
+    assert!(matches!(
+        complete_source_restoration(&mut tx, &transfer_id, "schedule_source_restored").await,
+        Err(TransferError::InvalidTransition)
+    ));
+    let operation_id = format!("{transfer_id}:source-restoration");
+    begin_source_restoration_payment(&mut tx, &transfer_id, &operation_id)
+        .await
+        .expect("persist stable recovery operation");
+    record_source_restoration_subscription(&mut tx, &transfer_id, &operation_id, "sub_restored")
+        .await
+        .expect("bind replacement subscription");
+    record_source_restoration_payment(
+        &mut tx,
+        &transfer_id,
+        &operation_id,
+        "sub_restored",
+        "pi_restoration_paid",
+    )
+    .await
+    .expect("record paid recovery invoice");
     let failed = complete_source_restoration(&mut tx, &transfer_id, "schedule_source_restored")
         .await
         .expect("record verified source restoration");
@@ -782,6 +1090,10 @@ async fn source_restoration_keeps_beneficiary_fenced_until_provider_confirmation
     assert_eq!(
         failed.source_restoration_reference.as_deref(),
         Some("schedule_source_restored")
+    );
+    assert_eq!(
+        failed.source_restoration_payment_reference.as_deref(),
+        Some("pi_restoration_paid")
     );
     assert!(matches!(
         complete_source_restoration(&mut tx, &transfer_id, "different_restoration").await,
@@ -938,10 +1250,102 @@ async fn sponsored_admin_and_beneficiary_can_authorise_leaving_a_sponsorship() {
             accept_transfer(&mut tx, &transfer_id, &beneficiary, 1_800_000_000)
                 .await
                 .expect("beneficiary accepts sponsored transfer");
+            tx.commit()
+                .await
+                .expect("commit transfer while Setup Checkout is incomplete");
+            assert!(claim_transfer_for_execution(&pool, &transfer_id)
+                .await
+                .expect("worker leaves setup waiting for the beneficiary")
+                .is_none());
+            let attempts: i32 = sqlx::query_scalar(
+                "SELECT execution_attempt_count FROM billing_transfer_intents WHERE transfer_id = $1",
+            )
+            .bind(&transfer_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read setup waiting attempts");
+            assert_eq!(attempts, 0, "waiting for setup must not consume retries");
+            let mut tx = pool.begin().await.expect("resume setup completion");
+            sqlx::query(
+                "UPDATE billing_transfer_intents SET destination_customer_id = $2, \
+                     destination_setup_session_id = $3 WHERE transfer_id = $1",
+            )
+            .bind(&transfer_id)
+            .bind("cus_transfer_destination")
+            .bind("cs_transfer_setup")
+            .execute(&mut *tx)
+            .await
+            .expect("bind beneficiary setup session");
+            record_destination_setup_completion(
+                &mut tx,
+                &transfer_id,
+                "cus_transfer_destination",
+                "cs_transfer_setup",
+                "seti_transfer_setup",
+            )
+            .await
+            .expect("record verified beneficiary setup");
+            assert!(matches!(
+                record_destination_setup_completion(
+                    &mut tx,
+                    &transfer_id,
+                    "cus_transfer_destination",
+                    "cs_transfer_setup",
+                    "seti_other",
+                )
+                .await,
+                Err(TransferError::ResultConflict)
+            ));
+            record_destination_schedule(
+                &mut tx,
+                &transfer_id,
+                &transfer_id,
+                "cus_transfer_destination",
+                "sub_sched_transfer",
+                None,
+                Some("seti_transfer_setup"),
+                FoundingDate::anchored_term_end_epoch(1_802_592_000, FoundingOffer::Monthly, 1)
+                    .expect("expected monthly destination term"),
+            )
+            .await
+            .expect("record verified future personal schedule");
+            record_destination_schedule(
+                &mut tx,
+                &transfer_id,
+                &transfer_id,
+                "cus_transfer_destination",
+                "sub_sched_transfer",
+                None,
+                Some("seti_transfer_setup"),
+                FoundingDate::anchored_term_end_epoch(1_802_592_000, FoundingOffer::Monthly, 1)
+                    .expect("expected monthly destination term"),
+            )
+            .await
+            .expect("replay the same destination schedule");
+            assert!(matches!(
+                record_destination_schedule(
+                    &mut tx,
+                    &transfer_id,
+                    &transfer_id,
+                    "cus_transfer_destination",
+                    "sub_sched_other",
+                    None,
+                    Some("seti_transfer_setup"),
+                FoundingDate::anchored_term_end_epoch(
+                    1_802_592_000,
+                    FoundingOffer::Monthly,
+                    1,
+                )
+                .expect("expected monthly destination term"),
+                )
+                .await,
+                Err(TransferError::ResultConflict)
+            ));
             transfer_id
         }
         BeginTransfer::AlreadyExists(_) => panic!("transfer unexpectedly existed"),
     };
+    let mut tx = pool.begin().await.expect("begin transfer cleanup");
     mark_failed(&mut tx, &transfer_id, "test_abort")
         .await
         .expect("abort uncommitted provider step");

@@ -46,6 +46,8 @@ fn app_with_mode(pool: PgPool, deployment_mode: sotto_server::config::Deployment
         cloud_action_enforcement_enabled: false,
         machine_eligibility_enforcement_enabled: false,
         billing_transfers_enabled: false,
+        billing_transfer_execution_enabled: false,
+        billing_transfer_setup_enabled: false,
         pool,
         oauth: None,
         oauth_config: None,

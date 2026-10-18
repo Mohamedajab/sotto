@@ -185,6 +185,8 @@ async fn run() -> Result<()> {
         cloud_action_enforcement_enabled: config.cloud_action_enforcement_enabled,
         machine_eligibility_enforcement_enabled: config.machine_eligibility_enforcement_enabled,
         billing_transfers_enabled: config.billing_transfers_enabled,
+        billing_transfer_execution_enabled: config.billing_transfer_execution_enabled,
+        billing_transfer_setup_enabled: config.billing_transfer_setup_enabled,
     };
 
     println!("deployment mode: {}", config.deployment_mode.as_str());
@@ -204,6 +206,14 @@ async fn run() -> Result<()> {
         config.machine_eligibility_enforcement_enabled
     );
     println!("billing transfers: {}", config.billing_transfers_enabled);
+    println!(
+        "billing transfer execution: {}",
+        config.billing_transfer_execution_enabled
+    );
+    println!(
+        "billing transfer setup: {}",
+        config.billing_transfer_setup_enabled
+    );
     println!(
         "founding schedule worker: {}",
         config.founding_schedule_worker_enabled
@@ -258,7 +268,7 @@ async fn run() -> Result<()> {
                     })?;
             }
         }
-        let provider = worker_provider.ok_or_else(|| {
+        let provider = worker_provider.clone().ok_or_else(|| {
             Error::Config("founding schedule worker requires Stripe billing".into())
         })?;
         let catalogue = config
@@ -269,6 +279,19 @@ async fn run() -> Result<()> {
                 Error::Config("founding schedule worker requires the hosted price catalogue".into())
             })?;
         sotto_server::founding_schedule_worker::spawn(pool.clone(), provider, catalogue);
+    }
+    if config.billing_transfer_execution_enabled {
+        let provider = worker_provider.as_ref().ok_or_else(|| {
+            Error::Config("payer transfer execution requires Stripe billing".into())
+        })?;
+        let catalogue = config
+            .billing
+            .as_ref()
+            .and_then(|billing| billing.price_catalogue.clone())
+            .ok_or_else(|| {
+                Error::Config("payer transfer execution requires the hosted price catalogue".into())
+            })?;
+        sotto_server::billing_transfer_worker::spawn(pool.clone(), provider.clone(), catalogue);
     }
     if config.provider_refresh_worker_enabled {
         let Some((coverage, sponsored_coverage, stripe)) = personal_coverage_runtime.clone() else {

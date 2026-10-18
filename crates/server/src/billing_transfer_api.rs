@@ -12,6 +12,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use sqlx::Row;
 
 use crate::auth::AuthUser;
 use crate::billing_catalogue::BillingOffer;
@@ -40,6 +41,217 @@ pub fn router() -> Router<AppState> {
             "/billing/transfers/{transfer_id}/withdraw",
             post(withdraw_transfer),
         )
+}
+
+pub fn setup_router() -> Router<AppState> {
+    Router::new().route(
+        "/billing/transfers/{transfer_id}/payment-method",
+        post(create_transfer_payment_method_setup),
+    )
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct TransferSetupView {
+    transfer_id: String,
+    session_id: String,
+    checkout_url: Option<String>,
+    status: String,
+    expires_at_epoch: Option<i64>,
+}
+
+/// Only the beneficiary may authorise the personal destination's future off-session payments.
+/// The stable provider key makes retries return the same customer and Setup Checkout Session.
+async fn create_transfer_payment_method_setup(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(transfer_id): Path<String>,
+) -> Result<Json<TransferSetupView>> {
+    if !state.billing_transfer_setup_enabled {
+        return Err(Error::NotFound("transfer setup is unavailable".into()));
+    }
+    let billing = state
+        .billing
+        .as_ref()
+        .ok_or_else(|| Error::NotConfigured("hosted billing is not configured".into()))?;
+    let mut tx = state.pool.begin().await?;
+    crate::founding_allocator::lock_capacity(&mut tx)
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?;
+    let exists: Option<String> =
+        sqlx::query_scalar("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+            .bind(&user.user_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if exists.is_none() {
+        return Err(Error::Unauthorized);
+    }
+    let row = sqlx::query(
+        "SELECT transfer_id, beneficiary_id, destination_kind, state, \
+                destination_customer_id, destination_setup_session_id, \
+                destination_setup_intent_id, provider_idempotency_key \
+         FROM billing_transfer_intents WHERE transfer_id = $1 FOR UPDATE",
+    )
+    .bind(&transfer_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| Error::NotFound("transfer not found".into()))?;
+    let beneficiary_id: String = row.try_get("beneficiary_id")?;
+    let destination_kind: String = row.try_get("destination_kind")?;
+    let state_text: String = row.try_get("state")?;
+    if beneficiary_id != user.user_id {
+        return Err(Error::Forbidden(
+            "only the beneficiary can authorise personal payment setup".into(),
+        ));
+    }
+    if destination_kind != TransferPayer::Personal.as_str() || state_text != "pending" {
+        return Err(Error::Conflict(
+            "this transfer is not waiting for personal payment setup".into(),
+        ));
+    }
+    if row
+        .try_get::<Option<String>, _>("destination_setup_intent_id")?
+        .is_some()
+    {
+        return Err(Error::Conflict(
+            "payment setup is already complete; wait for transfer status to update".into(),
+        ));
+    }
+    let saved_customer: Option<String> = row.try_get("destination_customer_id")?;
+    let saved_session: Option<String> = row.try_get("destination_setup_session_id")?;
+    let provider_key: String = row.try_get("provider_idempotency_key")?;
+    let existing_customer: Option<String> = sqlx::query_scalar(
+        "SELECT stripe_customer_id FROM billing_personal_accounts \
+         WHERE user_id = $1 AND state = 'canceled'",
+    )
+    .bind(&user.user_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .flatten();
+    tx.commit().await?;
+
+    if let Some(session_id) = saved_session.as_deref() {
+        let existing = billing
+            .provider()
+            .get_transfer_setup_session(session_id)
+            .await
+            .map_err(crate::billing::ProviderError::into_error)?;
+        if Some(existing.customer_id.as_str()) != saved_customer.as_deref() {
+            return Err(Error::Conflict(
+                "stored payment setup evidence changed".into(),
+            ));
+        }
+        if existing.status == "open" {
+            return Ok(Json(transfer_setup_view(&transfer_id, existing)));
+        }
+        if existing.status == "complete" {
+            return Err(Error::Conflict(
+                "payment setup is processing; refresh transfer status".into(),
+            ));
+        }
+    }
+
+    let customer_id = if let Some(customer_id) = saved_customer.or(existing_customer) {
+        customer_id
+    } else {
+        billing
+            .provider()
+            .create_transfer_customer(
+                &transfer_id,
+                &user.user_id,
+                &format!("{provider_key}-customer"),
+            )
+            .await
+            .map_err(crate::billing::ProviderError::into_error)?
+    };
+    let session_key = saved_session.as_deref().map_or_else(
+        || format!("{provider_key}-setup"),
+        |old_session| {
+            format!(
+                "{provider_key}-setup-retry-{}",
+                short_transfer_digest(old_session)
+            )
+        },
+    );
+    let (success_url, cancel_url) = transfer_setup_return_urls(billing.return_url(), &transfer_id);
+    let session = billing
+        .provider()
+        .create_transfer_setup_session(
+            &transfer_id,
+            &customer_id,
+            &session_key,
+            &success_url,
+            &cancel_url,
+        )
+        .await
+        .map_err(crate::billing::ProviderError::into_error)?;
+    if session.customer_id != customer_id || session.status != "open" {
+        return Err(Error::Conflict(
+            "provider setup session did not match the transfer".into(),
+        ));
+    }
+    let mut tx = state.pool.begin().await?;
+    crate::founding_allocator::lock_capacity(&mut tx)
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?;
+    sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+        .bind(&user.user_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(Error::Unauthorized)?;
+    let stored = sqlx::query(
+        "UPDATE billing_transfer_intents SET destination_customer_id = $3, \
+             destination_setup_session_id = $4, updated_at = now() \
+         WHERE transfer_id = $1 AND beneficiary_id = $2 AND destination_kind = 'personal' \
+           AND state = 'pending' AND destination_setup_intent_id IS NULL \
+           AND (destination_setup_session_id IS NULL OR destination_setup_session_id = $5) \
+           AND (destination_customer_id IS NULL OR destination_customer_id = $3) \
+         RETURNING transfer_id",
+    )
+    .bind(&transfer_id)
+    .bind(&user.user_id)
+    .bind(&customer_id)
+    .bind(&session.session_id)
+    .bind(saved_session.as_deref())
+    .fetch_optional(&mut *tx)
+    .await?;
+    if stored.is_none() {
+        tx.rollback().await?;
+        return Err(Error::Conflict(
+            "transfer setup state changed; refresh status".into(),
+        ));
+    }
+    tx.commit().await?;
+    Ok(Json(transfer_setup_view(&transfer_id, session)))
+}
+
+fn transfer_setup_view(
+    transfer_id: &str,
+    session: crate::billing::TransferSetupSession,
+) -> TransferSetupView {
+    TransferSetupView {
+        transfer_id: transfer_id.to_string(),
+        session_id: session.session_id,
+        checkout_url: session.checkout_url,
+        status: session.status,
+        expires_at_epoch: session.expires_at_epoch,
+    }
+}
+
+fn transfer_setup_return_urls(base: &str, transfer_id: &str) -> (String, String) {
+    let app = format!("{}/app", base.trim_end_matches('/'));
+    let encoded = url::form_urlencoded::byte_serialize(transfer_id.as_bytes()).collect::<String>();
+    (
+        format!("{app}?billing=transfer_setup&transfer_id={encoded}"),
+        format!("{app}?billing=transfer_setup_cancelled&transfer_id={encoded}"),
+    )
+}
+
+fn short_transfer_digest(value: &str) -> String {
+    Sha256::digest(value.as_bytes())[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -578,12 +790,18 @@ mod tests {
             destination_provider_subscription_id: None,
             source_provider_subscription_id: None,
             destination_payment_reference: None,
+            destination_period_end: None,
+            destination_expected_period_end: None,
             source_adjustment_reference: None,
             source_restoration_reference: None,
+            source_restoration_operation_id: None,
+            source_restoration_provider_subscription_id: None,
+            source_restoration_payment_reference: None,
             founding_award_id: None,
             execution_lease_token: None,
             execution_lease_until_epoch: None,
             execution_attempt_count: 0,
+            execution_manual_review_required: false,
             destination_customer_id: None,
             destination_schedule_id: None,
             source_schedule_id: None,

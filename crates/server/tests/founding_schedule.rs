@@ -50,6 +50,7 @@ impl CancellationWorkerProvider {
     ) -> SponsoredSubscriptionSnapshot {
         SponsoredSubscriptionSnapshot {
             customer_id: Some("cus_founding_schedule".into()),
+            default_payment_method_id: None,
             subscription_id: subscription_id.into(),
             status: SubscriptionStatus::Active,
             cancel_at_period_end,

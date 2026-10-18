@@ -46,6 +46,8 @@ fn app(pool: PgPool, transfers_enabled: bool) -> Router {
         cloud_action_enforcement_enabled: false,
         machine_eligibility_enforcement_enabled: false,
         billing_transfers_enabled: transfers_enabled,
+        billing_transfer_execution_enabled: false,
+        billing_transfer_setup_enabled: false,
     })
 }
 
@@ -179,6 +181,18 @@ async fn authenticated_transfer_quote_consent_status_and_replay_are_server_deriv
     .expect("insert destination owner");
 
     let paid_through = now_epoch() + 86_400;
+    sqlx::query(
+        "INSERT INTO billing_sponsored_subscriptions \
+         (organization_id, provider_customer_id, provider_subscription_id, status, current_period_end) \
+         VALUES ($1, $2, $3, 'active', $4)",
+    )
+    .bind(&org_id)
+    .bind(format!("cus_transfer_api_{fixture}_destination"))
+    .bind(format!("sub_transfer_api_{fixture}_destination"))
+    .bind(paid_through)
+    .execute(&pool)
+    .await
+    .expect("insert destination sponsor subscription at the source boundary");
     sqlx::query(
         "INSERT INTO billing_operations \
          (operation_id, idempotency_key, request_hash, actor_user_id, payer_id, beneficiary_id, \
@@ -480,6 +494,20 @@ async fn sponsored_source_quotes_cover_personal_and_sponsor_destinations() {
           current_period_start, current_period_end) \
          VALUES ($1, $2, $3, 'active', $4, $5)",
     )
+    .bind(&destination_org)
+    .bind(format!("cus_transfer_api_{fixture}_destination"))
+    .bind(format!("sub_transfer_api_{fixture}_destination"))
+    .bind(period_start)
+    .bind(period_end)
+    .execute(&pool)
+    .await
+    .expect("insert destination sponsor subscription at the source boundary");
+    sqlx::query(
+        "INSERT INTO billing_sponsored_subscriptions \
+         (organization_id, provider_customer_id, provider_subscription_id, status, \
+          current_period_start, current_period_end) \
+         VALUES ($1, $2, $3, 'active', $4, $5)",
+    )
     .bind(&source_org)
     .bind(format!("cus_transfer_api_{fixture}"))
     .bind(format!("sub_transfer_api_{fixture}"))
@@ -602,6 +630,19 @@ async fn same_person_transfer_requires_authority_for_both_payers() {
     }
 
     let paid_through = now_epoch() + 86_400;
+    sqlx::query(
+        "INSERT INTO billing_sponsored_subscriptions \
+         (organization_id, provider_customer_id, provider_subscription_id, status, current_period_end) \
+         VALUES ($1, $2, $3, 'active', $4)",
+    )
+    .bind(&owned_org)
+    .bind(format!("cus_transfer_api_{fixture}_owned_destination"))
+    .bind(format!("sub_transfer_api_{fixture}_owned_destination"))
+    .bind(paid_through)
+    .execute(&pool)
+    .await
+    .expect("insert active owned destination sponsor subscription");
+
     sqlx::query(
         "INSERT INTO billing_operations \
          (operation_id, idempotency_key, request_hash, actor_user_id, payer_id, beneficiary_id, \
