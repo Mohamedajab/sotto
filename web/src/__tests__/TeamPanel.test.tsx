@@ -10,17 +10,26 @@ import * as vault from "../vault";
 
 vi.mock("../api", () => ({
   organisationDeletionEnabled: false,
+  acceptPayerTransfer: vi.fn(),
+  beginPayerTransfer: vi.fn(),
   createCheckout: vi.fn(),
   createPortal: vi.fn(),
+  createPayerTransferPaymentSetup: vi.fn(),
   fetchAudit: vi.fn(),
   fetchEntitlements: vi.fn(),
   fetchMembers: vi.fn(),
   fetchOrgs: vi.fn(),
+  fetchPayerTransferCapabilities: vi.fn(),
+  fetchPayerTransfer: vi.fn(),
+  fetchPayerTransfers: vi.fn(),
   fetchSponsoredSeats: vi.fn(),
   fetchSponsoredQuote: vi.fn(),
   createSponsoredCheckout: vi.fn(),
   grantOrgKey: vi.fn(),
   inviteMember: vi.fn(),
+  me: vi.fn(),
+  quotePayerTransfer: vi.fn(),
+  withdrawPayerTransfer: vi.fn(),
 }));
 
 vi.mock("../vault", () => ({
@@ -34,6 +43,8 @@ afterEach(cleanup);
 function resetMocks() {
   vi.resetAllMocks();
   vi.mocked(api.fetchSponsoredSeats).mockResolvedValue([]);
+  vi.mocked(api.fetchPayerTransferCapabilities).mockResolvedValue({ available: false, setupAvailable: false });
+  vi.mocked(api.me).mockResolvedValue(null);
 }
 
 function deferred<T>() {

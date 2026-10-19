@@ -100,12 +100,12 @@ async fn seed_manual_review(pool: &PgPool) -> (String, String, String) {
         "INSERT INTO billing_transfer_intents \
          (transfer_id, actor_user_id, counterparty_user_id, beneficiary_id, source_kind, \
           destination_kind, destination_organization_id, offer, quote_version, \
-          quote_expires_at_epoch, effective_from, idempotency_key, request_hash, \
+          quote_expires_at_epoch, consent_expires_at_epoch, effective_from, idempotency_key, request_hash, \
           provider_idempotency_key, source_provider_subscription_id, state, result_code, \
           execution_manual_review_required, execution_review_generation, \
           execution_next_attempt_at, last_execution_error_code) \
          VALUES ($1, $2, $2, $2, 'personal', 'sponsor', $3, 'standard_monthly', 1, \
-                 2000000000, 2000001000, $4, 'request-hash', $5, 'sub_source', 'unknown', \
+                 2000000000, 2000000000, 2000001000, $4, 'request-hash', $5, 'sub_source', 'unknown', \
                  'manual_review_required', TRUE, 1, 'infinity'::timestamptz, \
                  'provider_outcome_unknown')",
     )

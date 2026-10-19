@@ -10,13 +10,14 @@ use sotto_server::billing_transfers::{
     accept_transfer, begin_source_adjustment, begin_source_restoration_payment, begin_transfer,
     claim_transfer_for_execution, complete_source_adjustment, complete_source_restoration,
     defer_execution_lease, finish_execution_lease, list_manual_review_transfers,
-    load_manual_review_transfer, lock_and_check_no_live_transfer, mark_failed,
-    record_destination_paid, record_destination_prepared, record_destination_schedule,
-    record_destination_setup_completion, record_operator_review_decision,
-    record_source_restoration_payment, record_source_restoration_subscription,
-    release_execution_lease, repark_mismatched_destination_invoice, request_source_restoration,
-    withdraw_transfer, BeginTransfer, TransferError, TransferExecutionFailure, TransferPayer,
-    TransferRequest, TransferReviewAction, TransferState,
+    load_manual_review_transfer, lock_and_check_no_live_transfer,
+    lock_and_check_no_provider_transfer_except, mark_failed, record_destination_paid,
+    record_destination_prepared, record_destination_schedule, record_destination_setup_completion,
+    record_operator_review_decision, record_source_restoration_payment,
+    record_source_restoration_subscription, release_execution_lease,
+    repark_mismatched_destination_invoice, request_source_restoration, withdraw_transfer,
+    BeginTransfer, TransferError, TransferExecutionFailure, TransferPayer, TransferRequest,
+    TransferReviewAction, TransferState,
 };
 use sotto_server::db;
 use sotto_server::founding_allocator::{FoundingDate, FoundingOffer};
@@ -1184,6 +1185,13 @@ async fn concurrent_live_transfer_is_rejected_and_personal_actor_is_required() {
         accept_transfer(&mut tx, &first_id, &user, 1_800_000_000).await,
         Err(TransferError::Unauthorised)
     ));
+    assert!(matches!(
+        lock_and_check_no_live_transfer(&mut tx, &[&user], 1_800_000_000).await,
+        Err(TransferError::InvitationPending)
+    ));
+    lock_and_check_no_provider_transfer_except(&mut tx, &[&user], &[], 1_800_000_000)
+        .await
+        .expect("provider webhooks must continue during consent");
     accept_transfer(&mut tx, &first_id, &other, 1_800_000_000)
         .await
         .expect("counterparty accepts first transfer");
@@ -1192,6 +1200,10 @@ async fn concurrent_live_transfer_is_rejected_and_personal_actor_is_required() {
     let mut tx = pool.begin().await.expect("begin mutation fence check");
     assert!(matches!(
         lock_and_check_no_live_transfer(&mut tx, &[&user], 1_800_000_000).await,
+        Err(TransferError::AlreadyInProgress)
+    ));
+    assert!(matches!(
+        lock_and_check_no_provider_transfer_except(&mut tx, &[&user], &[], 1_800_000_000).await,
         Err(TransferError::AlreadyInProgress)
     ));
     tx.rollback().await.expect("rollback mutation fence check");
@@ -1249,12 +1261,12 @@ async fn source_restoration_keeps_beneficiary_fenced_until_provider_confirmation
         "INSERT INTO billing_transfer_intents \
          (transfer_id, actor_user_id, counterparty_user_id, beneficiary_id, source_kind, \
           destination_kind, destination_organization_id, offer, quote_version, \
-          quote_expires_at_epoch, effective_from, idempotency_key, request_hash, \
+          quote_expires_at_epoch, consent_expires_at_epoch, effective_from, idempotency_key, request_hash, \
           provider_idempotency_key, source_provider_subscription_id, \
           destination_provider_subscription_id, destination_operation_id, source_operation_id, \
           source_adjustment_reference, state) \
          VALUES ($1, $2, $2, $2, 'personal', 'sponsor', $3, 'standard_monthly', 1, \
-                 2000000000, 2000000100, $1, $1, $1, 'sub_source', 'sub_destination', \
+                 2000000000, 2000000000, 2000000100, $1, $1, $1, 'sub_source', 'sub_destination', \
                  'op_destination', 'op_source', 'schedule_source', 'source_adjustment_pending')",
     )
     .bind(&transfer_id)
@@ -1598,6 +1610,15 @@ async fn sponsored_admin_and_beneficiary_can_authorise_leaving_a_sponsorship() {
         BeginTransfer::AlreadyExists(_) => panic!("expired invitation unexpectedly existed"),
     };
     tx.commit().await.expect("commit expired invitation");
+    sqlx::query(
+        "UPDATE billing_transfer_intents SET consent_expires_at_epoch = $2 \
+         WHERE transfer_id = $1",
+    )
+    .bind(&expired_id)
+    .bind(1_800_001_000_i64)
+    .execute(&pool)
+    .await
+    .expect("expire the invitation consent window");
 
     let mut fresh = request;
     fresh.idempotency_key = "fresh-invitation".into();
@@ -1622,7 +1643,7 @@ async fn sponsored_admin_and_beneficiary_can_authorise_leaving_a_sponsorship() {
     .await
     .expect("read expired invitation");
     assert_eq!(expired_state, ("failed".into(), "consent_expired".into()));
-    let withdrawn = withdraw_transfer(&mut tx, &fresh_id, &admin)
+    let withdrawn = withdraw_transfer(&mut tx, &fresh_id, &admin, 1_800_001_001)
         .await
         .expect("actor can withdraw invitation");
     assert_eq!(withdrawn.state, TransferState::Failed);

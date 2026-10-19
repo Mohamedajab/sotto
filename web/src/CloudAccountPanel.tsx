@@ -20,6 +20,8 @@ import {
   type PersonalBillingTerm,
   type RefundRequest,
 } from "./api";
+import { PayerTransferInbox } from "./PayerTransferInbox";
+import { PersonalTransferStart } from "./PayerTransferStart";
 
 function message(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 function pounds(pence: number): string { return new Intl.NumberFormat("en-GB", { style: "currency", currency: "GBP" }).format(pence / 100); }
@@ -202,7 +204,9 @@ export function CloudAccountPanel() {
     </section>}
     {eligibility.state === "pending_initial_payment" && <section aria-labelledby="pending-heading"><h2 id="pending-heading">Payment confirmation pending</h2><p>Your checkout is waiting for the verified payment webhook. Hosted access stays unchanged until it arrives.</p>{operation?.checkoutUrl !== null && operation?.checkoutUrl !== undefined && <p><a href={operation.checkoutUrl}>Return to checkout</a></p>}<button disabled={busy || operationLoading} aria-busy={operationLoading} onClick={() => void refreshOperation()}>{operationLoading ? "Refreshing payment status…" : "Refresh payment status"}</button></section>}
     {(eligibility.state === "paid" || eligibility.state === "renewal_recovery") && <section aria-labelledby="manage-heading"><h2 id="manage-heading">Manage billing</h2><button disabled={busy} onClick={() => void portal()}>Open billing portal</button>{" "}{eligibility.actions.revoke && <button disabled={busy} onClick={() => void cancel()}>Cancel at the end of the paid period</button>}<button disabled={busy} onClick={() => void askRefund()}>Request a refund</button>{lifecycle?.cancelAtPeriodEnd && <p className="muted">Cancellation is scheduled; access remains available until {lifecycle.paidThroughDate ?? "the paid period ends"}.</p>}{refund !== null && <p className="muted">Refund request: {refund.state}. The paid term is preserved by default.</p>}</section>}
+    {eligibility.payer === "personal" && (eligibility.state === "paid" || eligibility.state === "renewal_recovery") && <PersonalTransferStart />}
     {eligibility.actions.export && <section aria-labelledby="export-heading"><h2 id="export-heading">Recover your encrypted account</h2><p>{exportUntil === null ? "Your export window is open." : `Export before ${exportUntil}.`}</p>{eligibility.accountInitialized ? <button disabled={busy} onClick={() => void exportAccount()}>Download encrypted export</button> : <p>Set up your account before exporting.</p>}</section>}
+    <PayerTransferInbox />
     <p><a href="/app">Back to vault</a></p>
   </>;
 }

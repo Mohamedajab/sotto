@@ -21,6 +21,8 @@ use crate::org;
 /// The operator-facing lifetime of a transfer quote. A client cannot extend this by submitting
 /// its own expiry when it creates the invitation.
 pub const TRANSFER_QUOTE_SECONDS: i64 = 15 * 60;
+/// A distinct counterparty has seven days to discover and respond to a transfer invitation.
+pub const TRANSFER_CONSENT_SECONDS: i64 = 7 * 24 * 60 * 60;
 pub const TRANSFER_QUOTE_VERSION: i64 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,6 +192,19 @@ impl TransferRequest {
         Ok(())
     }
 
+    fn validate_acceptance_timing(&self, now_epoch: i64) -> Result<(), TransferError> {
+        if self.effective_from < now_epoch {
+            return Err(TransferError::InvalidField("effective_from"));
+        }
+        if self
+            .effective_until
+            .is_some_and(|until| until <= self.effective_from)
+        {
+            return Err(TransferError::InvalidField("effective_until"));
+        }
+        Ok(())
+    }
+
     fn request_hash(&self) -> String {
         let quote_version = self.quote_version.to_string();
         let quote_expires_at = self.quote_expires_at_epoch.to_string();
@@ -234,6 +249,7 @@ pub struct TransferIntent {
     pub offer: BillingOffer,
     pub quote_version: i64,
     pub quote_expires_at_epoch: i64,
+    pub consent_expires_at_epoch: i64,
     pub request_hash: String,
     pub idempotency_key: String,
     pub provider_idempotency_key: String,
@@ -395,6 +411,10 @@ pub enum TransferError {
     DestinationSubscriptionUnavailable,
     #[error("destination sponsor renewal does not match the source paid-through boundary")]
     DestinationTermChanged,
+    #[error(
+        "a payer transfer invitation is pending; the person who started it or the invited payer can withdraw it"
+    )]
+    InvitationPending,
     #[error("transfer is already in progress for this beneficiary")]
     AlreadyInProgress,
     #[error("transfer is not authorised")]
@@ -504,19 +524,23 @@ pub async fn build_transfer_request(
     request.validate_shape()?;
     authorise_transfer_parties(tx, &request).await?;
 
-    let live_transfer: Option<String> = sqlx::query_scalar(
-        "SELECT transfer_id FROM billing_transfer_intents WHERE beneficiary_id = $1 \
+    let live_transfer: Option<(String, String)> = sqlx::query_as(
+        "SELECT transfer_id, state FROM billing_transfer_intents WHERE beneficiary_id = $1 \
          AND (state IN ('pending','destination_prepared','destination_paid', \
                         'source_adjustment_pending','source_restoration_pending','unknown') \
-              OR (state = 'awaiting_consent' AND quote_expires_at_epoch > $2)) \
+              OR (state = 'awaiting_consent' AND consent_expires_at_epoch > $2 AND effective_from > $2)) \
          ORDER BY transfer_id LIMIT 1 FOR UPDATE",
     )
     .bind(&request.beneficiary_id)
     .bind(now_epoch)
     .fetch_optional(&mut **tx)
     .await?;
-    if live_transfer.is_some() {
-        return Err(TransferError::AlreadyInProgress);
+    if let Some((_, state)) = live_transfer {
+        return Err(if state == "awaiting_consent" {
+            TransferError::InvitationPending
+        } else {
+            TransferError::AlreadyInProgress
+        });
     }
 
     let source_offer = ensure_source_active(tx, &request, now_epoch).await?;
@@ -713,6 +737,10 @@ impl From<TransferError> for Error {
                 "destination sponsor renewal does not match the source paid-through boundary"
                     .into(),
             ),
+            TransferError::InvitationPending => Self::Conflict(
+                "a payer transfer invitation is pending; the person who started it or the invited payer can withdraw it"
+                    .into(),
+            ),
             TransferError::AlreadyInProgress => {
                 Self::Conflict("a transfer is already in progress for this beneficiary".into())
             }
@@ -746,7 +774,7 @@ pub async fn begin_transfer(
         "UPDATE billing_transfer_intents SET state = 'failed', result_code = 'consent_expired', \
          updated_at = now() \
          WHERE beneficiary_id = $1 AND state = 'awaiting_consent' \
-           AND quote_expires_at_epoch <= $2",
+           AND (consent_expires_at_epoch <= $2 OR effective_from <= $2)",
     )
     .bind(&request.beneficiary_id)
     .bind(now_epoch)
@@ -761,16 +789,22 @@ pub async fn begin_transfer(
         return Ok(BeginTransfer::AlreadyExists(existing));
     }
     request.validate_timing(now_epoch)?;
-    let live: Option<String> = sqlx::query_scalar(
-        "SELECT transfer_id FROM billing_transfer_intents WHERE beneficiary_id = $1 \
-         AND state IN ('awaiting_consent','pending','destination_prepared','destination_paid','source_adjustment_pending','source_restoration_pending','unknown') \
+    let live: Option<(String, String)> = sqlx::query_as(
+        "SELECT transfer_id, state FROM billing_transfer_intents WHERE beneficiary_id = $1 \
+         AND (state IN ('pending','destination_prepared','destination_paid','source_adjustment_pending','source_restoration_pending','unknown') \
+              OR (state = 'awaiting_consent' AND consent_expires_at_epoch > $2 AND effective_from > $2)) \
          FOR UPDATE",
     )
     .bind(&request.beneficiary_id)
+    .bind(now_epoch)
     .fetch_optional(&mut **tx)
     .await?;
-    if live.is_some() {
-        return Err(TransferError::AlreadyInProgress);
+    if let Some((_, state)) = live {
+        return Err(if state == "awaiting_consent" {
+            TransferError::InvitationPending
+        } else {
+            TransferError::AlreadyInProgress
+        });
     }
     let source_offer = ensure_source_active(tx, request, now_epoch).await?;
     ensure_no_pending_billing_mutation(tx, &request.beneficiary_id).await?;
@@ -794,6 +828,10 @@ pub async fn begin_transfer(
         None
     };
     validate_offer_at_boundary(request, &source_offer, award.as_ref())?;
+    let consent_expires_at_epoch = now_epoch
+        .checked_add(TRANSFER_CONSENT_SECONDS)
+        .ok_or(TransferError::InvalidField("consent expiry"))?
+        .min(request.effective_from);
     let transfer_id = format!("transfer:{}", Uuid::new_v4());
     let provider_key = format!(
         "sotto-transfer:{}",
@@ -802,15 +840,19 @@ pub async fn begin_transfer(
     let initial_state = if request.actor_user_id == request.counterparty_user_id {
         TransferState::Pending
     } else {
+        if consent_expires_at_epoch <= now_epoch {
+            return Err(TransferError::InvalidField("effective_from"));
+        }
         TransferState::AwaitingConsent
     };
     sqlx::query(
         "INSERT INTO billing_transfer_intents \
          (transfer_id, actor_user_id, counterparty_user_id, beneficiary_id, source_kind, source_organization_id, \
           destination_kind, destination_organization_id, offer, quote_version, quote_expires_at_epoch, \
+          consent_expires_at_epoch, \
           effective_from, effective_until, idempotency_key, request_hash, provider_idempotency_key, \
           founding_award_id, state, source_provider_subscription_id) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)",
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)",
     )
     .bind(&transfer_id)
     .bind(&request.actor_user_id)
@@ -823,6 +865,7 @@ pub async fn begin_transfer(
     .bind(request.offer.as_str())
     .bind(request.quote_version)
     .bind(request.quote_expires_at_epoch)
+    .bind(consent_expires_at_epoch)
     .bind(request.effective_from)
     .bind(request.effective_until)
     .bind(&request.idempotency_key)
@@ -865,6 +908,9 @@ pub async fn accept_transfer(
     if invitation.state == TransferState::Pending {
         return Ok(invitation);
     }
+    if invitation.consent_expires_at_epoch <= now_epoch {
+        return Err(TransferError::InvalidTransition);
+    }
     let request = request_from_intent(&invitation)?;
     authorise_transfer_parties(tx, &request).await?;
     let current = load_transfer(tx, transfer_id).await?;
@@ -877,8 +923,11 @@ pub async fn accept_transfer(
     if current.state != TransferState::AwaitingConsent {
         return Err(TransferError::InvalidTransition);
     }
+    if current.consent_expires_at_epoch <= now_epoch {
+        return Err(TransferError::InvalidTransition);
+    }
     let request = request_from_intent(&current)?;
-    request.validate_timing(now_epoch)?;
+    request.validate_acceptance_timing(now_epoch)?;
     let source_offer = ensure_source_active(tx, &request, now_epoch).await?;
     ensure_no_pending_billing_mutation(tx, &request.beneficiary_id).await?;
     ensure_destination_free(tx, &request).await?;
@@ -909,8 +958,9 @@ pub async fn accept_transfer(
 }
 
 /// Serialise a payer/coverage mutation against transfer creation and reject changes while a
-/// beneficiary has a live transfer. Expired consent invitations do not hold the beneficiary's
-/// billing state; `begin_transfer` marks them failed when the next transfer is started.
+/// beneficiary has a live transfer. Invitations whose consent deadline or renewal boundary has
+/// passed do not hold the beneficiary's billing state; `begin_transfer` marks them failed when
+/// the next transfer is started.
 pub async fn lock_and_check_no_live_transfer(
     tx: &mut Transaction<'_, Postgres>,
     beneficiary_ids: &[&str],
@@ -926,6 +976,29 @@ pub async fn lock_and_check_no_live_transfer_except(
     beneficiary_ids: &[&str],
     allowed_transfer_ids: &[String],
     now_epoch: i64,
+) -> Result<(), TransferError> {
+    lock_and_check_transfer_except(tx, beneficiary_ids, allowed_transfer_ids, now_epoch, true).await
+}
+
+/// Lock beneficiaries for provider webhooks. A consent invitation has not changed provider state,
+/// so it must not prevent Stripe events from updating the payer's current subscription. Accepted
+/// transfers and later execution states remain fenced as before.
+pub async fn lock_and_check_no_provider_transfer_except(
+    tx: &mut Transaction<'_, Postgres>,
+    beneficiary_ids: &[&str],
+    allowed_transfer_ids: &[String],
+    now_epoch: i64,
+) -> Result<(), TransferError> {
+    lock_and_check_transfer_except(tx, beneficiary_ids, allowed_transfer_ids, now_epoch, false)
+        .await
+}
+
+async fn lock_and_check_transfer_except(
+    tx: &mut Transaction<'_, Postgres>,
+    beneficiary_ids: &[&str],
+    allowed_transfer_ids: &[String],
+    now_epoch: i64,
+    include_consent_invitations: bool,
 ) -> Result<(), TransferError> {
     founding_allocator::lock_capacity(tx).await?;
 
@@ -962,21 +1035,26 @@ pub async fn lock_and_check_no_live_transfer_except(
         .await?;
     }
 
-    let active: Option<String> = sqlx::query_scalar(
-        "SELECT transfer_id FROM billing_transfer_intents \
+    let active: Option<(String, String)> = sqlx::query_as(
+        "SELECT transfer_id, state FROM billing_transfer_intents \
          WHERE beneficiary_id = ANY($1) AND (state IN \
            ('pending','destination_prepared','destination_paid','source_adjustment_pending','source_restoration_pending','unknown') \
-           OR (state = 'awaiting_consent' AND quote_expires_at_epoch > $2)) \
+           OR ($4 AND state = 'awaiting_consent' AND consent_expires_at_epoch > $2 AND effective_from > $2)) \
            AND NOT (transfer_id = ANY($3)) \
          ORDER BY beneficiary_id, transfer_id LIMIT 1 FOR UPDATE",
     )
     .bind(&user_ids)
     .bind(now_epoch)
     .bind(allowed_transfer_ids)
+    .bind(include_consent_invitations)
     .fetch_optional(&mut **tx)
     .await?;
-    if active.is_some() {
-        return Err(TransferError::AlreadyInProgress);
+    if let Some((_, state)) = active {
+        return Err(if state == "awaiting_consent" {
+            TransferError::InvitationPending
+        } else {
+            TransferError::AlreadyInProgress
+        });
     }
     Ok(())
 }
@@ -1011,6 +1089,7 @@ pub async fn withdraw_transfer(
     tx: &mut Transaction<'_, Postgres>,
     transfer_id: &str,
     user_id: &str,
+    now_epoch: i64,
 ) -> Result<TransferIntent, TransferError> {
     if user_id.trim().is_empty() {
         return Err(TransferError::InvalidField("user_id"));
@@ -1021,6 +1100,9 @@ pub async fn withdraw_transfer(
         return Err(TransferError::Unauthorised);
     }
     if current.state != TransferState::AwaitingConsent {
+        return Err(TransferError::InvalidTransition);
+    }
+    if current.consent_expires_at_epoch <= now_epoch {
         return Err(TransferError::InvalidTransition);
     }
     sqlx::query(
@@ -2695,6 +2777,7 @@ pub(crate) fn transfer_from_row(
         offer: parse_offer(&row.try_get::<String, _>("offer")?)?,
         quote_version: row.try_get("quote_version")?,
         quote_expires_at_epoch: row.try_get("quote_expires_at_epoch")?,
+        consent_expires_at_epoch: row.try_get("consent_expires_at_epoch")?,
         request_hash: row.try_get("request_hash")?,
         idempotency_key: row.try_get("idempotency_key")?,
         provider_idempotency_key: row.try_get("provider_idempotency_key")?,

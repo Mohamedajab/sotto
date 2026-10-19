@@ -1950,6 +1950,7 @@ mod tests {
             offer: BillingOffer::StandardMonthly,
             quote_version: 1,
             quote_expires_at_epoch: 1_000,
+            consent_expires_at_epoch: 1_000 + crate::billing_transfers::TRANSFER_CONSENT_SECONDS,
             request_hash: "hash".into(),
             idempotency_key: "key".into(),
             provider_idempotency_key: "provider-key".into(),

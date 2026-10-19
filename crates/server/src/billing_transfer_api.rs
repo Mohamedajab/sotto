@@ -21,6 +21,7 @@ use crate::billing_transfers::{
     TransferState, TRANSFER_QUOTE_SECONDS, TRANSFER_QUOTE_VERSION,
 };
 use crate::error::{Error, Result};
+use crate::notifications::{self, NoticeChannel, NoticeContent, NoticeIntent, NoticeKind};
 use crate::state::AppState;
 
 const MAX_TRANSFER_PAGE_SIZE: i64 = 50;
@@ -239,11 +240,11 @@ fn transfer_setup_view(
 }
 
 fn transfer_setup_return_urls(base: &str, transfer_id: &str) -> (String, String) {
-    let app = format!("{}/app", base.trim_end_matches('/'));
+    let cloud = format!("{}/cloud", base.trim_end_matches('/'));
     let encoded = url::form_urlencoded::byte_serialize(transfer_id.as_bytes()).collect::<String>();
     (
-        format!("{app}?billing=transfer_setup&transfer_id={encoded}"),
-        format!("{app}?billing=transfer_setup_cancelled&transfer_id={encoded}"),
+        format!("{cloud}?billing=transfer_setup&transfer_id={encoded}"),
+        format!("{cloud}?billing=transfer_setup_cancelled&transfer_id={encoded}"),
     )
 }
 
@@ -330,6 +331,8 @@ struct TransferView {
     interval: &'static str,
     effective_from: i64,
     quote_expires_at_epoch: i64,
+    consent_expires_at_epoch: i64,
+    personal_payment_setup_needed: bool,
     state: String,
     result_code: Option<&'static str>,
 }
@@ -402,7 +405,33 @@ async fn begin_transfer(
     }
     let outcome = billing_transfers::begin_transfer(&mut tx, &request, now).await?;
     let intent = match outcome {
-        BeginTransfer::Created(intent) | BeginTransfer::AlreadyExists(intent) => intent,
+        BeginTransfer::Created(intent) => {
+            if intent.state == TransferState::AwaitingConsent {
+                notifications::enqueue_in_tx(
+                    &mut tx,
+                    &NoticeIntent {
+                        recipient_user_id: intent.counterparty_user_id.clone(),
+                        event_key: intent.transfer_id.clone(),
+                        policy_key: "payer_transfer_invitation_v1".into(),
+                        kind: NoticeKind::PayerTransferInvitation,
+                        channel: NoticeChannel::InApp,
+                        contact_id: None,
+                        due_at_epoch: now,
+                        content: NoticeContent {
+                            title: "Payer transfer request".into(),
+                            detail: "A payer transfer request is waiting for your review. Open your Cloud account to check whether it is still available.".into(),
+                            effective_at_epoch: Some(intent.effective_from),
+                            deadline_epoch: Some(intent.consent_expires_at_epoch),
+                            amount_pence: Some(intent.offer.expected_amount_pence()),
+                        },
+                    },
+                )
+                .await
+                .map_err(|error| Error::Internal(error.to_string()))?;
+            }
+            intent
+        }
+        BeginTransfer::AlreadyExists(intent) => intent,
     };
     let view = transfer_view(intent, &user.user_id, now);
     tx.commit().await?;
@@ -430,7 +459,8 @@ async fn withdraw_transfer(
 ) -> Result<Json<TransferView>> {
     let now = current_epoch()?;
     let mut tx = state.pool.begin().await?;
-    let intent = billing_transfers::withdraw_transfer(&mut tx, &transfer_id, &user.user_id).await?;
+    let intent =
+        billing_transfers::withdraw_transfer(&mut tx, &transfer_id, &user.user_id, now).await?;
     let view = transfer_view(intent, &user.user_id, now);
     tx.commit().await?;
     Ok(Json(view))
@@ -555,7 +585,7 @@ fn quote_view(request: &TransferRequest) -> TransferQuoteView {
 
 fn transfer_view(intent: TransferIntent, user_id: &str, now: i64) -> TransferView {
     let expired =
-        intent.state == TransferState::AwaitingConsent && intent.quote_expires_at_epoch <= now;
+        intent.state == TransferState::AwaitingConsent && intent.consent_expires_at_epoch <= now;
     let state = if expired {
         "expired"
     } else {
@@ -591,6 +621,10 @@ fn transfer_view(intent: TransferIntent, user_id: &str, now: i64) -> TransferVie
         interval: interval_label(intent.offer),
         effective_from: intent.effective_from,
         quote_expires_at_epoch: intent.quote_expires_at_epoch,
+        consent_expires_at_epoch: intent.consent_expires_at_epoch,
+        personal_payment_setup_needed: intent.destination_kind == TransferPayer::Personal
+            && intent.state == TransferState::Pending
+            && intent.destination_setup_intent_id.is_none(),
         state: state.into(),
         result_code,
     }
@@ -699,8 +733,8 @@ fn current_epoch() -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        quote_id, quote_id_from_intent, transfer_quote_fingerprint, validate_idempotency_key,
-        validate_quote_id,
+        quote_id, quote_id_from_intent, transfer_quote_fingerprint, transfer_setup_return_urls,
+        validate_idempotency_key, validate_quote_id,
     };
     use crate::billing_catalogue::BillingOffer;
     use crate::billing_transfers::{TransferIntent, TransferPayer, TransferRequest, TransferState};
@@ -767,6 +801,20 @@ mod tests {
     }
 
     #[test]
+    fn payment_setup_returns_to_the_no_unlock_cloud_surface() {
+        let (success, cancel) =
+            transfer_setup_return_urls("https://getsotto.co.uk/", "transfer:abc");
+        assert_eq!(
+            success,
+            "https://getsotto.co.uk/cloud?billing=transfer_setup&transfer_id=transfer%3Aabc"
+        );
+        assert_eq!(
+            cancel,
+            "https://getsotto.co.uk/cloud?billing=transfer_setup_cancelled&transfer_id=transfer%3Aabc"
+        );
+    }
+
+    #[test]
     fn historical_intents_keep_their_original_quote_fingerprint() {
         let intent = TransferIntent {
             transfer_id: "transfer:legacy".into(),
@@ -780,6 +828,7 @@ mod tests {
             offer: BillingOffer::StandardMonthly,
             quote_version: 1,
             quote_expires_at_epoch: 2_000,
+            consent_expires_at_epoch: 2_000 + crate::billing_transfers::TRANSFER_CONSENT_SECONDS,
             request_hash: "request-hash".into(),
             idempotency_key: "request".into(),
             provider_idempotency_key: "provider-key".into(),

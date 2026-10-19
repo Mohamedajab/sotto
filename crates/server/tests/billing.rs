@@ -1216,6 +1216,166 @@ async fn personal_paid_checkout_webhook_records_provider_term() {
 }
 
 #[tokio::test]
+async fn personal_invoice_paid_is_not_blocked_by_an_open_transfer_invitation() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let fixture = Uuid::new_v4().simple().to_string();
+    let user_id = format!("billing-transfer-webhook-{fixture}-user");
+    let counterparty_id = format!("billing-transfer-webhook-{fixture}-counterparty");
+    let organization_id = format!("billing-transfer-webhook-{fixture}-org");
+    let transfer_id = format!("transfer:webhook-{fixture}");
+    seed_user(&pool, &user_id).await;
+    seed_user(&pool, &counterparty_id).await;
+    let operation_id =
+        seed_personal_account(&pool, &user_id, &format!("transfer-webhook-{fixture}")).await;
+
+    sqlx::query("INSERT INTO organizations (id, enc_name, created_by) VALUES ($1, decode('6f7267', 'hex'), $2)")
+        .bind(&organization_id)
+        .bind(&counterparty_id)
+        .execute(&pool)
+        .await
+        .expect("insert transfer destination organisation");
+
+    let provider = Arc::new(TestProvider {
+        observation: SubscriptionObservation::Missing,
+        personal_period_end: Some(1_900_000_000),
+    });
+    let app = app_with_provider(pool.clone(), provider);
+    let checkout_event_id = format!("evt_transfer_webhook_checkout_{fixture}");
+    let checkout = serde_json::json!({
+        "id": checkout_event_id,
+        "created": 1_800_000_000,
+        "api_version": STRIPE_API_VERSION,
+        "type": "checkout.session.completed",
+        "data": { "object": {
+            "client_reference_id": format!("personal:{operation_id}"),
+            "payment_status": "paid",
+            "customer": format!("cus_transfer_webhook_{fixture}"),
+            "subscription": format!("sub_transfer_webhook_{fixture}"),
+            "payment_intent": format!("pi_transfer_webhook_{fixture}")
+        }}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(&app, &checkout, Some(&stripe_signature(&checkout))).await,
+        StatusCode::OK
+    );
+
+    sqlx::query(
+        "INSERT INTO billing_transfer_intents \
+         (transfer_id, actor_user_id, counterparty_user_id, beneficiary_id, source_kind, \
+          destination_kind, destination_organization_id, offer, quote_version, \
+          quote_expires_at_epoch, consent_expires_at_epoch, effective_from, idempotency_key, \
+          request_hash, provider_idempotency_key, source_provider_subscription_id, state) \
+         VALUES ($1,$2,$3,$2,'personal','sponsor',$4,'standard_monthly',1, \
+                 1900000000,2000000000,2000000000,$1,$1,$1,$5,'awaiting_consent')",
+    )
+    .bind(&transfer_id)
+    .bind(&user_id)
+    .bind(&counterparty_id)
+    .bind(&organization_id)
+    .bind(format!("sub_transfer_webhook_{fixture}"))
+    .execute(&pool)
+    .await
+    .expect("insert open transfer invitation");
+
+    let invoice_event_id = format!("evt_transfer_webhook_invoice_{fixture}");
+    let invoice = serde_json::json!({
+        "id": invoice_event_id,
+        "created": 1_800_000_001,
+        "api_version": STRIPE_API_VERSION,
+        "type": "invoice.paid",
+        "data": { "object": {
+            "id": format!("in_transfer_webhook_{fixture}"),
+            "payment_intent": format!("pi_transfer_webhook_renewal_{fixture}"),
+            "period_end": 1_950_000_000,
+            "lines": { "data": [{
+                "parent": {
+                    "type": "subscription_item_details",
+                    "subscription_item_details": {
+                        "subscription": format!("sub_transfer_webhook_{fixture}")
+                    }
+                },
+                "period": { "end": 2_000_000_000 }
+            }]},
+            "parent": {
+                "type": "subscription_details",
+                "subscription_details": {
+                    "subscription": format!("sub_transfer_webhook_{fixture}")
+                }
+            }
+        }}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(&app, &invoice, Some(&stripe_signature(&invoice))).await,
+        StatusCode::OK,
+        "an invitation must not make the paid invoice retry or roll back"
+    );
+    let (paid_through, processed): (i64, bool) = sqlx::query_as(
+        "SELECT account.paid_through_epoch, event.processed_at IS NOT NULL \
+         FROM billing_personal_accounts AS account \
+         JOIN stripe_webhook_events AS event ON event.event_id = $2 \
+         WHERE account.user_id = $1",
+    )
+    .bind(&user_id)
+    .bind(&invoice_event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load paid invoice and webhook receipt");
+    assert_eq!(paid_through, 2_000_000_000);
+    assert!(processed);
+
+    let event_ids = vec![checkout_event_id, invoice_event_id];
+    sqlx::query("DELETE FROM stripe_subscription_watermarks WHERE event_id = ANY($1)")
+        .bind(&event_ids)
+        .execute(&pool)
+        .await
+        .expect("clean webhook watermarks");
+    sqlx::query("DELETE FROM stripe_webhook_events WHERE event_id = ANY($1)")
+        .bind(&event_ids)
+        .execute(&pool)
+        .await
+        .expect("clean webhook receipts");
+    sqlx::query("DELETE FROM billing_transfer_intents WHERE transfer_id = $1")
+        .bind(&transfer_id)
+        .execute(&pool)
+        .await
+        .expect("clean transfer invitation");
+    sqlx::query("DELETE FROM billing_personal_accounts WHERE user_id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("clean personal account");
+    sqlx::query("DELETE FROM billing_personal_events WHERE user_id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("clean personal billing events");
+    sqlx::query("DELETE FROM billing_operations WHERE actor_user_id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("clean billing operation");
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(&organization_id)
+        .execute(&pool)
+        .await
+        .expect("clean destination organisation");
+    sqlx::query("DELETE FROM sessions WHERE user_id = ANY($1)")
+        .bind(vec![user_id.clone(), counterparty_id.clone()])
+        .execute(&pool)
+        .await
+        .expect("clean test sessions");
+    sqlx::query("DELETE FROM users WHERE id = ANY($1)")
+        .bind(vec![user_id, counterparty_id])
+        .execute(&pool)
+        .await
+        .expect("clean test users");
+}
+
+#[tokio::test]
 async fn personal_invoice_first_delivery_waits_for_checkout_binding_then_queues_coverage() {
     let Some(pool) = one_connection_pool_or_skip().await else {
         return;

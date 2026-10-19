@@ -45,6 +45,7 @@ pub enum NoticeKind {
     ExportDeadline,
     ImpendingPurge,
     SponsorshipChange,
+    PayerTransferInvitation,
     FoundingExpiry,
     PriceChange,
 }
@@ -58,6 +59,7 @@ impl NoticeKind {
             Self::ExportDeadline => "export_deadline",
             Self::ImpendingPurge => "impending_purge",
             Self::SponsorshipChange => "sponsorship_change",
+            Self::PayerTransferInvitation => "payer_transfer_invitation",
             Self::FoundingExpiry => "founding_expiry",
             Self::PriceChange => "price_change",
         }
@@ -621,6 +623,10 @@ mod tests {
     #[test]
     fn kind_and_channel_names_are_stable() {
         assert_eq!(NoticeKind::PriceChange.as_str(), "price_change");
+        assert_eq!(
+            NoticeKind::PayerTransferInvitation.as_str(),
+            "payer_transfer_invitation"
+        );
         assert_eq!(NoticeChannel::InApp.as_str(), "in_app");
         assert_eq!(NoticeChannel::Email.as_str(), "email");
     }
