@@ -423,6 +423,7 @@ async fn begin_transfer(
                             effective_at_epoch: Some(intent.effective_from),
                             deadline_epoch: Some(intent.consent_expires_at_epoch),
                             amount_pence: Some(intent.offer.expected_amount_pence()),
+                            price_interval: None,
                         },
                     },
                 )

@@ -158,6 +158,7 @@ fn content() -> NoticeContent {
         effective_at_epoch: Some(1_800_000_000),
         deadline_epoch: Some(1_800_100_000),
         amount_pence: Some(299),
+        price_interval: None,
     }
 }
 

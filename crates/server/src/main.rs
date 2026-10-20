@@ -286,6 +286,9 @@ async fn run() -> Result<()> {
             })?;
         sotto_server::founding_schedule_worker::spawn(pool.clone(), provider, catalogue);
     }
+    if config.founding_price_notices_enabled {
+        sotto_server::founding_price_notices::spawn(pool.clone());
+    }
     if config.billing_transfer_execution_enabled {
         let provider = worker_provider.as_ref().ok_or_else(|| {
             Error::Config("payer transfer execution requires Stripe billing".into())

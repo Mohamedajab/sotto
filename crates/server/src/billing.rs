@@ -8202,6 +8202,7 @@ async fn record_personal_renewal_failure_notice(pool: &PgPool, event: &Event) ->
                     effective_at_epoch: Some(paid_through),
                     deadline_epoch: Some(deadline),
                     amount_pence: None,
+                    price_interval: None,
                 },
             };
             crate::notifications::enqueue_in_tx(&mut tx, &intent)
@@ -8313,6 +8314,7 @@ async fn enqueue_personal_renewal_recovered_notice(
             effective_at_epoch: (event_created > 0).then_some(event_created),
             deadline_epoch: None,
             amount_pence: None,
+            price_interval: None,
         },
     };
     crate::notifications::enqueue_in_tx(tx, &intent)
@@ -8351,6 +8353,7 @@ async fn enqueue_sponsored_renewal_failure_notices(
                 effective_at_epoch: Some(period_start),
                 deadline_epoch: Some(deadline),
                 amount_pence: None,
+                price_interval: None,
             },
         };
         crate::notifications::enqueue_in_tx(tx, &intent)
@@ -8390,6 +8393,7 @@ async fn enqueue_sponsored_renewal_failure_notices(
                 effective_at_epoch: Some(period_start),
                 deadline_epoch: Some(deadline),
                 amount_pence: None,
+                price_interval: None,
             },
         };
         crate::notifications::enqueue_in_tx(tx, &intent)
@@ -8483,6 +8487,7 @@ async fn resolve_sponsored_renewal_failures(
                 effective_at_epoch: Some(event_created.max(0)),
                 deadline_epoch: None,
                 amount_pence: None,
+                price_interval: None,
             },
         };
         crate::notifications::enqueue_in_tx(tx, &intent)

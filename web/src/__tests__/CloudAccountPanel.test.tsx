@@ -119,6 +119,29 @@ describe("CloudAccountPanel", () => {
     expect(api.createPersonalCheckout).not.toHaveBeenCalled();
   });
 
+  it("shows the verified founding price and interval to the payer without vault unlock", async () => {
+    const effectiveAtEpoch = 1_900_000_000;
+    vi.mocked(api.fetchEligibility).mockResolvedValue({
+      ...base, state: "paid", payer: "personal",
+    });
+    vi.mocked(api.fetchCloudNotices).mockResolvedValue([{
+      noticeId: "notice-price-change", kind: "price_change", channel: "in_app",
+      content: {
+        title: "Your founding price is changing",
+        detail: "Your founding price ends on the date shown. Your next renewal will use the standard monthly price shown.",
+        effectiveAtEpoch, deadlineEpoch: null, amountPence: 299, priceInterval: "month",
+      },
+      dueAtEpoch: effectiveAtEpoch - 60 * 24 * 60 * 60, status: "pending",
+      lastErrorCode: null, deliveredAtEpoch: null, createdAtEpoch: effectiveAtEpoch,
+    }]);
+    render(<CloudAccountPanel />);
+
+    expect(await screen.findByRole("heading", { name: "Account notices" })).toBeInTheDocument();
+    expect(screen.getByText("Your founding price is changing")).toBeInTheDocument();
+    expect(screen.getByText(`From ${new Date(effectiveAtEpoch * 1000).toLocaleDateString("en-GB")}, your price will be £2.99 per month.`)).toBeInTheDocument();
+    expect(api.fetchCloudNotices).toHaveBeenCalledOnce();
+  });
+
   it.each(["success", "failure"] as const)(
     "ignores a stale quote %s after changing the selected term",
     async (outcome) => {

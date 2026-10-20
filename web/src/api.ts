@@ -172,6 +172,7 @@ export interface CloudNotice {
     effectiveAtEpoch: number | null;
     deadlineEpoch: number | null;
     amountPence: number | null;
+    priceInterval?: string | null;
   };
   dueAtEpoch: number;
   status: string;
@@ -405,6 +406,7 @@ export async function fetchCloudNotices(): Promise<CloudNotice[]> {
       effective_at_epoch: number | null;
       deadline_epoch: number | null;
       amount_pence: number | null;
+      price_interval?: string | null;
     };
     due_at_epoch: number;
     status: string;
@@ -424,6 +426,7 @@ export async function fetchCloudNotices(): Promise<CloudNotice[]> {
       effectiveAtEpoch: notice.content.effective_at_epoch,
       deadlineEpoch: notice.content.deadline_epoch,
       amountPence: notice.content.amount_pence,
+      priceInterval: notice.content.price_interval ?? null,
     },
     dueAtEpoch: notice.due_at_epoch,
     status: notice.status,

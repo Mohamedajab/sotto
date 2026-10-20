@@ -56,6 +56,7 @@ pub mod cloud_provider_stripe_corrections;
 #[doc(hidden)]
 pub mod cloud_provider_stripe_coverage;
 pub mod founding_allocator;
+pub mod founding_price_notices;
 pub mod founding_schedule;
 pub mod founding_schedule_worker;
 // Dormant Stripe history transport; it remains unwired until the complete-history contract lands.
@@ -172,6 +173,11 @@ pub fn app(state: AppState) -> Router {
         .merge(billing_transfers)
         .merge(billing_transfer_setup)
         .merge(billing_transfer_ops)
+        .merge(if state.billing_transfer_operator_token.is_some() {
+            founding_price_notices::operator_router()
+        } else {
+            Router::new()
+        })
         .merge(machine::router())
         .merge(notifications::router())
         .merge(sync::router())

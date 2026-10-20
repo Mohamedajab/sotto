@@ -100,6 +100,8 @@ pub struct NoticeContent {
     pub effective_at_epoch: Option<i64>,
     pub deadline_epoch: Option<i64>,
     pub amount_pence: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_interval: Option<String>,
 }
 
 impl NoticeContent {
@@ -109,6 +111,15 @@ impl NoticeContent {
         if self.amount_pence.is_some_and(|amount| amount < 0) {
             return Err(NoticeError::InvalidContent(
                 "amount_pence must not be negative",
+            ));
+        }
+        if self
+            .price_interval
+            .as_deref()
+            .is_some_and(|interval| !matches!(interval, "month" | "year"))
+        {
+            return Err(NoticeError::InvalidContent(
+                "price_interval must be month or year",
             ));
         }
         Ok(())
@@ -380,6 +391,7 @@ pub async fn reconcile_export_deadline_notice(
                 effective_at_epoch: Some(effective_at),
                 deadline_epoch: Some(deadline),
                 amount_pence: None,
+                price_interval: None,
             },
         })
     } else {
@@ -496,6 +508,36 @@ pub async fn list_for_user(pool: &PgPool, user_id: &str) -> NoticeResult<Vec<Not
                 extract(epoch from created_at)::bigint AS created_at \
          FROM cloud_notice_outbox \
          WHERE recipient_user_id=$1 AND status <> 'cancelled' AND due_at <= now() \
+           AND (kind <> 'price_change' OR EXISTS ( \
+             SELECT 1 FROM billing_founding_price_notice_state AS notice_state \
+             JOIN billing_founding_awards AS award ON award.award_id = notice_state.award_id \
+             JOIN billing_founding_schedule_jobs AS schedule ON schedule.award_id = award.award_id \
+             WHERE notice_state.outcome='queued' \
+               AND notice_state.schedule_version=schedule.version \
+               AND schedule.state='scheduled' \
+               AND notice_state.payer_kind=award.payer_kind \
+               AND notice_state.payer_id=award.payer_id \
+               AND cloud_notice_outbox.event_key = \
+                 'founding-price-change:' || award.award_id || ':' || notice_state.transition_epoch::text \
+               AND ((award.payer_kind='personal' AND award.payer_id=$1 AND EXISTS ( \
+                    SELECT 1 FROM billing_personal_accounts account \
+                    WHERE account.user_id=$1 AND account.state IN ('active','past_due') \
+                      AND NOT account.cancel_at_period_end AND account.cancellation_requested_at IS NULL \
+                      AND account.stripe_subscription_id=schedule.provider_subscription_id)) \
+                 OR (award.payer_kind='sponsor' AND EXISTS ( \
+                    SELECT 1 FROM organization_memberships membership \
+                    JOIN organizations org ON org.id=membership.org_id \
+                    JOIN billing_sponsored_subscriptions sub ON sub.organization_id=org.id \
+                    JOIN billing_sponsored_seats seat ON seat.organization_id=org.id \
+                      AND seat.beneficiary_id=award.beneficiary_id \
+                    WHERE membership.user_id=$1 AND membership.org_id=award.payer_id \
+                      AND membership.role IN ('owner','admin') AND org.lifecycle_state='active' \
+                      AND sub.status IN ('active','past_due') \
+                      AND sub.provider_subscription_id=schedule.provider_subscription_id \
+                      AND seat.state IN ('active','scheduled_removal') \
+                      AND seat.effective_from <= notice_state.transition_epoch \
+                      AND (seat.effective_until IS NULL OR seat.effective_until > notice_state.transition_epoch)))) \
+           )) \
          ORDER BY created_at DESC, notice_id DESC LIMIT $2",
     )
     .bind(user_id)
@@ -730,6 +772,7 @@ mod tests {
             effective_at_epoch: Some(1_800_000_000),
             deadline_epoch: Some(1_800_100_000),
             amount_pence: Some(299),
+            price_interval: None,
         }
     }
 
@@ -749,6 +792,17 @@ mod tests {
                 "amount_pence must not be negative"
             ))
         ));
+    }
+
+    #[test]
+    fn absent_price_interval_keeps_legacy_notice_payload_shape() {
+        let value = serde_json::to_value(content()).expect("serialise legacy notice content");
+        assert!(value.get("price_interval").is_none());
+
+        let mut price_change = content();
+        price_change.price_interval = Some("year".into());
+        let value = serde_json::to_value(price_change).expect("serialise price change content");
+        assert_eq!(value["price_interval"], "year");
     }
 
     #[test]

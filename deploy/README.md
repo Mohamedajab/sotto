@@ -70,6 +70,10 @@ interval-change protection, safe Customer Portal configuration, and complete sch
 flow have passed a Stripe test-mode rehearsal. The worker requires
 `STRIPE_CLOUD_PORTAL_CONFIGURATION_ID` even when new sales are off. Set the preflight value to `1`
 only after recording that evidence. The worker switch does not enable Cloud sales by itself.
+Founding price-change notices have their own default-off `SOTTO_FOUNDING_PRICE_NOTICES_ENABLED`
+switch. It requires Cloud mode, the founding schedule worker, the hosted catalogue, and the
+protected billing operator token so late or unresolved notice cohorts can be reviewed. It creates
+only in-app notices after a schedule has been verified; it does not send email or change billing.
 
 Create a dedicated Stripe Customer Portal configuration for Cloud and set its id in
 `STRIPE_CLOUD_PORTAL_CONFIGURATION_ID`. Enable payment-method updates and period-end cancellation

@@ -65,6 +65,7 @@ const CLOUD_ACTION_ENFORCEMENT_ENV: &str = "SOTTO_CLOUD_ACTION_ENFORCEMENT";
 const MACHINE_ELIGIBILITY_ENFORCEMENT_ENV: &str = "SOTTO_MACHINE_ELIGIBILITY_ENFORCEMENT";
 const CLOUD_SALES_ENV: &str = "SOTTO_CLOUD_SALES_ENABLED";
 const FOUNDING_SCHEDULE_WORKER_ENV: &str = "SOTTO_FOUNDING_SCHEDULE_WORKER_ENABLED";
+const FOUNDING_PRICE_NOTICES_ENV: &str = "SOTTO_FOUNDING_PRICE_NOTICES_ENABLED";
 const FOUNDING_SCHEDULE_PREFLIGHT_ENV: &str = "SOTTO_FOUNDING_SCHEDULE_PREFLIGHT_VERIFIED";
 const BILLING_TRANSFERS_ENV: &str = "SOTTO_BILLING_TRANSFERS_ENABLED";
 const BILLING_TRANSFER_EXECUTION_ENV: &str = "SOTTO_BILLING_TRANSFER_EXECUTION_ENABLED";
@@ -110,6 +111,8 @@ pub struct Config {
     pub cloud_sales_enabled: bool,
     /// Whether verified founding awards may be scheduled to transition to standard Stripe prices.
     pub founding_schedule_worker_enabled: bool,
+    /// Whether verified founding-price transitions produce payer notices. Defaults off.
+    pub founding_price_notices_enabled: bool,
     /// Whether authenticated payer-transfer API routes are registered. Defaults off until
     /// provider execution and recovery are ready.
     pub billing_transfers_enabled: bool,
@@ -208,6 +211,8 @@ impl Config {
             feature_flag_is_enabled(std::env::var(CLOUD_SALES_ENV).ok().as_deref());
         let founding_schedule_worker_enabled =
             feature_flag_is_enabled(std::env::var(FOUNDING_SCHEDULE_WORKER_ENV).ok().as_deref());
+        let founding_price_notices_enabled =
+            feature_flag_is_enabled(std::env::var(FOUNDING_PRICE_NOTICES_ENV).ok().as_deref());
         let billing_transfers_enabled =
             feature_flag_is_enabled(std::env::var(BILLING_TRANSFERS_ENV).ok().as_deref());
         let billing_transfer_execution_enabled = feature_flag_is_enabled(
@@ -298,6 +303,13 @@ impl Config {
             founding_schedule_worker_enabled,
             founding_schedule_preflight_verified,
             billing.as_ref(),
+        )?;
+        validate_founding_price_notices_configuration(
+            founding_price_notices_enabled,
+            founding_schedule_worker_enabled,
+            deployment_mode,
+            billing.as_ref(),
+            billing_transfer_operator_token.as_deref(),
         )?;
         if hosted_catalogue_configured && billing.is_none() {
             // The hosted catalogue is dormant until the hosted billing route lands. Keep one
@@ -396,6 +408,7 @@ impl Config {
             machine_eligibility_enforcement_enabled,
             cloud_sales_enabled,
             founding_schedule_worker_enabled,
+            founding_price_notices_enabled,
             billing_transfers_enabled,
             billing_transfer_execution_enabled,
             billing_transfer_setup_enabled,
@@ -427,6 +440,37 @@ fn validate_founding_schedule_worker_configuration(
     if billing.cloud_portal_configuration_id.is_none() {
         return Err(Error::Config(
             "founding schedule worker requires STRIPE_CLOUD_PORTAL_CONFIGURATION_ID".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_founding_price_notices_configuration(
+    enabled: bool,
+    schedule_worker_enabled: bool,
+    deployment_mode: DeploymentMode,
+    billing: Option<&BillingConfig>,
+    operator_token: Option<&str>,
+) -> Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+    if deployment_mode != DeploymentMode::Cloud || !schedule_worker_enabled {
+        return Err(Error::Config(
+            "founding price notices require Cloud mode and the founding schedule worker".into(),
+        ));
+    }
+    if billing
+        .and_then(|billing| billing.price_catalogue.as_ref())
+        .is_none()
+    {
+        return Err(Error::Config(
+            "founding price notices require the hosted Stripe price catalogue".into(),
+        ));
+    }
+    if operator_token.is_none() {
+        return Err(Error::Config(
+            "founding price notices require SOTTO_BILLING_TRANSFER_OPERATOR_TOKEN for the review summary".into(),
         ));
     }
     Ok(())
@@ -723,6 +767,7 @@ mod tests {
         telemetry_ping_enabled, validate_billing_transfer_execution_configuration,
         validate_billing_transfer_operator_configuration, validate_billing_transfers_configuration,
         validate_cloud_sales_configuration, validate_deployment_billing_boundary,
+        validate_founding_price_notices_configuration,
         validate_founding_schedule_worker_configuration, validate_provider_refresh_configuration,
         BillingConfig, BillingPriceIds, DeploymentMode,
         DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS, MAX_ORGANISATION_DELETION_RETENTION_DAYS,
@@ -1031,6 +1076,56 @@ mod tests {
         assert!(
             validate_founding_schedule_worker_configuration(true, true, Some(&complete)).is_ok()
         );
+    }
+
+    #[test]
+    fn founding_price_notices_are_opt_in_and_require_verified_schedule_operations() {
+        assert!(validate_founding_price_notices_configuration(
+            false,
+            false,
+            DeploymentMode::SelfHosted,
+            None,
+            None
+        )
+        .is_ok());
+        assert!(validate_founding_price_notices_configuration(
+            true,
+            false,
+            DeploymentMode::Cloud,
+            None,
+            Some("operator")
+        )
+        .is_err());
+        let billing = BillingConfig {
+            api_key: "rk_test_secret".into(),
+            webhook_secret: "whsec_test".into(),
+            price_id: "price_legacy".into(),
+            price_catalogue: Some(BillingPriceIds {
+                standard_monthly: "price_standard_month".into(),
+                standard_annual: "price_standard_year".into(),
+                founding_monthly: "price_founding_month".into(),
+                founding_annual: "price_founding_year".into(),
+            }),
+            cloud_portal_configuration_id: Some("bpc_test".into()),
+            cloud_sales_enabled: false,
+            return_url: "https://app.example.test".into(),
+        };
+        assert!(validate_founding_price_notices_configuration(
+            true,
+            true,
+            DeploymentMode::Cloud,
+            Some(&billing),
+            None
+        )
+        .is_err());
+        assert!(validate_founding_price_notices_configuration(
+            true,
+            true,
+            DeploymentMode::Cloud,
+            Some(&billing),
+            Some("operator")
+        )
+        .is_ok());
     }
 
     #[test]
