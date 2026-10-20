@@ -11,6 +11,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::billing_catalogue::BillingOffer;
+use crate::billing_transfers;
 use crate::error::Error;
 use crate::org;
 
@@ -288,6 +289,8 @@ pub enum SponsoredBillingError {
     FoundingAllocator(#[from] crate::founding_allocator::FoundingAllocatorError),
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
+    #[error("payer transfer error: {0}")]
+    Transfer(#[from] billing_transfers::TransferError),
 }
 
 impl From<SponsoredBillingError> for Error {
@@ -309,6 +312,12 @@ impl From<SponsoredBillingError> for Error {
             SponsoredBillingError::BeneficiaryAlreadyCovered => {
                 Self::Conflict("beneficiary already has sponsored coverage".into())
             }
+            SponsoredBillingError::Transfer(
+                billing_transfers::TransferError::AlreadyInProgress,
+            ) => Self::Conflict(
+                "a payer transfer is already in progress for this beneficiary".into(),
+            ),
+            SponsoredBillingError::Transfer(error) => Self::from(error),
             SponsoredBillingError::SeatMissing => Self::NotFound("sponsored seat not found".into()),
             SponsoredBillingError::IdempotencyConflict => Self::Conflict(
                 "sponsored idempotency key conflicts with a different request".into(),
@@ -418,6 +427,12 @@ pub async fn begin_operation(
     now_epoch: i64,
 ) -> Result<SponsoredOperation, SponsoredBillingError> {
     request.validate_identity()?;
+    let mut transfer_beneficiaries = vec![request.beneficiary_id.as_str()];
+    if let Some(replacement) = request.replacement_beneficiary_id.as_deref() {
+        transfer_beneficiaries.push(replacement);
+    }
+    billing_transfers::lock_and_check_no_live_transfer(tx, &transfer_beneficiaries, now_epoch)
+        .await?;
     let access = org::access_for_update(tx, organization_id, actor_user_id)
         .await
         .map_err(|_| SponsoredBillingError::Unauthorised)?;
@@ -588,6 +603,7 @@ pub async fn record_checkout(
     .bind(operation_id)
     .execute(&mut **tx)
     .await?;
+    retire_founding_notice_for_pending_removal(tx, operation_id).await?;
     load_operation(tx, operation_id).await
 }
 
@@ -600,6 +616,7 @@ pub async fn record_provider_update(
     current_period_end: Option<i64>,
     provider_item_id: Option<&str>,
 ) -> Result<SponsoredOperation, SponsoredBillingError> {
+    lock_operation_beneficiaries(tx, operation_id).await?;
     let updated = sqlx::query(
         "UPDATE billing_sponsored_operations SET state = 'provider_pending', \
          provider_customer_id = $2, provider_subscription_id = $3, provider_item_id = $4, updated_at = now() \
@@ -657,6 +674,7 @@ pub async fn record_provider_update(
     .bind(current_period_end)
     .execute(&mut **tx)
     .await?;
+    retire_founding_notice_for_pending_removal(tx, operation_id).await?;
     sqlx::query(
         "UPDATE billing_sponsored_seats SET effective_from = GREATEST(\
              effective_from, COALESCE($2, 0)\
@@ -668,6 +686,41 @@ pub async fn record_provider_update(
     .execute(&mut **tx)
     .await?;
     load_operation(tx, operation_id).await
+}
+
+async fn retire_founding_notice_for_pending_removal(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "WITH retiring AS ( \
+             SELECT award.award_id, notice.transition_epoch \
+             FROM billing_sponsored_operations operation \
+             JOIN billing_sponsored_seats seat ON seat.operation_id <> operation.operation_id \
+               AND seat.organization_id=operation.organization_id \
+               AND seat.beneficiary_id=operation.beneficiary_id \
+             JOIN billing_founding_awards award ON award.beneficiary_id=seat.beneficiary_id \
+               AND award.payer_kind='sponsor' AND award.payer_id=seat.organization_id \
+             JOIN billing_founding_price_notice_state notice ON notice.award_id=award.award_id \
+             WHERE operation.operation_id=$1 AND operation.action IN ('remove','replace') \
+               AND seat.effective_until IS NOT NULL AND seat.effective_until <= notice.transition_epoch \
+               AND notice.outcome <> 'retired' \
+         ), retired AS ( \
+             UPDATE billing_founding_price_notice_state notice SET outcome='retired', \
+               reason_code='subscription_ending', updated_at=now() \
+             FROM retiring WHERE notice.award_id=retiring.award_id \
+             RETURNING notice.award_id, notice.transition_epoch \
+         ) \
+         UPDATE cloud_notice_outbox outbox SET status='cancelled', cancelled_at=now(), updated_at=now() \
+         FROM retired WHERE outbox.event_key = \
+           'founding-price-change:' || retired.award_id || ':' || retired.transition_epoch::text \
+           AND outbox.kind='price_change' AND outbox.policy_key='founding-standard-price-v1' \
+           AND outbox.status IN ('pending','leased')",
+    )
+    .bind(operation_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 pub async fn record_provider_item(
@@ -714,6 +767,7 @@ pub async fn complete_paid_checkout(
     operation_id: &str,
     evidence: &SponsoredProviderEvidence,
 ) -> Result<SponsoredOperation, SponsoredBillingError> {
+    lock_operation_beneficiaries(tx, operation_id).await?;
     let organization_id: String = sqlx::query_scalar(
         "SELECT organization_id FROM billing_sponsored_operations WHERE operation_id = $1",
     )
@@ -777,6 +831,47 @@ pub async fn complete_paid_checkout(
     .execute(&mut **tx)
     .await?;
     load_operation(tx, operation_id).await
+}
+
+async fn lock_operation_beneficiaries(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+) -> Result<(), SponsoredBillingError> {
+    let beneficiaries: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT beneficiary_id, replacement_beneficiary_id \
+         FROM billing_sponsored_operations WHERE operation_id = $1",
+    )
+    .bind(operation_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((beneficiary_id, replacement_beneficiary_id)) = beneficiaries else {
+        return Ok(());
+    };
+    let mut ids = vec![beneficiary_id];
+    ids.extend(replacement_beneficiary_id);
+    let references = ids.iter().map(String::as_str).collect::<Vec<_>>();
+    let transfer_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT transfer_id FROM billing_transfer_intents \
+         WHERE destination_operation_id = $1 AND destination_kind = 'sponsor' \
+           AND state IN ('pending','destination_prepared','destination_paid', \
+                         'source_adjustment_pending','source_restoration_pending','unknown') \
+         UNION \
+         SELECT transfer_id FROM billing_transfer_intents \
+         WHERE transfer_id || ':destination:source' = $1 AND source_kind = 'sponsor' \
+           AND state IN ('pending','destination_prepared','destination_paid', \
+                         'source_adjustment_pending','source_restoration_pending','unknown')",
+    )
+    .bind(operation_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    billing_transfers::lock_and_check_no_live_transfer_except(
+        tx,
+        &references,
+        &transfer_ids,
+        current_epoch(),
+    )
+    .await?;
+    Ok(())
 }
 
 /// Preserve paid evidence when a founding place can no longer be awarded.

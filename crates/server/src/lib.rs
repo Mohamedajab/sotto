@@ -28,6 +28,12 @@ pub mod billing_operations;
 #[doc(hidden)]
 pub mod billing_refunds;
 #[doc(hidden)]
+pub mod billing_transfer_api;
+#[doc(hidden)]
+pub mod billing_transfer_ops;
+#[doc(hidden)]
+pub mod billing_transfer_worker;
+#[doc(hidden)]
 pub mod billing_transfers;
 #[doc(hidden)]
 pub mod cloud_action_policy;
@@ -50,6 +56,7 @@ pub mod cloud_provider_stripe_corrections;
 #[doc(hidden)]
 pub mod cloud_provider_stripe_coverage;
 pub mod founding_allocator;
+pub mod founding_price_notices;
 pub mod founding_schedule;
 pub mod founding_schedule_worker;
 // Dormant Stripe history transport; it remains unwired until the complete-history contract lands.
@@ -138,6 +145,21 @@ pub fn app(state: AppState) -> Router {
     } else {
         Router::new()
     };
+    let billing_transfers = if state.billing_transfers_enabled {
+        billing_transfer_api::router()
+    } else {
+        Router::new()
+    };
+    let billing_transfer_setup = if state.billing_transfer_setup_enabled {
+        billing_transfer_api::setup_router()
+    } else {
+        Router::new()
+    };
+    let billing_transfer_ops = if state.billing_transfer_operator_token.is_some() {
+        billing_transfer_ops::router()
+    } else {
+        Router::new()
+    };
     Router::new()
         .merge(health::router())
         .merge(auth::router())
@@ -148,6 +170,14 @@ pub fn app(state: AppState) -> Router {
         .merge(person_eligibility::router())
         .merge(org::router())
         .merge(billing::router())
+        .merge(billing_transfers)
+        .merge(billing_transfer_setup)
+        .merge(billing_transfer_ops)
+        .merge(if state.billing_transfer_operator_token.is_some() {
+            founding_price_notices::operator_router()
+        } else {
+            Router::new()
+        })
         .merge(machine::router())
         .merge(notifications::router())
         .merge(sync::router())
