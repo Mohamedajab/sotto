@@ -155,7 +155,13 @@ pub async fn mark_scheduled(
         "UPDATE billing_founding_schedule_jobs SET state = 'scheduled', provider_schedule_id = $3, \
            last_error_code = NULL, lease_token = NULL, lease_until = NULL, \
            next_attempt_at = now(), updated_at = now() \
-         WHERE job_id = $1 AND lease_token = $2 AND state IN ('pending', 'unresolved')",
+         WHERE job_id = $1 AND lease_token = $2 AND state IN ('pending', 'unresolved') \
+           AND NOT (payer_kind = 'personal' AND EXISTS ( \
+             SELECT 1 FROM billing_personal_accounts AS account \
+             WHERE account.user_id = billing_founding_schedule_jobs.beneficiary_id \
+               AND account.stripe_subscription_id = billing_founding_schedule_jobs.provider_subscription_id \
+               AND (account.cancel_at_period_end OR account.cancellation_requested_at IS NOT NULL) \
+           ))",
     )
     .bind(&job.job_id)
     .bind(&job.lease_token)
@@ -204,6 +210,107 @@ pub async fn mark_not_required(
     .await?
     .rows_affected();
     Ok(changed == 1)
+}
+
+/// Persist a cancellation request before contacting Stripe and make any founding transition
+/// work retryable. The worker checks this marker before and after updating a schedule, closing the
+/// race where a schedule update started just before the customer requested cancellation.
+pub async fn request_personal_cancellation(
+    tx: &mut Transaction<'_, Postgres>,
+    beneficiary_id: &str,
+    subscription_id: &str,
+) -> Result<(), sqlx::Error> {
+    let updated = sqlx::query(
+        "UPDATE billing_personal_accounts SET cancellation_requested_at = \
+           COALESCE(cancellation_requested_at, now()), updated_at = now() \
+         WHERE user_id = $1 AND stripe_subscription_id = $2",
+    )
+    .bind(beneficiary_id)
+    .bind(subscription_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    if updated != 1 {
+        return Err(sqlx::Error::RowNotFound);
+    }
+
+    sqlx::query(
+        "UPDATE billing_founding_schedule_jobs SET \
+           state = CASE WHEN lease_token IS NULL THEN 'pending' ELSE state END, \
+           provider_schedule_id = CASE WHEN lease_token IS NULL THEN NULL ELSE provider_schedule_id END, \
+           last_error_code = CASE WHEN lease_token IS NULL THEN NULL ELSE last_error_code END, \
+           next_attempt_at = CASE WHEN lease_token IS NULL THEN now() ELSE next_attempt_at END, \
+           updated_at = now() \
+         WHERE beneficiary_id = $1 AND payer_kind = 'personal' \
+           AND provider_subscription_id = $2 AND state <> 'not_required'",
+    )
+    .bind(beneficiary_id)
+    .bind(subscription_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Record that Stripe has accepted the end-of-period cancellation. A retrying worker may call
+/// this after the HTTP request has already completed, so both updates are idempotent.
+pub async fn record_personal_cancellation(
+    pool: &PgPool,
+    beneficiary_id: &str,
+    subscription_id: &str,
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let updated = sqlx::query(
+        "UPDATE billing_personal_accounts SET cancel_at_period_end = TRUE, \
+           cancellation_requested_at = COALESCE(cancellation_requested_at, now()), \
+           updated_at = now() WHERE user_id = $1 AND stripe_subscription_id = $2",
+    )
+    .bind(beneficiary_id)
+    .bind(subscription_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if updated != 1 {
+        return Err(sqlx::Error::RowNotFound);
+    }
+    sqlx::query(
+        "UPDATE billing_founding_schedule_jobs SET \
+           state = CASE WHEN lease_token IS NULL THEN 'not_required' ELSE state END, \
+           last_error_code = CASE WHEN lease_token IS NULL \
+             THEN 'subscription_terminates_before_transition' ELSE last_error_code END, \
+           updated_at = now(), next_attempt_at = now() \
+         WHERE beneficiary_id = $1 AND payer_kind = 'personal' \
+           AND provider_subscription_id = $2 AND state <> 'not_required'",
+    )
+    .bind(beneficiary_id)
+    .bind(subscription_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await
+}
+
+/// Requeue the founding transition when Stripe confirms that a scheduled cancellation was lifted.
+/// A fresh provider idempotency key is required because the prior schedule update may have been
+/// cached with `end_behavior=cancel`.
+pub async fn resume_personal_transition(
+    tx: &mut Transaction<'_, Postgres>,
+    beneficiary_id: &str,
+    subscription_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE billing_founding_schedule_jobs SET state = 'pending', \
+           provider_schedule_id = NULL, last_error_code = NULL, next_attempt_at = now(), \
+           version = version + 1, provider_idempotency_key = \
+             'founding-transition:' || award_id || ':' || (version + 1)::text, \
+           updated_at = now() \
+         WHERE beneficiary_id = $1 AND payer_kind = 'personal' \
+           AND provider_subscription_id = $2 AND state IN ('not_required', 'scheduled') \
+           AND lease_token IS NULL",
+    )
+    .bind(beneficiary_id)
+    .bind(subscription_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 fn provider_error_code(error: &ProviderError) -> &'static str {

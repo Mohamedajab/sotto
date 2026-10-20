@@ -9,15 +9,26 @@ import { CloudAccountPanel } from "../CloudAccountPanel";
 
 vi.mock("../api", () => ({
   cancelPersonalBilling: vi.fn(),
+  acceptPayerTransfer: vi.fn(),
+  beginPayerTransfer: vi.fn(),
+  createPayerTransferPaymentSetup: vi.fn(),
   createPersonalCheckout: vi.fn(),
   createPersonalPortal: vi.fn(),
   fetchCloudExportChunk: vi.fn(),
   fetchCloudNotices: vi.fn(),
+  fetchPayerTransferCapabilities: vi.fn(),
+  fetchPayerTransfer: vi.fn(),
+  fetchPayerTransfers: vi.fn(),
+  fetchMembers: vi.fn(),
+  fetchOrgs: vi.fn(),
   fetchEligibility: vi.fn(),
   fetchPersonalLifecycle: vi.fn(),
   fetchPersonalQuote: vi.fn(),
+  me: vi.fn(),
+  quotePayerTransfer: vi.fn(),
   fetchPersonalOperation: vi.fn(),
   requestPersonalRefund: vi.fn(),
+  withdrawPayerTransfer: vi.fn(),
   startCloudExport: vi.fn(),
 }));
 
@@ -57,6 +68,11 @@ describe("CloudAccountPanel", () => {
   beforeEach(() => vi.resetAllMocks());
 
   beforeEach(() => {
+    vi.mocked(api.fetchPayerTransferCapabilities).mockResolvedValue({ available: false, setupAvailable: false });
+    vi.mocked(api.fetchPayerTransfers).mockResolvedValue({ transfers: [], nextCursor: null });
+    vi.mocked(api.me).mockResolvedValue(null);
+    vi.mocked(api.fetchOrgs).mockResolvedValue([]);
+    vi.mocked(api.fetchMembers).mockResolvedValue([]);
     vi.mocked(api.fetchCloudNotices).mockResolvedValue([]);
     vi.mocked(api.fetchPersonalLifecycle).mockResolvedValue({
       state: "active", paidThroughDate: null, cancelAtPeriodEnd: false, portalUrl: null,
@@ -181,9 +197,10 @@ describe("CloudAccountPanel", () => {
 
       if (outcome === "failure") {
         view.unmount();
+        const exportDeadline = 1_900_000_000;
         vi.mocked(api.fetchCloudNotices).mockResolvedValue([{
           noticeId: "notice-current", kind: "export_deadline", channel: "in_app",
-          content: { title: "Current export notice", detail: "Keep your encrypted recovery materials.", effectiveAtEpoch: null, deadlineEpoch: null, amountPence: null },
+          content: { title: "Current export notice", detail: "Keep your encrypted recovery materials.", effectiveAtEpoch: 1_800_000_000, deadlineEpoch: exportDeadline, amountPence: null },
           dueAtEpoch: 1_900_000_000, status: "pending", lastErrorCode: null,
           deliveredAtEpoch: null, createdAtEpoch: 1_900_000_000,
         }]);
@@ -191,6 +208,7 @@ describe("CloudAccountPanel", () => {
         expect(await screen.findByRole("heading", { name: "Account notices" })).toBeInTheDocument();
         expect(screen.getByText("Current export notice")).toBeInTheDocument();
         expect(screen.getByText("Keep your encrypted recovery materials.")).toBeInTheDocument();
+        expect(screen.getByText(`Deadline: ${new Date(exportDeadline * 1000).toLocaleDateString("en-GB")}`)).toBeInTheDocument();
         expect(api.fetchCloudNotices).toHaveBeenCalledTimes(2);
         expect(screen.getByRole("button", { name: "Download encrypted export" })).toBeEnabled();
         expect(screen.queryByRole("alert")).not.toBeInTheDocument();
@@ -305,16 +323,55 @@ describe("CloudAccountPanel", () => {
   });
 
   it("shows durable account notices without unlocking the vault", async () => {
-    vi.mocked(api.fetchEligibility).mockResolvedValue({ ...base, state: "export_only", actions: { ...base.actions, export: true } });
+    vi.mocked(api.fetchEligibility).mockResolvedValue({ ...base, state: "renewal_recovery", payer: "personal" });
+    vi.mocked(api.createPersonalPortal).mockResolvedValue({
+      state: "past_due", paidThroughDate: null, cancelAtPeriodEnd: false, portalUrl: null,
+      foundingPriceEndEpoch: null, standardRenewalAmountPence: null,
+      foundingTransitionStatus: null, foundingTransitionReason: null,
+    });
     vi.mocked(api.fetchCloudNotices).mockResolvedValue([{
-      noticeId: "notice-1", kind: "export_deadline", channel: "in_app",
-      content: { title: "Export window", detail: "Download your encrypted export.", effectiveAtEpoch: null, deadlineEpoch: 2_000_000_000, amountPence: null },
+      noticeId: "notice-1", kind: "failed_renewal", channel: "in_app",
+      content: { title: "Action needed for your Cloud renewal", detail: "Your renewal payment was unsuccessful. Update your payment method in Cloud billing before the recovery deadline.", effectiveAtEpoch: 1_900_000_000, deadlineEpoch: 1_901_209_600, amountPence: null },
       dueAtEpoch: 1_900_000_000, status: "pending", lastErrorCode: null, deliveredAtEpoch: null, createdAtEpoch: 1_900_000_000,
+    }]);
+
+    const { unmount } = render(<CloudAccountPanel />);
+
+    expect(await screen.findByRole("heading", { name: "Account notices" })).toBeInTheDocument();
+    expect(screen.getByText("Your renewal payment was unsuccessful. Update your payment method in Cloud billing before the recovery deadline.")).toBeInTheDocument();
+    expect(screen.getByText(/Deadline:/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Update payment method" }));
+    expect(await screen.findByText("The billing portal is not available yet.")).toBeInTheDocument();
+    expect(api.createPersonalPortal).toHaveBeenCalledTimes(1);
+
+    unmount();
+    vi.mocked(api.fetchCloudNotices).mockResolvedValue([{
+      noticeId: "notice-2", kind: "recovery_resolved", channel: "in_app",
+      content: { title: "Your Cloud renewal is up to date", detail: "Your renewal payment was received. No further action is needed.", effectiveAtEpoch: 1_900_000_100, deadlineEpoch: null, amountPence: null },
+      dueAtEpoch: 1_900_000_100, status: "pending", lastErrorCode: null, deliveredAtEpoch: null, createdAtEpoch: 1_900_000_100,
+    }]);
+    render(<CloudAccountPanel />);
+    expect(await screen.findByText("Your Cloud renewal is up to date")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Update payment method" })).not.toBeInTheDocument();
+  });
+
+  it("directs sponsored renewal actions to organisation admins instead of personal billing", async () => {
+    vi.mocked(api.fetchEligibility).mockResolvedValue({ ...base, state: "renewal_recovery" });
+    vi.mocked(api.fetchCloudNotices).mockResolvedValue([{
+      noticeId: "sponsored-notice-1", kind: "sponsored_renewal_action", channel: "in_app",
+      content: {
+        title: "Organisation Cloud renewal needs attention",
+        detail: "The organisation’s sponsored Cloud renewal payment was unsuccessful. Review the organisation billing panel before the recovery deadline.",
+        effectiveAtEpoch: 1_900_000_000, deadlineEpoch: 1_901_209_600, amountPence: null,
+      },
+      dueAtEpoch: 1_900_000_000, status: "pending", lastErrorCode: null,
+      deliveredAtEpoch: null, createdAtEpoch: 1_900_000_000,
     }]);
 
     render(<CloudAccountPanel />);
 
-    expect(await screen.findByRole("heading", { name: "Account notices" })).toBeInTheDocument();
-    expect(screen.getByText("Download your encrypted export.")).toBeInTheDocument();
+    expect(await screen.findByText(/Review the organisation billing panel/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Update payment method" })).not.toBeInTheDocument();
+    expect(api.createPersonalPortal).not.toHaveBeenCalled();
   });
 });

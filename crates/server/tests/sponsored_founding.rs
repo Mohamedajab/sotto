@@ -47,6 +47,9 @@ fn app(pool: PgPool) -> Router {
         telemetry_ingest: false,
         cloud_action_enforcement_enabled: false,
         machine_eligibility_enforcement_enabled: false,
+        billing_transfers_enabled: false,
+        billing_transfer_execution_enabled: false,
+        billing_transfer_setup_enabled: false,
         pool,
         oauth: None,
         oauth_config: None,
@@ -60,6 +63,7 @@ fn app(pool: PgPool) -> Router {
                 founding_monthly: "price_founding_monthly".into(),
                 founding_annual: "price_founding_annual".into(),
             }),
+            cloud_portal_configuration_id: Some("bpc_test".into()),
             cloud_sales_enabled: true,
             return_url: "https://app.sotto.test".into(),
         })),
@@ -67,6 +71,7 @@ fn app(pool: PgPool) -> Router {
         organisation_deletion_retention_days: DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
         organisation_deletion_metrics_token: None,
         organisation_deletion_operator_token: None,
+        billing_transfer_operator_token: None,
     };
     Router::new()
         .merge(sotto_server::billing::router())

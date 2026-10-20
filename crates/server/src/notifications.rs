@@ -18,7 +18,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
+use crate::cloud_coverage::EXPORT_WINDOW_SECONDS;
 use crate::error::{Error, Result};
+use crate::person_eligibility::{EligibilityState, EligibilityView};
 use crate::state::AppState;
 
 const MAX_EVENT_KEY: usize = 160;
@@ -26,6 +28,7 @@ const MAX_TEXT: usize = 240;
 const MAX_DETAIL: usize = 2_000;
 const MAX_NOTICES: i64 = 100;
 pub const STANDARD_MONTHLY_PRICE_NOTICE_LEAD_SECONDS: i64 = 60 * 24 * 60 * 60;
+const EXPORT_DEADLINE_POLICY_KEY: &str = "cloud-export-deadline-v1";
 type NoticeResult<T> = std::result::Result<T, NoticeError>;
 
 const RETRY_DELAYS: [Duration; 5] = [
@@ -45,8 +48,12 @@ pub enum NoticeKind {
     ExportDeadline,
     ImpendingPurge,
     SponsorshipChange,
+    PayerTransferInvitation,
     FoundingExpiry,
     PriceChange,
+    RecoveryResolved,
+    SponsoredRenewalFailure,
+    SponsoredRenewalAction,
 }
 
 impl NoticeKind {
@@ -58,8 +65,12 @@ impl NoticeKind {
             Self::ExportDeadline => "export_deadline",
             Self::ImpendingPurge => "impending_purge",
             Self::SponsorshipChange => "sponsorship_change",
+            Self::PayerTransferInvitation => "payer_transfer_invitation",
             Self::FoundingExpiry => "founding_expiry",
             Self::PriceChange => "price_change",
+            Self::RecoveryResolved => "recovery_resolved",
+            Self::SponsoredRenewalFailure => "sponsored_renewal_failure",
+            Self::SponsoredRenewalAction => "sponsored_renewal_action",
         }
     }
 }
@@ -267,6 +278,150 @@ pub async fn enqueue_in_tx(
     })
 }
 
+/// Reconcile the in-app export notice against one complete eligibility snapshot.
+///
+/// The account endpoint supplies the coverage revision it evaluated. The shared projection head
+/// is locked while the outbox is changed, so an older eligibility read cannot restore a notice
+/// after a newer source set has already committed.
+pub async fn reconcile_export_deadline_notice(
+    pool: &PgPool,
+    recipient_user_id: &str,
+    view: &EligibilityView,
+    coverage_revision: Option<i64>,
+    now_epoch: i64,
+) -> NoticeResult<bool> {
+    bounded_key(recipient_user_id, "recipient_user_id")?;
+    if now_epoch <= 0 {
+        return Err(NoticeError::InvalidContent("now_epoch must be positive"));
+    }
+
+    // Unavailable means the source set cannot be trusted. Keep the last durable result intact;
+    // an unavailable snapshot cannot prove that an earlier export notice is stale.
+    if view.state == EligibilityState::Unavailable {
+        return Ok(true);
+    }
+    if coverage_revision.is_none() {
+        // A missing projection cannot show that an earlier export episode was superseded. This
+        // is the normal first-read shape for a free account, so preserve existing notice state
+        // without treating the absence as an error or as proof that coverage ended.
+        if view.state == EligibilityState::Free {
+            return Ok(true);
+        }
+        return Err(NoticeError::InvalidContent(
+            "this eligibility state requires a complete coverage revision",
+        ));
+    }
+
+    let mut tx = pool.begin().await?;
+    let lock_key = format!("cloud-export-notice:{recipient_user_id}");
+    sqlx::query_scalar::<_, ()>("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(lock_key)
+        .fetch_one(&mut *tx)
+        .await?;
+
+    let current_head: Option<Option<i64>> = sqlx::query_scalar(
+        "SELECT current_revision FROM cloud_coverage_heads WHERE beneficiary_id=$1 FOR SHARE",
+    )
+    .bind(recipient_user_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let current_revision = match current_head {
+        None => None,
+        Some(Some(revision)) => Some(revision),
+        Some(None) => return Ok(false),
+    };
+    if current_revision != coverage_revision {
+        tx.commit().await?;
+        return Ok(false);
+    }
+
+    // A pending personal checkout takes precedence in the public eligibility state, but its
+    // coverage decision can still carry the beneficiary's current export deadline. Keep the
+    // notice tied to that complete projection until its deadline passes; pending billing alone
+    // does not prove that the export episode has ended.
+    let export_window_is_open = view.state == EligibilityState::ExportOnly
+        || (view.state == EligibilityState::PendingInitialPayment
+            && view
+                .export_until_epoch
+                .is_some_and(|deadline| deadline > now_epoch));
+    let intent = if export_window_is_open {
+        let deadline = view
+            .export_until_epoch
+            .ok_or(NoticeError::InvalidContent("export deadline is missing"))?;
+        let effective_at =
+            deadline
+                .checked_sub(EXPORT_WINDOW_SECONDS)
+                .ok_or(NoticeError::InvalidContent(
+                    "export deadline is out of range",
+                ))?;
+        // Eligibility can cross its deadline between loading the view and reaching this write.
+        // In that case the old ExportOnly snapshot is simply stale; do not turn a normal boundary
+        // race into a failed eligibility request or create a notice after the deadline.
+        if deadline <= now_epoch {
+            tx.commit().await?;
+            return Ok(false);
+        }
+        if effective_at <= 0 || effective_at > now_epoch {
+            return Err(NoticeError::InvalidContent(
+                "export-only deadline is outside its expected window",
+            ));
+        }
+        Some(NoticeIntent {
+            recipient_user_id: recipient_user_id.to_owned(),
+            event_key: format!("cloud-export-window:{effective_at}:{deadline}"),
+            policy_key: EXPORT_DEADLINE_POLICY_KEY.to_owned(),
+            kind: NoticeKind::ExportDeadline,
+            channel: NoticeChannel::InApp,
+            contact_id: None,
+            due_at_epoch: effective_at,
+            content: NoticeContent {
+                title: "Your Cloud account is in its export period".into(),
+                detail: "Download an encrypted export before your export deadline.".into(),
+                effective_at_epoch: Some(effective_at),
+                deadline_epoch: Some(deadline),
+                amount_pence: None,
+            },
+        })
+    } else {
+        None
+    };
+
+    let desired_event_key = intent.as_ref().map(|notice| notice.event_key.as_str());
+    sqlx::query(
+        "UPDATE cloud_notice_outbox SET status='cancelled', cancelled_at=now(), updated_at=now() \
+         WHERE recipient_user_id=$1 AND kind='export_deadline' AND policy_key=$2 \
+           AND status IN ('pending','leased') \
+           AND ($3::text IS NULL OR event_key <> $3)",
+    )
+    .bind(recipient_user_id)
+    .bind(EXPORT_DEADLINE_POLICY_KEY)
+    .bind(desired_event_key)
+    .execute(&mut *tx)
+    .await?;
+
+    if let Some(intent) = intent {
+        let payload = payload_json(&intent.content)?;
+        sqlx::query(
+            "UPDATE cloud_notice_outbox SET status='pending', cancelled_at=NULL, \
+                 available_at=due_at, updated_at=now() \
+             WHERE recipient_user_id=$1 AND event_key=$2 AND policy_key=$3 AND channel='in_app' \
+               AND status='cancelled' AND delivered_at IS NULL AND due_at=to_timestamp($4) \
+               AND payload=$5::jsonb",
+        )
+        .bind(recipient_user_id)
+        .bind(&intent.event_key)
+        .bind(EXPORT_DEADLINE_POLICY_KEY)
+        .bind(intent.due_at_epoch)
+        .bind(payload)
+        .execute(&mut *tx)
+        .await?;
+        enqueue_in_tx(&mut tx, &intent).await?;
+    }
+
+    tx.commit().await?;
+    Ok(true)
+}
+
 /// Record a verified email destination. Verification is intentionally an internal boundary until
 /// the approved provider and challenge flow are configured; a GitHub login alone never creates it.
 pub async fn record_verified_email(
@@ -340,7 +495,7 @@ pub async fn list_for_user(pool: &PgPool, user_id: &str) -> NoticeResult<Vec<Not
                 status, last_error_code, extract(epoch from delivered_at)::bigint AS delivered_at, \
                 extract(epoch from created_at)::bigint AS created_at \
          FROM cloud_notice_outbox \
-         WHERE recipient_user_id=$1 AND status <> 'cancelled' \
+         WHERE recipient_user_id=$1 AND status <> 'cancelled' AND due_at <= now() \
          ORDER BY created_at DESC, notice_id DESC LIMIT $2",
     )
     .bind(user_id)
@@ -621,6 +776,18 @@ mod tests {
     #[test]
     fn kind_and_channel_names_are_stable() {
         assert_eq!(NoticeKind::PriceChange.as_str(), "price_change");
+        assert_eq!(
+            NoticeKind::SponsoredRenewalFailure.as_str(),
+            "sponsored_renewal_failure"
+        );
+        assert_eq!(
+            NoticeKind::SponsoredRenewalAction.as_str(),
+            "sponsored_renewal_action"
+        );
+        assert_eq!(
+            NoticeKind::PayerTransferInvitation.as_str(),
+            "payer_transfer_invitation"
+        );
         assert_eq!(NoticeChannel::InApp.as_str(), "in_app");
         assert_eq!(NoticeChannel::Email.as_str(), "email");
     }

@@ -180,6 +180,220 @@ export interface CloudNotice {
   createdAtEpoch: number;
 }
 
+export interface PayerTransferCapabilities {
+  available: boolean;
+  setupAvailable: boolean;
+}
+
+export async function fetchPayerTransferCapabilities(): Promise<PayerTransferCapabilities> {
+  const body = await authedJson<{
+    payer_transfers_available?: unknown;
+    payer_transfer_setup_available?: unknown;
+  }>("/server/info");
+  // Older servers do not advertise transfer journeys. Missing or malformed flags fail closed.
+  return {
+    available: body.payer_transfers_available === true,
+    setupAvailable: body.payer_transfer_setup_available === true,
+  };
+}
+
+export interface PayerTransferQuote {
+  quoteId: string;
+  quoteVersion: number;
+  quoteExpiresAtEpoch: number;
+  beneficiaryId: string;
+  counterpartyUserId: string;
+  sourceKind: "personal" | "sponsor";
+  sourceOrganizationId: string | null;
+  destinationKind: "personal" | "sponsor";
+  destinationOrganizationId: string | null;
+  offer: BillingOffer;
+  amountPence: number;
+  currency: string;
+  interval: string;
+  effectiveFrom: number;
+  creditPence: number;
+  founding: boolean;
+}
+
+export interface PayerTransfer {
+  transferId: string;
+  beneficiaryId: string;
+  participantRole: "initiator" | "counterparty";
+  sourceKind: "personal" | "sponsor";
+  sourceOrganizationId: string | null;
+  destinationKind: "personal" | "sponsor";
+  destinationOrganizationId: string | null;
+  offer: BillingOffer;
+  amountPence: number;
+  currency: string;
+  interval: string;
+  effectiveFrom: number;
+  quoteExpiresAtEpoch: number;
+  consentExpiresAtEpoch: number;
+  personalPaymentSetupNeeded: boolean;
+  state: string;
+  resultCode: string | null;
+}
+
+function parsePayerTransfer(body: {
+  transfer_id: string;
+  beneficiary_id: string;
+  participant_role: "initiator" | "counterparty";
+  source_kind: "personal" | "sponsor";
+  source_organization_id: string | null;
+  destination_kind: "personal" | "sponsor";
+  destination_organization_id: string | null;
+  offer: BillingOffer;
+  amount_pence: number;
+  currency: string;
+  interval: string;
+  effective_from: number;
+  quote_expires_at_epoch: number;
+  consent_expires_at_epoch: number;
+  personal_payment_setup_needed: boolean;
+  state: string;
+  result_code: string | null;
+}): PayerTransfer {
+  return {
+    transferId: body.transfer_id,
+    beneficiaryId: body.beneficiary_id,
+    participantRole: body.participant_role,
+    sourceKind: body.source_kind,
+    sourceOrganizationId: body.source_organization_id,
+    destinationKind: body.destination_kind,
+    destinationOrganizationId: body.destination_organization_id,
+    offer: body.offer,
+    amountPence: body.amount_pence,
+    currency: body.currency,
+    interval: body.interval,
+    effectiveFrom: body.effective_from,
+    quoteExpiresAtEpoch: body.quote_expires_at_epoch,
+    consentExpiresAtEpoch: body.consent_expires_at_epoch,
+    personalPaymentSetupNeeded: body.personal_payment_setup_needed,
+    state: body.state,
+    resultCode: body.result_code,
+  };
+}
+
+export async function fetchPayerTransfers(before?: string): Promise<{
+  transfers: PayerTransfer[];
+  nextCursor: string | null;
+}> {
+  const query = new URLSearchParams({ limit: "50" });
+  if (before !== undefined) query.set("before", before);
+  const body = await authedJson<{
+    transfers: Parameters<typeof parsePayerTransfer>[0][];
+    next_cursor: string | null;
+  }>(`/billing/transfers?${query.toString()}`);
+  return {
+    transfers: body.transfers.map(parsePayerTransfer),
+    nextCursor: body.next_cursor,
+  };
+}
+
+export async function fetchPayerTransfer(transferId: string): Promise<PayerTransfer> {
+  return parsePayerTransfer(
+    await authedJson<Parameters<typeof parsePayerTransfer>[0]>(
+      `/billing/transfers/${encodeURIComponent(transferId)}`,
+    ),
+  );
+}
+
+export async function quotePayerTransfer(input: {
+  beneficiaryId: string;
+  counterpartyUserId: string;
+  destinationKind: "personal" | "sponsor";
+  destinationOrganizationId?: string;
+}): Promise<PayerTransferQuote> {
+  const body = await postJson<{
+    quote_id: string;
+    quote_version: number;
+    quote_expires_at_epoch: number;
+    beneficiary_id: string;
+    source_kind: "personal" | "sponsor";
+    source_organization_id: string | null;
+    destination_kind: "personal" | "sponsor";
+    destination_organization_id: string | null;
+    offer: BillingOffer;
+    amount_pence: number;
+    currency: string;
+    interval: string;
+    effective_from: number;
+    credit_pence: number;
+    founding: boolean;
+  }>("/billing/transfers/quote", {
+    beneficiary_id: input.beneficiaryId,
+    counterparty_user_id: input.counterpartyUserId,
+    destination_kind: input.destinationKind,
+    destination_organization_id: input.destinationOrganizationId ?? null,
+  });
+  return {
+    quoteId: body.quote_id,
+    quoteVersion: body.quote_version,
+    quoteExpiresAtEpoch: body.quote_expires_at_epoch,
+    beneficiaryId: body.beneficiary_id,
+    counterpartyUserId: input.counterpartyUserId,
+    sourceKind: body.source_kind,
+    sourceOrganizationId: body.source_organization_id,
+    destinationKind: body.destination_kind,
+    destinationOrganizationId: body.destination_organization_id,
+    offer: body.offer,
+    amountPence: body.amount_pence,
+    currency: body.currency,
+    interval: body.interval,
+    effectiveFrom: body.effective_from,
+    creditPence: body.credit_pence,
+    founding: body.founding,
+  };
+}
+
+export async function beginPayerTransfer(input: {
+  quote: PayerTransferQuote;
+  idempotencyKey: string;
+}): Promise<PayerTransfer> {
+  const quote = input.quote;
+  const body = await postJson<Parameters<typeof parsePayerTransfer>[0]>("/billing/transfers", {
+    beneficiary_id: quote.beneficiaryId,
+    counterparty_user_id: quote.counterpartyUserId,
+    destination_kind: quote.destinationKind,
+    destination_organization_id: quote.destinationOrganizationId,
+    quote_id: quote.quoteId,
+    quote_version: quote.quoteVersion,
+    quote_expires_at_epoch: quote.quoteExpiresAtEpoch,
+    idempotency_key: input.idempotencyKey,
+  });
+  return parsePayerTransfer(body);
+}
+
+export async function acceptPayerTransfer(transferId: string): Promise<PayerTransfer> {
+  return parsePayerTransfer(
+    await postJson<Parameters<typeof parsePayerTransfer>[0]>(
+      `/billing/transfers/${encodeURIComponent(transferId)}/accept`,
+      {},
+    ),
+  );
+}
+
+export async function withdrawPayerTransfer(transferId: string): Promise<PayerTransfer> {
+  return parsePayerTransfer(
+    await postJson<Parameters<typeof parsePayerTransfer>[0]>(
+      `/billing/transfers/${encodeURIComponent(transferId)}/withdraw`,
+      {},
+    ),
+  );
+}
+
+export async function createPayerTransferPaymentSetup(
+  transferId: string,
+): Promise<{ checkoutUrl: string | null }> {
+  const body = await postJson<{ checkout_url: string | null }>(
+    `/billing/transfers/${encodeURIComponent(transferId)}/payment-method`,
+    {},
+  );
+  return { checkoutUrl: body.checkout_url };
+}
+
 export async function fetchCloudNotices(): Promise<CloudNotice[]> {
   const body = await authedJson<Array<{
     notice_id: string;
