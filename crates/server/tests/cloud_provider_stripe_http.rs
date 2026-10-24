@@ -184,7 +184,7 @@ fn config() -> StripeCoverageConfig {
 }
 
 fn account() -> Value {
-    json!({"id":"acct_test_transport","object":"account","livemode":false})
+    json!({"id":"acct_test_transport","object":"account"})
 }
 
 fn monthly_price() -> Value {
@@ -2257,12 +2257,12 @@ async fn invoice_history_wraps_later_correction_uncertainty_without_a_paid_subse
 }
 
 #[tokio::test]
-async fn rejects_wrong_account_mode_redirect_and_invalid_pagination() {
+async fn rejects_wrong_account_key_mode_redirect_and_invalid_pagination() {
     let mut responses = HashMap::new();
     responses.insert(
         "/v1/account".into(),
         vec![MockResponse::json(
-            json!({"id":"acct_other","livemode":false}),
+            json!({"id":"acct_other","object":"account"}),
         )],
     );
     let server = mock_server(responses).await;
@@ -2274,21 +2274,28 @@ async fn rejects_wrong_account_mode_redirect_and_invalid_pagination() {
         Err(StripeReadError::AccountMismatch)
     ));
 
+    let server = mock_server(HashMap::new()).await;
+    let live_config = StripeCoverageConfig::new(
+        "acct_test_transport",
+        ProviderEnvironment::Live,
+        "price_month",
+        "price_year",
+    )
+    .unwrap();
+    assert!(matches!(
+        StripeReadClient::for_test(API_KEY, &live_config, server.origin.clone(), limits()),
+        Err(StripeReadError::InvalidConfig("Stripe API key environment"))
+    ));
+
     let mut responses = HashMap::new();
-    responses.insert(
-        "/v1/account".into(),
-        vec![MockResponse::json(
-            json!({"id":"acct_test_transport","livemode":true}),
-        )],
-    );
+    responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
     let server = mock_server(responses).await;
     let client =
         StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
     let mut session = client.session();
-    assert!(matches!(
-        client.account(&mut session).await,
-        Err(StripeReadError::ContextMismatch)
-    ));
+    let account_resource = client.account(&mut session).await.unwrap();
+    assert_eq!(account_resource.id, "acct_test_transport");
+    assert!(!account_resource.livemode);
 
     let mut responses = HashMap::new();
     responses.insert(

@@ -43,7 +43,7 @@ does not publish coverage, assign a failed-renewal ID, or mutate storage.
 
 | Resource | Required fields used | Provenance and rejection rule |
 | --- | --- | --- |
-| `GET /v1/account` | `id`, `livemode` | Must equal the configured operator account and environment before resource reads continue. |
+| `GET /v1/account` | `id` | Must equal the configured operator account before resource reads continue. Stripe's Account object does not include `livemode`; the client validates live/test mode from the API key prefix, then checks each resource's `livemode` field where available. |
 | `GET /v1/invoices/:id` | `id`, `customer`, `parent.type`, `parent.subscription_details.subscription`, `status`, `currency`, `amount_paid`, `amount_due`, `amount_overpaid`, `amount_paid_off_stripe`, `livemode`, `metadata.sotto_allocation_reference` | The path ID, nested subscription parent, paid status, mode, currency, full positive amount and trusted allocation claim are checked. Missing financial, parent or metadata fields fail closed. The deprecated top-level `subscription` field cannot establish association. |
 | `GET /v1/invoices/:id/lines` | `id`, `quantity`, `livemode`, `parent.type`, `parent.subscription_item_details.subscription`, `parent.subscription_item_details.subscription_item`, `pricing.type`, `pricing.price_details.price`, `period.start`, `period.end` | The complete paginated list must contain exactly one subscription-item line with quantity one and a configured standard price. Invoice-item and other line types are unsupported. |
 | `GET /v1/invoice_payments?invoice=:id` | `id`, `invoice`, `status`, `amount_paid`, `amount_requested`, `currency`, `livemode`, `payment.type`, `payment.payment_intent` | The complete list must contain exactly one paid PaymentIntent settlement. Open, canceled, multiple or mismatched records are ambiguous or unsupported. |
@@ -67,6 +67,8 @@ consistent Stripe snapshot.
 The object and list references were checked with `stripe docs api` on 25 September 2026:
 [the refund object](https://docs.stripe.com/api/refunds/object),
 [list refunds](https://docs.stripe.com/api/refunds/list),
+[the PaymentIntent object](https://docs.stripe.com/api/payment_intents/object),
+[the Charge object](https://docs.stripe.com/api/charges/object),
 [the dispute object](https://docs.stripe.com/api/disputes/object),
 [list disputes](https://docs.stripe.com/api/disputes/list),
 [the credit note object](https://docs.stripe.com/api/credit_notes/object) and
@@ -80,6 +82,8 @@ set to the previous page's last ID. The shared session budget applies across all
 
 | Endpoint | Required and validated | Nullable, kept as absent | Parent and mode rule |
 | --- | --- | --- | --- |
+| `GET /v1/payment_intents/:id` | `id`, `status`, `amount_received`, `currency`, `latest_charge` | none of the retained fields | ID must match the requested PaymentIntent and status must be `succeeded`. `latest_charge` identifies the charge whose aggregate is used for a successful full-refund check. |
+| `GET /v1/charges/:id` | `id`, `payment_intent`, `currency`, `amount_captured`, `amount_refunded` | none of the retained fields | Charge ID, PaymentIntent, currency and captured amount must match the verified payment. For a succeeded candidate refund, `amount_refunded` must include at least that refund's amount; subtracting it yields the pre-refund refundable balance without enumerating the refund history. |
 | `GET /v1/refunds?payment_intent=:id` | `object` (`refund`), `id`, `amount`, `currency`, `created` | `payment_intent`, `charge`, `status` | A present `payment_intent` naming another PaymentIntent is a parent mismatch. An absent one stays `None`; the filter is not treated as proof of ownership. Refunds document no `livemode`, so none is required; a present value must match the verified account. |
 | `GET /v1/disputes?payment_intent=:id` | `object` (`dispute`), `id`, `charge`, `amount`, `currency`, `created`, `status`, `livemode` | `payment_intent` | A present `payment_intent` naming another PaymentIntent is a parent mismatch; an absent one stays `None`. `livemode` is required and must match the verified account. |
 | `GET /v1/credit_notes?invoice=:id` | `object` (`credit_note`), `id`, `invoice`, `customer`, `amount`, `pre_payment_amount`, `post_payment_amount`, `currency`, `created`, `status`, `type`, `livemode` | none of the retained fields | `invoice` is required, so any value other than the requested invoice is a parent mismatch. `customer` is kept as evidence, not checked against a binding. `livemode` is required and must match the verified account. |
@@ -183,3 +187,20 @@ versioned semantic reference. It does not assign `failed_renewal_id`, produce a
 The candidate is provisional evidence. Pagination is complete only relative to the bounded read,
 not an atomic remote snapshot; publication, freshness, invalidation, missed-event repair and
 recovery eligibility remain later adapter responsibilities.
+
+## Sponsored renewal failure fan-out
+
+The sponsored failure path lists invoices with both the trusted subscription and customer IDs.
+It uses the embedded `lines.data` summaries to select only paid invoices with a subscription-item
+line whose item and price match the failed line and whose period ends exactly when the failed
+period starts. A truncated summary, or one without a `has_more` value, is completed from that
+invoice's line endpoint before it can be used to rule out a predecessor. Settlement and the allocation manifest are read
+only for matching predecessor invoices, under the same bounded Stripe session. Provider read,
+database and manifest-query failures remain retryable; a successfully read but malformed or
+contradictory invoice is durably rejected without storing partial beneficiary evidence.
+
+The final application takes the subscription lock and checks the durable processed webhook receipt
+for the exact paid invoice before recording a failed renewal. That prevents a delayed failure read
+from overriding a paid invoice that committed while Stripe history was being prepared. Sponsored
+failure and resolution writes are set-based for all affected allocations, and the notice bound
+allows the configured maximum of 128 beneficiaries plus 128 organisation administrators.
