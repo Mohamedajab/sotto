@@ -72,6 +72,9 @@ this README follows the `main` branch, which can be ahead of the latest release.
 here may therefore not exist in your installed version yet; `sotto --help` lists the commands your
 version supports.
 
+See [COMPATIBILITY.md](COMPATIBILITY.md) for integration version requirements, platform claims,
+and the evidence currently available for them.
+
 ### Homebrew (preview)
 
 The [Sotto tap](https://github.com/getsotto/homebrew-tap) provides another
@@ -201,6 +204,11 @@ decrypts in your browser, with keys that never leave your devices.
 
 To browse secrets interactively, see the [dashboard guide](#interactive-dashboard).
 
+## Agent workflows
+
+Local coding agents can discover and run project-declared tasks through Sotto's local MCP server.
+Read the [agent task guide](AGENT-WORKFLOWS.md) for setup, approval, and the security boundary.
+
 ## Using Sotto
 
 ### Another device
@@ -242,6 +250,45 @@ sotto env copy dev staging --confirm  # apply the copy; never delete destination
 `env diff` marks each key `=` (same value), `!` (different values), `<` (only in the first
 environment) or `>` (only in the second). Without `--confirm`, copying is a dry-run. A confirmed
 copy adds and updates secrets but leaves keys that exist only in the destination untouched.
+
+### Import a dotenv file
+
+`sotto import` reads a dotenv file and sets each assignment in one environment, encrypting every
+value locally. It writes to the active environment unless you name another with `--env`:
+
+```sh
+sotto import .env                         # into the active environment
+sotto import --env staging .env.staging   # into staging; the default environment is unchanged
+```
+
+An import merges into what is already there. Suppose `staging` already holds `API_URL` and `REGION`,
+and `.env.staging` contains:
+
+```dotenv
+API_URL=https://staging.example.test
+FEATURE_FLAG=on
+```
+
+After importing it into `staging`:
+
+- `API_URL` takes the value from the file, because an existing name is updated.
+- `FEATURE_FLAG` is added, because a new name is created.
+- `REGION` is kept, because a name that is missing from the file is never removed.
+
+Import writes to your local store only. After `sotto login`, upload the result as a separate step:
+
+```sh
+sotto push --env staging
+```
+
+The dotenv file is only read: import does not change, consume or delete it, so protect or remove it
+yourself if it holds real values. A file that does not parse changes nothing, but a failure while
+writing does not undo the assignments already stored, so check `sotto ls --env staging` after an
+interrupted import.
+
+To get an earlier value back, see [Restore an earlier secret version](#restore-an-earlier-secret-version).
+That history comes from the server, so it only helps for values you had already pushed. Run
+`sotto import --help` for the quoting and literal-value rules instead of repeating them here.
 
 ### Remove a secret
 
@@ -346,15 +393,16 @@ tokens they created in the organisation, naming each so you can recreate it. Rot
 is written afterwards. Values the member has already seen stay exposed, so change them at their
 source.
 
-#### Organisation plan
+#### Legacy organisation entitlements
 
 `sotto org plan <org-id>` reads the configured server's current entitlement view for that
 organisation. You must be logged in (`sotto login`); the local vault does not need to be unlocked.
-It prints the assigned tier, the effective tier (the tier whose limits apply now), the trial end
-when the organisation has one, and either member and organisation-project limits or
-`limits: none (Team)`.
+It prints the assigned tier, effective tier, stored trial end, and either member and
+organisation-project limits or `limits: none (Team)`. These fields preserve compatibility with
+existing organisation-tier records and deployments; they do not describe current Sotto Cloud
+person-based pricing or a new Cloud trial offer.
 
-Illustrative output on Sotto Cloud for a free organisation whose trial has ended:
+Illustrative output from a legacy organisation-tier record:
 
 ```text
 tier:      free
@@ -363,8 +411,8 @@ trial:     ends 2026-07-16T09:00:00Z
 limits:    3 members, 1 org project(s)
 ```
 
-A self-hosted server applies no plan limits, so it always reports the effective tier as `team`,
-whatever tier and trial end the organisation has stored:
+A self-hosted server applies no plan limits, so it reports the effective tier as `team`, whatever
+tier and trial end the organisation has stored:
 
 ```text
 tier:      free
@@ -373,7 +421,8 @@ trial:     ends 2026-07-16T09:00:00Z
 limits:    none (Team)
 ```
 
-These examples are illustrative; real organisations may show different tiers, trials, and limits.
+These examples show stored compatibility fields, not current Cloud offers. Real deployments may
+show different stored tiers, trial dates, and limits.
 
 #### Organisation audit log
 
@@ -390,9 +439,9 @@ event as `timestamp  action  actor`, with optional `target=...`, `env=...`, and 
 is a bounded activity/metadata view, not a way to retrieve secret values, and it does not provide
 pagination or a complete historical archive.
 
-On Sotto Cloud, the organisation needs effective Team entitlement, including an active Team trial.
-Self-hosted deployments skip this plan gate, but the caller still needs the owner/admin role. If no
-events are available, the command prints no rows and exits successfully.
+This command retains the legacy organisation Team-entitlement gate. Self-hosted deployments skip
+that plan gate, but the caller still needs the owner/admin role. If no events are available, the
+command prints no rows and exits successfully.
 
 ### Machine tokens and CI
 
@@ -484,6 +533,38 @@ Without a `sotto.toml` or local identity:
 
 An absent `sotto.toml` means no project is selected. A malformed or unreadable file is an error.
 
+### Lock, unlock and log out
+
+For an already-initialised local identity, lock the vault, check its state, then
+unlock it when you need it again:
+
+```sh
+sotto lock
+sotto status
+sotto unlock
+```
+
+`sotto lock` clears the cached local master-key session used by subsequent CLI
+commands. It does not delete your identity, encrypted vault or saved sync-server
+login. `sotto unlock` uses your master password when no valid cached session is
+available. Commands that need local decryption also request unlocking when needed.
+See [Inspect local status](#inspect-local-status) for the status fields.
+
+The local session lasts 12 hours from when the key is cached, not from your last
+activity. Expiry is checked when the cached key is read. Running `sotto unlock`
+while already unlocked does not extend that lifetime. Neither locking nor expiry
+clears plaintext already held by running applications.
+
+To clear the CLI's saved sync-server login as well, run both commands:
+
+```sh
+sotto lock
+sotto logout
+```
+
+`sotto logout` removes the CLI's stored server session token, independently of the
+local unlock cache. It does not sign out browser sessions or other devices.
+
 ### Cloud status
 
 To inspect the configured server and your account's Cloud eligibility, first log in:
@@ -569,6 +650,42 @@ border = "#331144"
 
 Saved as `synth.toml`, that file adds a `synth` theme. Apply it with `sotto theme set synth`,
 or for one command with `sotto --theme synth <command>`.
+
+### Restore an earlier secret version
+
+Start in an existing configured project and keep the same environment selected throughout.
+You need a logged-in session and an unlocked local store. History comes from the server:
+values that have never been pushed are not available there for recovery.
+
+```sh
+sotto history DATABASE_URL
+```
+
+Choose a readable, positive version number from the history. The example below uses `2`;
+replace it with an available version, without the displayed `v` prefix.
+
+```sh
+sotto rollback DATABASE_URL 2
+sotto push
+```
+
+Rollback restores the chosen value as a new local version. It does not erase or rewrite
+older history, and the server is not updated until the subsequent push.
+
+For metadata-only JSON, use:
+
+```sh
+sotto history DATABASE_URL --json
+```
+
+Each row has `version`, `readable` (whether the value could be decrypted) and `size_bytes`
+(the plaintext byte count, or null for an unreadable version). No values are printed.
+By contrast, `--reveal` prints secret values; it cannot be combined with `--json`.
+
+If there is no server history, check the selected environment and whether it has been
+pushed. Pushing now cannot recover older values that were never synced. For an unreadable
+version, follow the CLI's suggestion to run `sotto pull` and try again; pulling does not
+guarantee that a version can be decrypted with the available keys.
 
 ### Environment variables
 

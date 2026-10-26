@@ -74,6 +74,9 @@ mientras que este README sigue la rama `main`, que puede ir por delante de la ú
 eso es posible que un comando descrito aquí aún no exista en la versión que tienes instalada;
 `sotto --help` muestra los comandos que admite tu versión.
 
+Consulta [COMPATIBILITY.md](COMPATIBILITY.md) para ver los requisitos de versión de las
+integraciones, las plataformas declaradas y las pruebas disponibles actualmente.
+
 ### Homebrew (versión preliminar)
 
 El [tap de Sotto](https://github.com/getsotto/homebrew-tap) ofrece otra vía de
@@ -205,6 +208,10 @@ servidor que elegiste. En cualquier caso el servidor solo almacena texto cifrado
 
 Para explorar los secretos de forma interactiva, consulta la [guía del panel](#panel-interactivo).
 
+## Flujos de trabajo con agentes
+
+Los agentes de código locales pueden descubrir y ejecutar tareas declaradas por el proyecto mediante el servidor MCP local de Sotto. Consulta la [guía de tareas para agentes](AGENT-WORKFLOWS.md) para ver la configuración, las aprobaciones y los límites de seguridad.
+
 ## Uso de Sotto
 
 ### Otro dispositivo
@@ -246,6 +253,45 @@ sotto env copy dev staging --confirm  # apply the copy; never delete destination
 `env diff` marca cada clave con `=` (mismo valor), `!` (valores distintos), `<` (solo en el primer
 entorno) o `>` (solo en el segundo). Sin `--confirm`, la copia es una simulación. Una copia confirmada
 añade y actualiza secretos, pero deja intactas las claves que solo existen en el destino.
+
+### Importar un archivo dotenv
+
+`sotto import` lee un archivo dotenv y asigna cada variable en un entorno, cifrando cada valor en local.
+Escribe en el entorno activo, salvo que indiques otro con `--env`:
+
+```sh
+sotto import .env                         # into the active environment
+sotto import --env staging .env.staging   # into staging; the default environment is unchanged
+```
+
+Una importación se fusiona con lo que ya existe. Supón que `staging` ya contiene `API_URL` y `REGION`,
+y que `.env.staging` contiene:
+
+```dotenv
+API_URL=https://staging.example.test
+FEATURE_FLAG=on
+```
+
+Tras importarlo en `staging`:
+
+- `API_URL` toma el valor del archivo, porque un nombre existente se actualiza.
+- `FEATURE_FLAG` se añade, porque se crea un nombre nuevo.
+- `REGION` se conserva, porque un nombre que falta en el archivo nunca se elimina.
+
+La importación escribe solo en tu almacén local. Tras `sotto login`, sube el resultado en un paso aparte:
+
+```sh
+sotto push --env staging
+```
+
+El archivo dotenv solo se lee: la importación no lo modifica, no lo consume ni lo elimina, así que
+protégelo o bórralo tú si contiene valores reales. Un archivo que no se puede analizar no cambia nada,
+pero un fallo durante la escritura no deshace las asignaciones ya guardadas, así que revisa
+`sotto ls --env staging` después de una importación interrumpida.
+
+Para recuperar un valor anterior, consulta [Restaurar una versión anterior de un secreto](#restaurar-una-versión-anterior-de-un-secreto).
+Ese historial procede del servidor, así que solo sirve para valores que ya habías subido. Ejecuta
+`sotto import --help` para ver las reglas de comillas y de valores literales en lugar de repetirlas aquí.
 
 ### Eliminar un secreto
 
@@ -354,15 +400,16 @@ de máquina que creó en la organización, nombrando cada uno para que puedas vo
 rotación protege lo que se escriba después. Los valores que el miembro ya vio siguen expuestos, así
 que cámbialos en su origen.
 
-#### Plan de la organización
+#### Derechos antiguos de la organización
 
 `sotto org plan <org-id>` lee la vista de derechos actual del servidor configurado para esa
 organización. Debes haber iniciado sesión (`sotto login`); el cofre local no necesita estar
-desbloqueado. Muestra el nivel asignado, el nivel efectivo (el que aplica los límites ahora), el
-fin de la prueba cuando la organización tiene uno, y o bien límites de miembros y proyectos de
-organización o `limits: none (Team)`.
+desbloqueado. Muestra los niveles asignado y efectivo, la fecha de prueba guardada y los límites
+aplicables, como `limits: none (Team)`. Estos campos mantienen la compatibilidad con registros y despliegues antiguos de planes
+por organización; no describen los precios actuales de Cloud por persona ni una nueva prueba de
+Cloud.
 
-Salida ilustrativa en Sotto Cloud para una organización gratuita cuya prueba ha terminado:
+Salida ilustrativa de un registro antiguo de plan de organización:
 
 ```text
 tier:      free
@@ -381,8 +428,8 @@ trial:     ends 2026-07-16T09:00:00Z
 limits:    none (Team)
 ```
 
-Estos ejemplos son ilustrativos; las organizaciones reales pueden mostrar niveles, pruebas y
-límites distintos.
+Estos ejemplos muestran campos de compatibilidad guardados, no las ofertas actuales de Cloud. Los
+despliegues reales pueden mostrar otros niveles, fechas de prueba y límites guardados.
 
 #### Registro de auditoría de la organización
 
@@ -400,10 +447,10 @@ primero con los eventos más recientes; el valor predeterminado es de 100 evento
 actividad y metadatos, no una forma de recuperar valores secretos; no ofrece paginación ni un archivo
 histórico completo.
 
-En Sotto Cloud, la organización necesita una suscripción Team efectiva, incluido un periodo de
-prueba Team activo. Las implementaciones autoalojadas omiten esta comprobación del plan, pero quien
-ejecute el comando debe conservar el rol de propietario o administrador. Si no hay eventos, el
-comando no muestra filas y termina correctamente.
+Este comando conserva el control de acceso antiguo basado en el plan Team de la organización. Las
+implementaciones autoalojadas omiten esta comprobación del plan, pero quien ejecute el comando debe
+conservar el rol de propietario o administrador. Si no hay eventos, el comando no muestra filas y
+termina correctamente.
 
 ### Tokens de máquina y CI
 
@@ -498,6 +545,41 @@ Sin un `sotto.toml` ni identidad local:
 
 Si falta `sotto.toml`, no hay ningún proyecto seleccionado. Un archivo mal formado o ilegible produce un error.
 
+### Bloquear, desbloquear y cerrar sesión
+
+Con una identidad local ya inicializada, bloquea la bóveda, consulta su estado y
+desbloquéala cuando vuelvas a necesitarla:
+
+```sh
+sotto lock
+sotto status
+sotto unlock
+```
+
+`sotto lock` borra la sesión local de la clave maestra en caché que utilizan los
+siguientes comandos de la CLI. No elimina tu identidad, la bóveda cifrada ni el
+inicio de sesión guardado del servidor de sincronización. `sotto unlock` utiliza
+tu contraseña maestra cuando no hay una sesión válida en caché. Los comandos que
+necesitan descifrar datos locales también solicitan el desbloqueo cuando hace falta.
+Consulta [Consultar el estado local](#consultar-el-estado-local) para conocer los campos de estado.
+
+La sesión local dura 12 horas desde que se guarda la clave en caché, no desde tu
+última actividad. La caducidad se comprueba al leer la clave en caché. Ejecutar
+`sotto unlock` cuando ya está desbloqueada no prolonga ese plazo. Ni el bloqueo ni
+la caducidad borran el texto sin cifrar que ya tienen las aplicaciones en ejecución.
+
+Para borrar también el inicio de sesión guardado de la CLI en el servidor de
+sincronización, ejecuta ambos comandos:
+
+```sh
+sotto lock
+sotto logout
+```
+
+`sotto logout` elimina el token de sesión del servidor guardado por la CLI,
+independientemente de la caché de desbloqueo local. No cierra las sesiones del
+navegador ni las de otros dispositivos.
+
 ### Estado de Cloud
 
 Para consultar el servidor configurado y la elegibilidad de tu cuenta para Cloud, inicia sesión primero:
@@ -585,6 +667,42 @@ border = "#331144"
 
 Guardado como `synth.toml`, ese archivo añade un tema `synth`. Aplícalo con
 `sotto theme set synth`, o para un solo comando con `sotto --theme synth <command>`.
+
+### Restaurar una versión anterior de un secreto
+
+Empieza en un proyecto ya configurado y mantén seleccionado el mismo entorno durante todo el proceso.
+Necesitas una sesión iniciada y el almacén local desbloqueado. El historial procede del servidor:
+los valores que nunca se han enviado no están disponibles allí para recuperarlos.
+
+```sh
+sotto history DATABASE_URL
+```
+
+Elige un número de versión positivo y legible del historial. El ejemplo siguiente usa `2`;
+sustitúyelo por una versión disponible, sin el prefijo `v` que se muestra.
+
+```sh
+sotto rollback DATABASE_URL 2
+sotto push
+```
+
+Rollback restaura el valor elegido como una nueva versión local. No borra ni reescribe el
+historial anterior, y el servidor no se actualiza hasta el envío posterior.
+
+Para obtener JSON con solo metadatos:
+
+```sh
+sotto history DATABASE_URL --json
+```
+
+Cada fila contiene `version`, `readable` (si se pudo descifrar el valor) y `size_bytes`
+(el número de bytes del texto sin cifrar, o null si la versión es ilegible). No se imprimen valores.
+En cambio, `--reveal` imprime los valores secretos y no se puede combinar con `--json`.
+
+Si no hay historial en el servidor, comprueba el entorno seleccionado y si se ha enviado.
+Un envío ahora no recupera valores antiguos que nunca se sincronizaron. Para una versión
+ilegible, sigue la sugerencia de la CLI: ejecuta `sotto pull` e inténtalo de nuevo;
+esto no garantiza que las claves disponibles permitan descifrar esa versión.
 
 ### Variables de entorno
 

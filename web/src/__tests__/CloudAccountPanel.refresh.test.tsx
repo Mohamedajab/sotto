@@ -6,15 +6,31 @@ import * as api from "../api";
 import { CloudAccountPanel } from "../CloudAccountPanel";
 
 vi.mock("../api", () => ({
+  confirmCloudContactVerification: vi.fn(),
+  fetchCloudContactStatus: vi.fn(),
+  UnsupportedCloudContactError: class UnsupportedCloudContactError extends Error {},
+  revokeCloudContact: vi.fn(),
+  startCloudContactVerification: vi.fn(),
   cancelPersonalBilling: vi.fn(),
+  acceptPayerTransfer: vi.fn(),
+  beginPayerTransfer: vi.fn(),
+  createPayerTransferPaymentSetup: vi.fn(),
   createPersonalCheckout: vi.fn(),
   createPersonalPortal: vi.fn(),
   fetchCloudExportChunk: vi.fn(),
   fetchCloudNotices: vi.fn(),
+  fetchPayerTransferCapabilities: vi.fn(),
+  fetchPayerTransfer: vi.fn(),
+  fetchPayerTransfers: vi.fn(),
+  fetchMembers: vi.fn(),
+  fetchOrgs: vi.fn(),
   fetchEligibility: vi.fn(),
   fetchPersonalQuote: vi.fn(),
+  me: vi.fn(),
+  quotePayerTransfer: vi.fn(),
   fetchPersonalOperation: vi.fn(),
   requestPersonalRefund: vi.fn(),
+  withdrawPayerTransfer: vi.fn(),
   startCloudExport: vi.fn(),
 }));
 
@@ -49,8 +65,14 @@ function deferred<T>() {
 
 beforeEach(() => {
   vi.resetAllMocks();
+  vi.mocked(api.fetchPayerTransferCapabilities).mockResolvedValue({ available: false, setupAvailable: false });
+  vi.mocked(api.fetchPayerTransfers).mockResolvedValue({ transfers: [], nextCursor: null });
+  vi.mocked(api.me).mockResolvedValue(null);
+  vi.mocked(api.fetchOrgs).mockResolvedValue([]);
+  vi.mocked(api.fetchMembers).mockResolvedValue([]);
   vi.mocked(api.fetchEligibility).mockResolvedValue(eligibility);
   vi.mocked(api.fetchCloudNotices).mockResolvedValue([]);
+  vi.mocked(api.fetchCloudContactStatus).mockResolvedValue({ email: null, pendingExpiresAtEpoch: null, enrolmentAvailable: false });
 });
 
 afterEach(() => {

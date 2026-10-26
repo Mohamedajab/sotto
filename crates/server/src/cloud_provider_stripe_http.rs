@@ -308,6 +308,16 @@ impl StripeReadClient {
         if api_key.trim().is_empty() {
             return Err(StripeReadError::InvalidConfig("Stripe API key"));
         }
+        let key_livemode = if api_key.starts_with("sk_live_") || api_key.starts_with("rk_live_") {
+            Some(true)
+        } else if api_key.starts_with("sk_test_") || api_key.starts_with("rk_test_") {
+            Some(false)
+        } else {
+            None
+        };
+        if key_livemode != Some(matches!(config.environment, ProviderEnvironment::Live)) {
+            return Err(StripeReadError::InvalidConfig("Stripe API key environment"));
+        }
         let limits = limits.validate()?;
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -335,6 +345,7 @@ impl StripeReadClient {
             pages: 0,
             records: 0,
             account_verified: false,
+            last_permission_scope: None,
             identity: Arc::clone(&self.identity),
         }
     }
@@ -367,15 +378,13 @@ impl StripeReadClient {
         if id != self.account_id {
             return Err(StripeReadError::AccountMismatch);
         }
-        let livemode = value
-            .get("livemode")
-            .and_then(Value::as_bool)
-            .ok_or(StripeReadError::MalformedResponse("account.livemode"))?;
-        if livemode != matches!(self.environment, ProviderEnvironment::Live) {
-            return Err(StripeReadError::ContextMismatch);
-        }
         session.account_verified = true;
-        Ok(StripeAccountResource { id, livemode })
+        // Stripe's Account object has no `livemode` field. The key prefix is the authoritative
+        // mode signal; `build` rejects a key whose mode differs from the configured environment.
+        Ok(StripeAccountResource {
+            id,
+            livemode: matches!(self.environment, ProviderEnvironment::Live),
+        })
     }
 
     pub async fn subscription(
@@ -405,7 +414,12 @@ impl StripeReadClient {
         self.ensure_account(session).await?;
         validate_identifier(invoice_id)?;
         let path = format!("v1/invoices/{invoice_id}");
-        let value = self.request_json(session, Method::GET, &path, &[]).await?;
+        // Stripe marks amount_paid_off_stripe as includable rather than returning it by
+        // default. We require it to distinguish Stripe settlements from off-Stripe payment.
+        let query = [("expand[]".to_owned(), "amount_paid_off_stripe".to_owned())];
+        let value = self
+            .request_json(session, Method::GET, &path, &query)
+            .await?;
         let resource = parse_invoice(&value)?;
         if resource.id != invoice_id {
             return Err(StripeReadError::ContextMismatch);
@@ -861,6 +875,7 @@ impl StripeReadClient {
             currency,
             amount_due,
             amount_paid,
+            payment.payment_intent_id().to_owned(),
             format!(
                 "stripe:invoice:{invoice_id}:payment:{}",
                 payment.payment_intent_id()
@@ -1485,6 +1500,91 @@ impl StripeReadClient {
         )
     }
 
+    /// Read the current failed sponsored renewal invoice and its complete, bounded line list.
+    /// Only an open automatic cycle invoice is usable. A closed invoice returns `None` because a
+    /// late failure delivery must not create recovery evidence or trigger a webhook retry.
+    pub async fn sponsored_failure_invoice(
+        &self,
+        session: &mut StripeReadSession,
+        invoice_id: &str,
+        customer_id: &str,
+        subscription_id: &str,
+    ) -> Result<Option<(StripeInvoiceResource, Vec<StripeInvoiceLineResource>)>, StripeReadError>
+    {
+        let invoice = self.invoice(session, invoice_id).await?;
+        if invoice.parent_type.as_deref() != Some("subscription_details")
+            || invoice.customer_id.as_deref() != Some(customer_id)
+            || invoice.subscription_id.as_deref() != Some(subscription_id)
+        {
+            return Err(StripeReadError::Observation(
+                StripeContractError::ContextMismatch,
+            ));
+        }
+        // A failed webhook can arrive after the same invoice was paid or otherwise closed. That
+        // is a stale delivery, not a reason to create recovery evidence or retry the webhook.
+        match invoice.status.as_deref() {
+            Some("open") => {}
+            Some("paid" | "void" | "uncollectible") => return Ok(None),
+            Some(_) => {
+                return Err(StripeReadError::Observation(
+                    StripeContractError::UnsupportedSettlement(
+                        "sponsored renewal invoice is not open or closed",
+                    ),
+                ));
+            }
+            None => return Err(StripeReadError::MalformedResponse("invoice.status")),
+        }
+        if invoice.billing_reason.as_deref() != Some("subscription_cycle")
+            || invoice.collection_method.as_deref() != Some("charge_automatically")
+            || invoice.currency.as_deref() != Some("gbp")
+            || invoice.amount_due.is_none_or(|amount| amount <= 0)
+            || invoice.amount_remaining != invoice.amount_due
+            || invoice.amount_paid != Some(0)
+            || invoice.amount_overpaid != Some(0)
+            || invoice.amount_paid_off_stripe != Some(0)
+            || invoice.livemode != Some(matches!(self.environment, ProviderEnvironment::Live))
+        {
+            return Err(StripeReadError::Observation(
+                StripeContractError::UnsupportedSettlement(
+                    "sponsored renewal is not a complete open automatic cycle invoice",
+                ),
+            ));
+        }
+        let lines = self.invoice_lines(session, invoice_id).await?;
+        if lines.is_empty() {
+            return Err(StripeReadError::MalformedResponse("lines.data"));
+        }
+        for line in &lines {
+            if line.invoice_id.as_deref() != Some(invoice_id)
+                || line.parent_type.as_deref() != Some("subscription_item_details")
+                || line.pricing_type.as_deref() != Some("price_details")
+                || line.subscription_id.as_deref() != Some(subscription_id)
+                || line
+                    .subscription_item_id
+                    .as_deref()
+                    .is_none_or(str::is_empty)
+                || line.price_id.as_deref().is_none_or(str::is_empty)
+                || line.livemode != Some(matches!(self.environment, ProviderEnvironment::Live))
+                || line.quantity.is_none_or(|quantity| quantity <= 0)
+                || line.period_start.is_none_or(|start| start < 0)
+                || line
+                    .period_end
+                    .zip(line.period_start)
+                    .is_none_or(|(end, start)| end <= start)
+            {
+                return Err(StripeReadError::Observation(
+                    StripeContractError::ContextMismatch,
+                ));
+            }
+            if line.proration != Some(false) {
+                return Err(StripeReadError::Observation(
+                    StripeContractError::UnsupportedRenewal("sponsored proration"),
+                ));
+            }
+        }
+        Ok(Some((invoice, lines)))
+    }
+
     async fn list_bounded<T, F>(
         &self,
         session: &mut StripeReadSession,
@@ -1681,7 +1781,13 @@ impl StripeReadClient {
             request = request.query(query);
         }
         let response = request.send().await.map_err(map_request_error)?;
-        self.read_response(session, response).await
+        match self.read_response(session, response).await {
+            Err(error @ StripeReadError::Permission { .. }) => {
+                session.last_permission_scope = Some(safe_permission_scope(path));
+                Err(error)
+            }
+            result => result,
+        }
     }
 
     async fn read_response(
@@ -1737,6 +1843,7 @@ pub struct StripeReadSession {
     pages: usize,
     records: usize,
     account_verified: bool,
+    last_permission_scope: Option<&'static str>,
     identity: Arc<()>,
 }
 
@@ -1754,6 +1861,14 @@ impl fmt::Debug for StripeReadSession {
 }
 
 impl StripeReadSession {
+    /// Return the fixed endpoint category for the most recent 403 response.
+    ///
+    /// This diagnostic omits request paths and resource identifiers.
+    #[doc(hidden)]
+    pub fn last_permission_scope(&self) -> Option<&'static str> {
+        self.last_permission_scope
+    }
+
     fn remaining(&self) -> Result<Duration, StripeReadError> {
         self.deadline
             .checked_duration_since(Instant::now())
@@ -1806,6 +1921,24 @@ impl StripeReadSession {
     }
 }
 
+fn safe_permission_scope(path: &str) -> &'static str {
+    match path {
+        "v1/account" => "account",
+        "v1/invoices" => "invoice_list",
+        "v1/invoice_payments" => "invoice_payments",
+        "v1/refunds" => "refunds",
+        "v1/disputes" => "disputes",
+        "v1/credit_notes" => "credit_notes",
+        "v1/events" => "events",
+        "v1/prices" => "prices",
+        "v1/products" => "products",
+        path if path.starts_with("v1/invoices/") && path.ends_with("/lines") => "invoice_lines",
+        path if path.starts_with("v1/invoices/") => "invoice_detail",
+        path if path.starts_with("v1/subscriptions/") => "subscriptions",
+        _ => "other_stripe_read",
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StripeAccountResource {
     pub id: String,
@@ -1845,6 +1978,10 @@ pub struct StripeInvoiceResource {
     pub amount_paid_off_stripe: Option<i64>,
     pub allocation_reference: Option<String>,
     pub livemode: Option<bool>,
+    /// Line summaries included in the Invoice response. When `lines_complete` is false, callers
+    /// must fetch the invoice's line collection before using these as a negative match.
+    pub line_summaries: Vec<StripeInvoiceLineResource>,
+    pub lines_complete: bool,
     billing_reason_present: bool,
     collection_method_present: bool,
 }
@@ -2094,7 +2231,11 @@ fn invoice_headers_match(left: &StripeInvoiceResource, right: &StripeInvoiceReso
         && left.amount_due == right.amount_due
         && left.amount_remaining == right.amount_remaining
         && left.amount_overpaid == right.amount_overpaid
-        && left.amount_paid_off_stripe == right.amount_paid_off_stripe
+        // Stripe omits this includable value from invoice list summaries unless expanded. The
+        // detail read requests it and the access decision validates that value, so a missing
+        // summary value is unknown rather than evidence that the invoice changed.
+        && (left.amount_paid_off_stripe.is_none()
+            || left.amount_paid_off_stripe == right.amount_paid_off_stripe)
         && left.allocation_reference == right.allocation_reference
         && left.livemode == right.livemode
 }
@@ -2737,6 +2878,23 @@ fn parse_subscription(value: &Value) -> Result<StripeSubscriptionResource, Strip
 }
 
 fn parse_invoice(value: &Value) -> Result<StripeInvoiceResource, StripeReadError> {
+    let (line_summaries, lines_complete) = match value.get("lines") {
+        None | Some(Value::Null) => (Vec::new(), false),
+        Some(lines) => {
+            let lines = optional_object(Some(lines), "invoice.lines")?
+                .ok_or(StripeReadError::MalformedResponse("invoice.lines"))?;
+            let data = lines
+                .get("data")
+                .and_then(Value::as_array)
+                .ok_or(StripeReadError::MalformedResponse("invoice.lines.data"))?;
+            let has_more = optional_bool(lines.get("has_more"), "invoice.lines.has_more")?;
+            let parsed = data
+                .iter()
+                .map(parse_invoice_line)
+                .collect::<Result<Vec<_>, _>>()?;
+            (parsed, has_more == Some(false))
+        }
+    };
     let parent = optional_object(value.get("parent"), "invoice.parent")?;
     let parent_type = parent
         .map(|parent| optional_string(parent.get("type"), "invoice.parent.type"))
@@ -2801,6 +2959,8 @@ fn parse_invoice(value: &Value) -> Result<StripeInvoiceResource, StripeReadError
         )?,
         allocation_reference: parent_allocation_reference.or(invoice_allocation_reference),
         livemode: optional_bool(value.get("livemode"), "invoice.livemode")?,
+        line_summaries,
+        lines_complete,
         billing_reason_present: value.get("billing_reason").is_some(),
         collection_method_present: value.get("collection_method").is_some(),
     })
@@ -3259,5 +3419,80 @@ fn map_request_error(error: reqwest::Error) -> StripeReadError {
         StripeReadError::RedirectRejected
     } else {
         StripeReadError::Transport
+    }
+}
+
+#[cfg(test)]
+mod invoice_summary_tests {
+    use super::{parse_invoice, safe_permission_scope};
+
+    #[test]
+    fn permission_scope_diagnostics_never_include_resource_identifiers() {
+        assert_eq!(
+            safe_permission_scope("v1/invoices/in_secret_123/lines"),
+            "invoice_lines"
+        );
+        assert_eq!(
+            safe_permission_scope("v1/invoices/in_secret_123"),
+            "invoice_detail"
+        );
+        assert_eq!(safe_permission_scope("v1/refunds"), "refunds");
+        assert_eq!(
+            safe_permission_scope("v1/unrecognised/resource_456"),
+            "other_stripe_read"
+        );
+    }
+
+    #[test]
+    fn invoice_list_summary_marks_complete_line_data_for_candidate_filtering() {
+        let invoice = parse_invoice(&serde_json::json!({
+            "id": "in_summary",
+            "lines": {
+                "has_more": false,
+                "data": [{
+                    "id": "il_summary",
+                    "parent": {
+                        "type": "subscription_item_details",
+                        "subscription_item_details": {
+                            "subscription": "sub_summary",
+                            "subscription_item": "si_summary"
+                        }
+                    },
+                    "pricing": {
+                        "type": "price_details",
+                        "price_details": {"price": "price_summary"}
+                    },
+                    "period": {"start": 100, "end": 200},
+                    "invoice": "in_summary"
+                }]
+            }
+        }))
+        .expect("valid invoice list summary");
+
+        assert!(invoice.lines_complete);
+        assert_eq!(invoice.line_summaries.len(), 1);
+        assert_eq!(
+            invoice.line_summaries[0].subscription_item_id.as_deref(),
+            Some("si_summary")
+        );
+        assert_eq!(invoice.line_summaries[0].period_end, Some(200));
+    }
+
+    #[test]
+    fn invoice_without_embedded_lines_requires_a_full_line_read() {
+        let invoice = parse_invoice(&serde_json::json!({"id": "in_summary"}))
+            .expect("valid invoice without expanded line summaries");
+        assert!(!invoice.lines_complete);
+        assert!(invoice.line_summaries.is_empty());
+    }
+
+    #[test]
+    fn invoice_summary_without_has_more_is_not_treated_as_complete() {
+        let invoice = parse_invoice(&serde_json::json!({
+            "id": "in_partial_summary",
+            "lines": {"data": []}
+        }))
+        .expect("partial line summary can be completed from its endpoint");
+        assert!(!invoice.lines_complete);
     }
 }
