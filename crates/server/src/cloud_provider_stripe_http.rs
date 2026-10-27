@@ -308,6 +308,16 @@ impl StripeReadClient {
         if api_key.trim().is_empty() {
             return Err(StripeReadError::InvalidConfig("Stripe API key"));
         }
+        let key_livemode = if api_key.starts_with("sk_live_") || api_key.starts_with("rk_live_") {
+            Some(true)
+        } else if api_key.starts_with("sk_test_") || api_key.starts_with("rk_test_") {
+            Some(false)
+        } else {
+            None
+        };
+        if key_livemode != Some(matches!(config.environment, ProviderEnvironment::Live)) {
+            return Err(StripeReadError::InvalidConfig("Stripe API key environment"));
+        }
         let limits = limits.validate()?;
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -335,6 +345,7 @@ impl StripeReadClient {
             pages: 0,
             records: 0,
             account_verified: false,
+            last_permission_scope: None,
             identity: Arc::clone(&self.identity),
         }
     }
@@ -367,15 +378,13 @@ impl StripeReadClient {
         if id != self.account_id {
             return Err(StripeReadError::AccountMismatch);
         }
-        let livemode = value
-            .get("livemode")
-            .and_then(Value::as_bool)
-            .ok_or(StripeReadError::MalformedResponse("account.livemode"))?;
-        if livemode != matches!(self.environment, ProviderEnvironment::Live) {
-            return Err(StripeReadError::ContextMismatch);
-        }
         session.account_verified = true;
-        Ok(StripeAccountResource { id, livemode })
+        // Stripe's Account object has no `livemode` field. The key prefix is the authoritative
+        // mode signal; `build` rejects a key whose mode differs from the configured environment.
+        Ok(StripeAccountResource {
+            id,
+            livemode: matches!(self.environment, ProviderEnvironment::Live),
+        })
     }
 
     pub async fn subscription(
@@ -405,7 +414,12 @@ impl StripeReadClient {
         self.ensure_account(session).await?;
         validate_identifier(invoice_id)?;
         let path = format!("v1/invoices/{invoice_id}");
-        let value = self.request_json(session, Method::GET, &path, &[]).await?;
+        // Stripe marks amount_paid_off_stripe as includable rather than returning it by
+        // default. We require it to distinguish Stripe settlements from off-Stripe payment.
+        let query = [("expand[]".to_owned(), "amount_paid_off_stripe".to_owned())];
+        let value = self
+            .request_json(session, Method::GET, &path, &query)
+            .await?;
         let resource = parse_invoice(&value)?;
         if resource.id != invoice_id {
             return Err(StripeReadError::ContextMismatch);
@@ -1767,7 +1781,13 @@ impl StripeReadClient {
             request = request.query(query);
         }
         let response = request.send().await.map_err(map_request_error)?;
-        self.read_response(session, response).await
+        match self.read_response(session, response).await {
+            Err(error @ StripeReadError::Permission { .. }) => {
+                session.last_permission_scope = Some(safe_permission_scope(path));
+                Err(error)
+            }
+            result => result,
+        }
     }
 
     async fn read_response(
@@ -1823,6 +1843,7 @@ pub struct StripeReadSession {
     pages: usize,
     records: usize,
     account_verified: bool,
+    last_permission_scope: Option<&'static str>,
     identity: Arc<()>,
 }
 
@@ -1840,6 +1861,14 @@ impl fmt::Debug for StripeReadSession {
 }
 
 impl StripeReadSession {
+    /// Return the fixed endpoint category for the most recent 403 response.
+    ///
+    /// This diagnostic omits request paths and resource identifiers.
+    #[doc(hidden)]
+    pub fn last_permission_scope(&self) -> Option<&'static str> {
+        self.last_permission_scope
+    }
+
     fn remaining(&self) -> Result<Duration, StripeReadError> {
         self.deadline
             .checked_duration_since(Instant::now())
@@ -1889,6 +1918,24 @@ impl StripeReadSession {
             return Err(StripeReadError::RecordBoundExceeded);
         }
         Ok(())
+    }
+}
+
+fn safe_permission_scope(path: &str) -> &'static str {
+    match path {
+        "v1/account" => "account",
+        "v1/invoices" => "invoice_list",
+        "v1/invoice_payments" => "invoice_payments",
+        "v1/refunds" => "refunds",
+        "v1/disputes" => "disputes",
+        "v1/credit_notes" => "credit_notes",
+        "v1/events" => "events",
+        "v1/prices" => "prices",
+        "v1/products" => "products",
+        path if path.starts_with("v1/invoices/") && path.ends_with("/lines") => "invoice_lines",
+        path if path.starts_with("v1/invoices/") => "invoice_detail",
+        path if path.starts_with("v1/subscriptions/") => "subscriptions",
+        _ => "other_stripe_read",
     }
 }
 
@@ -2184,7 +2231,11 @@ fn invoice_headers_match(left: &StripeInvoiceResource, right: &StripeInvoiceReso
         && left.amount_due == right.amount_due
         && left.amount_remaining == right.amount_remaining
         && left.amount_overpaid == right.amount_overpaid
-        && left.amount_paid_off_stripe == right.amount_paid_off_stripe
+        // Stripe omits this includable value from invoice list summaries unless expanded. The
+        // detail read requests it and the access decision validates that value, so a missing
+        // summary value is unknown rather than evidence that the invoice changed.
+        && (left.amount_paid_off_stripe.is_none()
+            || left.amount_paid_off_stripe == right.amount_paid_off_stripe)
         && left.allocation_reference == right.allocation_reference
         && left.livemode == right.livemode
 }
@@ -3373,7 +3424,24 @@ fn map_request_error(error: reqwest::Error) -> StripeReadError {
 
 #[cfg(test)]
 mod invoice_summary_tests {
-    use super::parse_invoice;
+    use super::{parse_invoice, safe_permission_scope};
+
+    #[test]
+    fn permission_scope_diagnostics_never_include_resource_identifiers() {
+        assert_eq!(
+            safe_permission_scope("v1/invoices/in_secret_123/lines"),
+            "invoice_lines"
+        );
+        assert_eq!(
+            safe_permission_scope("v1/invoices/in_secret_123"),
+            "invoice_detail"
+        );
+        assert_eq!(safe_permission_scope("v1/refunds"), "refunds");
+        assert_eq!(
+            safe_permission_scope("v1/unrecognised/resource_456"),
+            "other_stripe_read"
+        );
+    }
 
     #[test]
     fn invoice_list_summary_marks_complete_line_data_for_candidate_filtering() {

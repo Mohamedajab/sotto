@@ -201,6 +201,7 @@ pub struct StripePersonalInvoiceObservation {
     payment_intent_id: String,
     currency: String,
     amount_paid: i64,
+    amount_paid_off_stripe: i64,
     interval: StripeInterval,
     period_start: i64,
     period_end: i64,
@@ -230,6 +231,7 @@ impl StripePersonalInvoiceObservation {
             payment_intent_id: "pi_test".into(),
             currency: "gbp".into(),
             amount_paid: 100,
+            amount_paid_off_stripe: 0,
             interval,
             period_start,
             period_end,
@@ -267,6 +269,10 @@ impl StripePersonalInvoiceObservation {
 
     pub const fn amount_paid(&self) -> i64 {
         self.amount_paid
+    }
+
+    pub(crate) const fn amount_paid_off_stripe(&self) -> i64 {
+        self.amount_paid_off_stripe
     }
 
     pub const fn interval(&self) -> StripeInterval {
@@ -372,6 +378,7 @@ pub(crate) fn validate_personal_invoice_observation(
         allocation_reference: facts.allocation_reference,
         currency: facts.currency.to_ascii_lowercase(),
         amount_paid: facts.amount_paid,
+        amount_paid_off_stripe: facts.amount_paid_off_stripe,
         interval,
         period_start: facts.period_start,
         period_end: facts.period_end,
@@ -576,16 +583,38 @@ pub fn decode_paid_invoice(
 
     let event: RawStripeEvent =
         serde_json::from_slice(raw_payload).map_err(|_| StripeContractError::MalformedPayload)?;
-    decode_paid_invoice_event(event, config, binding, settlement)
+    decode_paid_invoice_event(event, config, binding, settlement, None)
 }
 
-/// Decode the same paid-invoice contract from a Stripe Event retrieved through the authenticated
-/// Events API. This path does not assert or fabricate webhook-signature provenance.
-pub(crate) fn decode_paid_invoice_from_authenticated_read(
+/// Decode a signed invoice event using an independently fetched, validated invoice observation.
+/// The observation may supply fields Stripe omitted from the event snapshot, but only for the same
+/// invoice and ownership binding.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_paid_invoice_with_observation(
+    raw_payload: &[u8],
+    signature_header: &str,
+    webhook_secret: &str,
+    now: i64,
+    config: &StripeCoverageConfig,
+    binding: &StripeAllocationBinding,
+    settlement: &StripePaymentSettlement,
+    observation: &StripePersonalInvoiceObservation,
+) -> Result<StripeCoverageEvidence, StripeContractError> {
+    let payload =
+        std::str::from_utf8(raw_payload).map_err(|_| StripeContractError::MalformedPayload)?;
+    verify_webhook_signature(webhook_secret, signature_header, payload, now)?;
+
+    let event: RawStripeEvent =
+        serde_json::from_slice(raw_payload).map_err(|_| StripeContractError::MalformedPayload)?;
+    decode_paid_invoice_event(event, config, binding, settlement, Some(observation))
+}
+
+pub(crate) fn decode_paid_invoice_from_authenticated_read_with_observation(
     event: &AuthenticatedStripeEvent,
     config: &StripeCoverageConfig,
     binding: &StripeAllocationBinding,
     settlement: &StripePaymentSettlement,
+    observation: &StripePersonalInvoiceObservation,
 ) -> Result<StripeCoverageEvidence, StripeContractError> {
     if event.account_id() != config.account_id || event.environment() != config.environment {
         return Err(StripeContractError::ContextMismatch);
@@ -597,7 +626,7 @@ pub(crate) fn decode_paid_invoice_from_authenticated_read(
     if parsed.id != event.event_id() {
         return Err(StripeContractError::ContextMismatch);
     }
-    decode_paid_invoice_event(parsed, config, binding, settlement)
+    decode_paid_invoice_event(parsed, config, binding, settlement, Some(observation))
 }
 
 fn decode_paid_invoice_event(
@@ -605,6 +634,7 @@ fn decode_paid_invoice_event(
     config: &StripeCoverageConfig,
     binding: &StripeAllocationBinding,
     settlement: &StripePaymentSettlement,
+    verified_observation: Option<&StripePersonalInvoiceObservation>,
 ) -> Result<StripeCoverageEvidence, StripeContractError> {
     let account_provenance = validate_event_context(&event, config)?;
     let api_version = event
@@ -630,7 +660,19 @@ fn decode_paid_invoice_event(
     let amount_paid = required_i64(invoice, "amount_paid")?;
     let amount_due = required_i64(invoice, "amount_due")?;
     let amount_overpaid = required_i64(invoice, "amount_overpaid")?;
-    let amount_paid_off_stripe = required_i64(invoice, "amount_paid_off_stripe")?;
+    let amount_paid_off_stripe = match invoice.get("amount_paid_off_stripe") {
+        Some(value) if !value.is_null() => required_i64(invoice, "amount_paid_off_stripe")?,
+        _ => verified_observation
+            .filter(|observation| {
+                observation.invoice_id == invoice_id
+                    && observation.customer_id == customer_id
+                    && observation.subscription_id == binding.subscription_id
+                    && observation.provider_item_id == binding.provider_item_id
+                    && observation.allocation_reference == binding.allocation_reference
+            })
+            .map(StripePersonalInvoiceObservation::amount_paid_off_stripe)
+            .ok_or(StripeContractError::MissingField("amount_paid_off_stripe"))?,
+    };
 
     let lines = invoice
         .get("lines")
@@ -918,4 +960,150 @@ fn required_i64(object: &Value, field: &'static str) -> Result<i64, StripeContra
         .get(field)
         .and_then(Value::as_i64)
         .ok_or(StripeContractError::MissingField(field))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hmac::{Hmac, Mac};
+    use serde_json::json;
+    use sha2::Sha256;
+
+    const SECRET: &str = "whsec_contract_test";
+    const NOW: i64 = 1_700_000_000;
+
+    fn test_config() -> StripeCoverageConfig {
+        StripeCoverageConfig::new(
+            "acct_test_sotto_contract",
+            ProviderEnvironment::Test,
+            "price_contract_month",
+            "price_contract_year",
+        )
+        .unwrap()
+    }
+
+    fn test_binding() -> StripeAllocationBinding {
+        StripeAllocationBinding::new(
+            "allocation_contract_person",
+            "cus_contract_person",
+            "sub_contract_person",
+            "si_contract_person",
+            PayerKind::Personal,
+        )
+        .unwrap()
+    }
+
+    fn sign(payload: &[u8]) -> String {
+        let mut mac = Hmac::<Sha256>::new_from_slice(SECRET.as_bytes()).unwrap();
+        mac.update(format!("{NOW}.{}", String::from_utf8_lossy(payload)).as_bytes());
+        let signature = mac
+            .finalize()
+            .into_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        format!("t={NOW},v1={signature}")
+    }
+
+    fn test_settlement(config: &StripeCoverageConfig) -> StripePaymentSettlement {
+        let payment = include_str!("../tests/fixtures/stripe/invoice_payment_paid.json");
+        decode_invoice_payment(payment.as_bytes(), config).unwrap()
+    }
+
+    fn test_observation() -> StripePersonalInvoiceObservation {
+        StripePersonalInvoiceObservation::for_test(
+            "in_contract_invoice",
+            "cus_contract_person",
+            "sub_contract_person",
+            "si_contract_person",
+            "allocation_contract_person",
+            StripeInterval::Month,
+            NOW,
+            1_702_592_000,
+            "stripe:invoice:in_contract_invoice:line:il_contract_line",
+        )
+    }
+
+    #[test]
+    fn nullable_off_stripe_amount_requires_a_matching_verified_invoice_read() {
+        let mut event: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/stripe/invoice_paid_personal.json"
+        ))
+        .unwrap();
+        event["data"]["object"]["amount_paid_off_stripe"] = Value::Null;
+        let payload = serde_json::to_vec(&event).unwrap();
+        let signature = sign(&payload);
+        let config = test_config();
+        let binding = test_binding();
+        let settlement = test_settlement(&config);
+        let observation = test_observation();
+
+        assert!(matches!(
+            decode_paid_invoice(
+                &payload,
+                &signature,
+                SECRET,
+                NOW,
+                &config,
+                &binding,
+                &settlement,
+            ),
+            Err(StripeContractError::MissingField("amount_paid_off_stripe"))
+        ));
+
+        let evidence = decode_paid_invoice_with_observation(
+            &payload,
+            &signature,
+            SECRET,
+            NOW,
+            &config,
+            &binding,
+            &settlement,
+            &observation,
+        )
+        .unwrap();
+        assert_eq!(evidence.invoice_id, observation.invoice_id());
+
+        let unrelated = StripePersonalInvoiceObservation::for_test(
+            "in_another_invoice",
+            "cus_contract_person",
+            "sub_contract_person",
+            "si_contract_person",
+            "allocation_contract_person",
+            StripeInterval::Month,
+            NOW,
+            1_702_592_000,
+            "stripe:invoice:in_another_invoice:line:il_contract_line",
+        );
+        assert!(matches!(
+            decode_paid_invoice_with_observation(
+                &payload,
+                &signature,
+                SECRET,
+                NOW,
+                &config,
+                &binding,
+                &settlement,
+                &unrelated,
+            ),
+            Err(StripeContractError::MissingField("amount_paid_off_stripe"))
+        ));
+
+        event["data"]["object"]["amount_paid_off_stripe"] = json!(1);
+        let payload = serde_json::to_vec(&event).unwrap();
+        let signature = sign(&payload);
+        assert!(matches!(
+            decode_paid_invoice_with_observation(
+                &payload,
+                &signature,
+                SECRET,
+                NOW,
+                &config,
+                &binding,
+                &settlement,
+                &observation,
+            ),
+            Err(StripeContractError::UnsupportedSettlement(_))
+        ));
+    }
 }

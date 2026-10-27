@@ -172,7 +172,7 @@ exemplos de matriz, Windows e workflows reutilizáveis.
 
 Quer uma demo funcional? O [**sotto-example**](https://github.com/getsotto/sotto-example)
 mostra a injeção local de segredos com um GIF de Python e passos copiáveis, além de pequenos exemplos
-em JavaScript, TypeScript, Java, C#, PHP, Go e C++. Não precisa de conta; as instruções cobrem
+em JavaScript, TypeScript, Java, C#, PHP, Go, Rust e C++. Não precisa de conta; as instruções cobrem
 macOS, Linux e Windows.
 
 ```sh
@@ -253,6 +253,75 @@ sotto env copy dev staging --confirm  # apply the copy; never delete destination
 ambiente) ou `>` (só no segundo). Sem `--confirm`, a cópia é uma simulação. Uma cópia confirmada
 adiciona e atualiza segredos, mas mantém intactas as chaves que existem apenas no destino.
 
+### Importar um arquivo dotenv
+
+`sotto import` lê um arquivo dotenv e define cada atribuição em um ambiente, criptografando cada valor
+localmente. Ele grava no ambiente ativo, a menos que você indique outro com `--env`:
+
+```sh
+sotto import .env                         # into the active environment
+sotto import --env staging .env.staging   # into staging; the default environment is unchanged
+```
+
+Uma importação é mesclada ao que já existe. Suponha que `staging` já tenha `API_URL` e `REGION`, e que
+`.env.staging` contenha:
+
+```dotenv
+API_URL=https://staging.example.test
+FEATURE_FLAG=on
+```
+
+Depois de importá-lo em `staging`:
+
+- `API_URL` recebe o valor do arquivo, porque um nome existente é atualizado.
+- `FEATURE_FLAG` é adicionado, porque um novo nome é criado.
+- `REGION` é mantido, porque um nome ausente do arquivo nunca é removido.
+
+A importação grava apenas no seu armazenamento local. Depois de `sotto login`, envie o resultado em uma etapa separada:
+
+```sh
+sotto push --env staging
+```
+
+O arquivo dotenv é apenas lido: a importação não o altera, não o consome nem o apaga, então proteja-o ou
+apague-o você mesmo se ele tiver valores reais. Um arquivo que não pode ser analisado não altera nada, mas
+uma falha durante a gravação não desfaz as atribuições já armazenadas; por isso, confira
+`sotto ls --env staging` após uma importação interrompida.
+
+Para recuperar um valor anterior, veja [Restaurar uma versão anterior de um segredo](#restaurar-uma-versão-anterior-de-um-segredo).
+Esse histórico vem do servidor, então só ajuda com valores que você já havia enviado. Execute
+`sotto import --help` para ver as regras de aspas e de valores literais em vez de repeti-las aqui.
+
+### Remover um segredo
+
+Para remover um segredo obsoleto de `staging` sem alterar o ambiente padrão:
+
+```sh
+sotto --env staging rm DEMO_OBSOLETE_KEY
+sotto --env staging push
+sotto --env staging pull
+```
+
+`sotto rm` remove o segredo do ambiente selecionado no cofre local.
+`sotto push` sincroniza a remoção com o servidor depois de `sotto login`;
+execute `sotto pull` no mesmo ambiente em outro dispositivo para receber
+a remoção. Execute o último comando no outro dispositivo.
+
+Em um terminal interativo, `sotto rm` sem nome abre o seletor de segredos.
+Depois, aparece uma confirmação com Não como opção padrão; cancelar ou
+recusar mantém o segredo. `--yes` (ou `-y`) ignora a confirmação, mas não
+ignora o seletor sem nome nem uma solicitação de desbloqueio necessária.
+
+As solicitações interativas exigem que stdin, stdout e stderr sejam terminais,
+que `TERM` não seja «dumb» e que `CI` esteja inativo. Em uso não interativo,
+é obrigatório informar o nome; a remoção com nome não pede confirmação
+mesmo sem `--yes`.
+
+Segredos removidos deixam de aparecer nas leituras e listagens comuns, mas
+o histórico de versões é mantido. Isso não é uma exclusão segura e não revoga
+a credencial no provedor externo. Para recuperação, use `sotto history`
+e `sotto rollback`.
+
 ### Compartilhar um segredo
 
 `sotto share` criptografa um segredo em um link de uso único. A chave fica depois do `#` no link,
@@ -330,15 +399,16 @@ de máquina que ele criou na organização, citando cada um para que você possa
 protege o que for escrito depois. Valores que o membro já viu continuam expostos, então troque-os na
 origem.
 
-#### Plano da organização
+#### Direitos antigos da organização
 
 `sotto org plan <org-id>` lê a visão atual de direitos do servidor configurado para essa
 organização. É preciso estar autenticado (`sotto login`); o cofre local não precisa estar
-desbloqueado. Ele mostra o nível atribuído, o nível efetivo (cujos limites se aplicam agora), o
-fim do trial quando a organização tem um, e ou limites de membros e projetos da organização ou
-`limits: none (Team)`.
+desbloqueado. Ele mostra os níveis atribuído e efetivo, a data de trial armazenada e os limites
+aplicáveis, como `limits: none (Team)`. Esses campos mantêm a compatibilidade com registros e implantações antigas de planos
+por organização; eles não descrevem os preços atuais do Cloud por pessoa nem uma nova oferta de
+trial do Cloud.
 
-Saída ilustrativa no Sotto Cloud para uma organização gratuita cujo trial terminou:
+Saída ilustrativa de um registro antigo de plano da organização:
 
 ```text
 tier:      free
@@ -357,8 +427,8 @@ trial:     ends 2026-07-16T09:00:00Z
 limits:    none (Team)
 ```
 
-Esses exemplos são ilustrativos; organizações reais podem mostrar níveis, trials e limites
-diferentes.
+Esses exemplos mostram campos de compatibilidade armazenados, não as ofertas atuais do Cloud.
+Implantações reais podem mostrar outros níveis, datas de trial e limites armazenados.
 
 #### Log de auditoria da organização
 
@@ -376,10 +446,10 @@ com os campos opcionais `target=...`, `env=...` e `(detail)`. É uma visão limi
 metadados, não uma forma de recuperar valores secretos; não há paginação nem um arquivo histórico
 completo.
 
-No Sotto Cloud, a organização precisa de uma habilitação Team efetiva, incluindo um período de teste
-Team ativo. Implantações auto-hospedadas ignoram essa verificação do plano, mas quem chama o comando
-ainda precisa ter o papel de proprietário ou administrador. Se não houver eventos, o comando não
-imprime linhas e termina com sucesso.
+Este comando mantém a antiga verificação de acesso baseada no plano Team da organização.
+Implantações auto-hospedadas ignoram essa verificação do plano, mas quem chama o comando ainda
+precisa ter o papel de proprietário ou administrador. Se não houver eventos, o comando não imprime
+linhas e termina com sucesso.
 
 ### Tokens de máquina e CI
 
@@ -471,6 +541,42 @@ Sem `sotto.toml` nem identidade local:
 ```
 
 Sem `sotto.toml`, nenhum projeto está selecionado. Um arquivo inválido ou ilegível causa um erro.
+
+### Bloquear, desbloquear e sair
+
+Com uma identidade local já inicializada, bloqueie o cofre, confira seu estado e
+desbloqueie-o quando precisar usá-lo novamente:
+
+```sh
+sotto lock
+sotto status
+sotto unlock
+```
+
+`sotto lock` limpa a sessão local da chave mestra em cache usada pelos próximos
+comandos da CLI. Não exclui sua identidade, o cofre criptografado nem o login salvo
+do servidor de sincronização. `sotto unlock` usa sua senha mestra quando não há uma
+sessão válida em cache. Os comandos que precisam descriptografar dados locais
+também solicitam o desbloqueio quando necessário. Consulte
+[Consultar o estado local](#consultar-o-estado-local) para conhecer os campos de estado.
+
+A sessão local dura 12 horas a partir do armazenamento da chave em cache, não da
+sua última atividade. A expiração é verificada quando a chave em cache é lida.
+Executar `sotto unlock` quando o cofre já está desbloqueado não prolonga esse prazo.
+Nem o bloqueio nem a expiração limpam o texto sem criptografia que os aplicativos
+em execução já possuem.
+
+Para limpar também o login da CLI salvo no servidor de sincronização, execute
+os dois comandos:
+
+```sh
+sotto lock
+sotto logout
+```
+
+`sotto logout` remove o token de sessão do servidor armazenado pela CLI,
+independentemente do cache de desbloqueio local. Não encerra sessões do navegador
+nem de outros dispositivos.
 
 ### Status do Cloud
 

@@ -175,7 +175,7 @@ matrices, Windows et workflows réutilisables.
 
 Envie d'une démo fonctionnelle ? [**sotto-example**](https://github.com/getsotto/sotto-example)
 présente l'injection locale de secrets avec un GIF Python et des étapes copiables, plus de petits exemples
-en JavaScript, TypeScript, Java, C#, PHP, Go et C++. Aucun compte requis ; les instructions couvrent
+en JavaScript, TypeScript, Java, C#, PHP, Go, Rust et C++. Aucun compte requis ; les instructions couvrent
 macOS, Linux et Windows.
 
 ```sh
@@ -259,6 +259,75 @@ le premier environnement) ou `>` (seulement dans le second). Sans `--confirm`, l
 simulation. Une copie confirmée ajoute et met à jour les secrets, mais laisse intactes les clés
 présentes uniquement dans la destination.
 
+### Importer un fichier dotenv
+
+`sotto import` lit un fichier dotenv et définit chaque affectation dans un environnement, en chiffrant
+chaque valeur en local. Il écrit dans l'environnement actif, sauf si vous en nommez un autre avec `--env` :
+
+```sh
+sotto import .env                         # into the active environment
+sotto import --env staging .env.staging   # into staging; the default environment is unchanged
+```
+
+Un import fusionne avec l'existant. Supposons que `staging` contienne déjà `API_URL` et `REGION`,
+et que `.env.staging` contienne :
+
+```dotenv
+API_URL=https://staging.example.test
+FEATURE_FLAG=on
+```
+
+Après l'avoir importé dans `staging` :
+
+- `API_URL` prend la valeur du fichier, car un nom existant est mis à jour.
+- `FEATURE_FLAG` est ajouté, car un nouveau nom est créé.
+- `REGION` est conservé, car un nom absent du fichier n'est jamais supprimé.
+
+L'import n'écrit que dans votre magasin local. Après `sotto login`, envoyez le résultat lors d'une étape distincte :
+
+```sh
+sotto push --env staging
+```
+
+Le fichier dotenv est seulement lu : l'import ne le modifie pas, ne le consomme pas et ne le supprime pas,
+donc protégez-le ou supprimez-le vous-même s'il contient de vraies valeurs. Un fichier qui ne s'analyse pas
+ne change rien, mais un échec pendant l'écriture n'annule pas les affectations déjà enregistrées ;
+vérifiez donc `sotto ls --env staging` après un import interrompu.
+
+Pour retrouver une valeur antérieure, voir [Restaurer une ancienne version d'un secret](#restaurer-une-ancienne-version-dun-secret).
+Cet historique provient du serveur : il ne sert donc que pour des valeurs déjà envoyées. Exécutez
+`sotto import --help` pour les règles de guillemets et de valeurs littérales plutôt que de les répéter ici.
+
+### Supprimer un secret
+
+Pour supprimer un secret obsolète de `staging` sans changer l'environnement par défaut :
+
+```sh
+sotto --env staging rm DEMO_OBSOLETE_KEY
+sotto --env staging push
+sotto --env staging pull
+```
+
+`sotto rm` supprime le secret de l'environnement sélectionné dans le coffre local.
+`sotto push` synchronise la suppression avec le serveur après `sotto login` ;
+exécutez `sotto pull` pour le même environnement sur un autre appareil pour
+récupérer ce changement. La dernière commande s'exécute sur cet autre appareil.
+
+Dans un terminal interactif, `sotto rm` sans nom ouvre le sélecteur de secrets.
+Une confirmation est alors demandée, avec Non par défaut ; annuler ou refuser
+laisse le secret inchangé. `--yes` (ou `-y`) évite la confirmation, mais pas
+le sélecteur si aucun nom n'est fourni, ni une demande de déverrouillage requise.
+
+Les invites interactives exigent que stdin, stdout et stderr soient des terminaux,
+que `TERM` ne soit pas « dumb » et que `CI` ne soit pas actif. Sans interaction,
+le nom est obligatoire ; une suppression nommée ne demande pas de confirmation,
+même sans `--yes`.
+
+Les secrets supprimés disparaissent des lectures et listes ordinaires, mais leur
+historique de versions est conservé. Ce n'est pas un effacement sécurisé et cela
+ne révoque pas l'identifiant chez son fournisseur externe. Consultez
+`sotto history` et `sotto rollback` pour la restauration.
+
 ### Partager un secret
 
 `sotto share` chiffre un secret dans un lien à usage unique. La clé se trouve après le `#` du lien,
@@ -337,15 +406,16 @@ tokens machine qu'il a créés dans l'organisation, en les nommant pour que vous
 La rotation protège ce qui est écrit ensuite. Les valeurs que le membre a déjà vues restent exposées :
 changez-les à leur source.
 
-#### Forfait de l'organisation
+#### Anciens forfaits d'organisation
 
 `sotto org plan <org-id>` lit la vue d'entitlements actuelle du serveur configuré pour cette
 organisation. Vous devez être connecté (`sotto login`) ; le coffre local n'a pas besoin d'être
-déverrouillé. Il affiche le niveau assigné, le niveau effectif (celui dont les limites s'appliquent
-maintenant), la fin de l'essai lorsque l'organisation en a une, et soit des limites de membres et
-de projets d'organisation, soit `limits: none (Team)`.
+déverrouillé. Il affiche le niveau assigné, le niveau effectif, la fin d'essai enregistrée et les
+limites applicables, comme `limits: none (Team)`. Ces champs préservent la compatibilité avec les anciens enregistrements et
+déploiements à forfait d'organisation ; ils ne décrivent ni les tarifs Cloud actuels par personne ni
+une nouvelle offre d'essai Cloud.
 
-Sortie illustrative sur Sotto Cloud pour une organisation gratuite dont l'essai est terminé :
+Sortie illustrative d'un ancien enregistrement de forfait d'organisation :
 
 ```text
 tier:      free
@@ -364,8 +434,8 @@ trial:     ends 2026-07-16T09:00:00Z
 limits:    none (Team)
 ```
 
-Ces exemples sont illustratifs ; les organisations réelles peuvent afficher des niveaux, essais et
-limites différents.
+Ces exemples montrent des champs de compatibilité enregistrés, pas les offres Cloud actuelles. Les
+déploiements réels peuvent présenter d'autres niveaux, dates d'essai et limites enregistrés.
 
 #### Journal d’audit de l’organisation
 
@@ -384,10 +454,10 @@ au format `timestamp  action  actor`, avec éventuellement les champs `target=..
 `(detail)`. Il s’agit d’une vue limitée de l’activité et des métadonnées, pas d’un moyen de récupérer
 des valeurs secrètes ; elle ne fournit ni pagination ni archive historique complète.
 
-Sur Sotto Cloud, l’organisation doit disposer du niveau Team effectif, y compris pendant un essai
-Team actif. Les déploiements auto-hébergés ignorent ce contrôle de forfait, mais l’appelant doit
-toujours avoir le rôle de propriétaire ou d’administrateur. S’il n’y a aucun événement, la commande
-n’affiche aucune ligne et se termine avec succès.
+Cette commande conserve le contrôle d'accès historique par forfait Team d'organisation. Les
+déploiements auto-hébergés ignorent ce contrôle de forfait, mais l’appelant doit toujours avoir le
+rôle de propriétaire ou d’administrateur. S’il n’y a aucun événement, la commande n’affiche aucune
+ligne et se termine avec succès.
 
 ### Tokens machine et CI
 
@@ -482,6 +552,42 @@ Sans `sotto.toml` ni identité locale :
 ```
 
 L'absence de `sotto.toml` signifie qu'aucun projet n'est sélectionné. Un fichier invalide ou illisible provoque une erreur.
+
+### Verrouiller, déverrouiller et se déconnecter
+
+Pour une identité locale déjà initialisée, verrouillez le coffre, vérifiez son
+état, puis déverrouillez-le lorsque vous en avez de nouveau besoin :
+
+```sh
+sotto lock
+sotto status
+sotto unlock
+```
+
+`sotto lock` efface la session locale de clé maîtresse en cache utilisée par les
+commandes CLI suivantes. Cette commande ne supprime ni votre identité, ni le coffre
+chiffré, ni la connexion enregistrée au serveur de synchronisation. `sotto unlock`
+utilise votre mot de passe maître lorsqu'aucune session valide n'est en cache. Les
+commandes nécessitant un déchiffrement local demandent aussi le déverrouillage si
+nécessaire. Consultez [Consulter l'état local](#consulter-létat-local) pour les champs d'état.
+
+La session locale dure 12 heures à partir de la mise en cache de la clé, et non de
+votre dernière activité. L'expiration est vérifiée lors de la lecture de la clé en
+cache. Exécuter `sotto unlock` alors que le coffre est déjà déverrouillé ne prolonge
+pas cette durée. Ni le verrouillage ni l'expiration n'effacent le texte en clair
+déjà détenu par les applications en cours d'exécution.
+
+Pour effacer aussi la connexion de la CLI au serveur de synchronisation,
+exécutez les deux commandes :
+
+```sh
+sotto lock
+sotto logout
+```
+
+`sotto logout` supprime le jeton de session du serveur enregistré par la CLI,
+indépendamment du cache de déverrouillage local. Cette commande ne déconnecte pas
+les sessions du navigateur ni les autres appareils.
 
 ### État Cloud
 

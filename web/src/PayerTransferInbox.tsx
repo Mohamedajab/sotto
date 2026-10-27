@@ -66,10 +66,13 @@ export function PayerTransferInbox() {
   const [setupAvailable, setSetupAvailable] = useState(false);
   const [userId, setUserId] = useState<string | null>(null);
   const [transfers, setTransfers] = useState<PayerTransfer[]>([]);
+  // The list has been received at least once, so an empty one really means no requests.
+  const [listLoaded, setListLoaded] = useState(false);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [busyAction, setBusyAction] = useState<"accept" | "withdraw" | "setup" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [expiryTick, setExpiryTick] = useState(0);
@@ -81,6 +84,7 @@ export function PayerTransferInbox() {
       const page = await fetchPayerTransfers();
       setTransfers(page.transfers);
       setNextCursor(page.nextCursor);
+      setListLoaded(true);
     } catch (e) {
       setError(message(e));
     } finally {
@@ -167,6 +171,7 @@ export function PayerTransferInbox() {
 
   async function act(transfer: PayerTransfer, action: "accept" | "withdraw" | "setup") {
     setBusyId(transfer.transferId);
+    setBusyAction(action);
     setError(null);
     setNotice(null);
     try {
@@ -193,6 +198,7 @@ export function PayerTransferInbox() {
       }
     } finally {
       setBusyId(null);
+      setBusyAction(null);
     }
   }
 
@@ -205,7 +211,7 @@ export function PayerTransferInbox() {
     {notice !== null && <p className="notice" role="status">{notice}</p>}
     <button disabled={loading || loadingMore || busyId !== null} onClick={() => void refresh()}>{loading ? "Refreshing transfers…" : "Refresh transfers"}</button>
     {loading && <p className="muted" role="status">Loading transfer requests…</p>}
-    {!loading && transfers.length === 0 && <p className="muted">There are no payer transfer requests for this account.</p>}
+    {!loading && listLoaded && transfers.length === 0 && <p className="muted">There are no payer transfer requests for this account.</p>}
     <ul className="items">
       {transfers.map((transfer) => {
         const incoming = transfer.participantRole === "counterparty";
@@ -227,8 +233,8 @@ export function PayerTransferInbox() {
           {actionable && incoming && transfer.destinationKind === "personal" && !setupAvailable
             && <p className="muted">Personal payment setup is not available on this server yet. The request has not been accepted.</p>}
           {actionable && incoming && <>
-            {(transfer.destinationKind !== "personal" || setupAvailable) && <button disabled={busyId !== null} onClick={() => void act(transfer, "accept")}>{busyId === transfer.transferId ? "Accepting…" : "Accept transfer request"}</button>}{" "}
-            <button disabled={busyId !== null} onClick={() => void act(transfer, "withdraw")}>Decline request</button>
+            {(transfer.destinationKind !== "personal" || setupAvailable) && <button disabled={busyId !== null} onClick={() => void act(transfer, "accept")}>{busyId === transfer.transferId && busyAction === "accept" ? "Accepting…" : "Accept transfer request"}</button>}{" "}
+            <button disabled={busyId !== null} onClick={() => void act(transfer, "withdraw")}>{busyId === transfer.transferId && busyAction === "withdraw" ? "Declining…" : "Decline request"}</button>
           </>}
           {actionable && !incoming && <button disabled={busyId !== null} onClick={() => void act(transfer, "withdraw")}>Withdraw request</button>}
           {setupRequired && <button disabled={busyId !== null} onClick={() => void act(transfer, "setup")}>Set up payment method</button>}

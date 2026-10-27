@@ -170,7 +170,7 @@ reusable-workflow examples.
 
 Want a runnable demo? [**sotto-example**](https://github.com/getsotto/sotto-example)
 walks through local secret injection with a Python GIF and copyable steps, plus tiny examples
-in JavaScript, TypeScript, Java, C#, PHP, Go, and C++. No account required; instructions cover
+in JavaScript, TypeScript, Java, C#, PHP, Go, Rust, and C++. No account required; instructions cover
 macOS, Linux, and Windows.
 
 ```sh
@@ -251,6 +251,73 @@ sotto env copy dev staging --confirm  # apply the copy; never delete destination
 environment) or `>` (only in the second). Without `--confirm`, copying is a dry-run. A confirmed
 copy adds and updates secrets but leaves keys that exist only in the destination untouched.
 
+### Import a dotenv file
+
+`sotto import` reads a dotenv file and sets each assignment in one environment, encrypting every
+value locally. It writes to the active environment unless you name another with `--env`:
+
+```sh
+sotto import .env                         # into the active environment
+sotto import --env staging .env.staging   # into staging; the default environment is unchanged
+```
+
+An import merges into what is already there. Suppose `staging` already holds `API_URL` and `REGION`,
+and `.env.staging` contains:
+
+```dotenv
+API_URL=https://staging.example.test
+FEATURE_FLAG=on
+```
+
+After importing it into `staging`:
+
+- `API_URL` takes the value from the file, because an existing name is updated.
+- `FEATURE_FLAG` is added, because a new name is created.
+- `REGION` is kept, because a name that is missing from the file is never removed.
+
+Import writes to your local store only. After `sotto login`, upload the result as a separate step:
+
+```sh
+sotto push --env staging
+```
+
+The dotenv file is only read: import does not change, consume or delete it, so protect or remove it
+yourself if it holds real values. A file that does not parse changes nothing, but a failure while
+writing does not undo the assignments already stored, so check `sotto ls --env staging` after an
+interrupted import.
+
+To get an earlier value back, see [Restore an earlier secret version](#restore-an-earlier-secret-version).
+That history comes from the server, so it only helps for values you had already pushed. Run
+`sotto import --help` for the quoting and literal-value rules instead of repeating them here.
+
+### Remove a secret
+
+To remove an obsolete secret from `staging` without changing your default environment:
+
+```sh
+sotto --env staging rm DEMO_OBSOLETE_KEY
+sotto --env staging push
+sotto --env staging pull
+```
+
+`sotto rm` removes the secret from the selected environment in your local vault.
+`sotto push` synchronises the removal with the server after `sotto login`; run
+`sotto pull` for that same environment on another device to receive the removal.
+Run the final command on the other device, not the device that made the change.
+
+In an interactive terminal, `sotto rm` without a name opens the secret picker.
+Removal then asks for confirmation, with No as the default; cancelling or declining
+does not remove anything. `--yes` (or `-y`) skips confirmation but never skips
+the picker when the name is omitted or a required unlock prompt.
+
+Interactive prompts require stdin, stdout and stderr to be terminals, a non-dumb
+`TERM`, and `CI` not being active. In non-interactive use, the name is required;
+a named removal proceeds without confirmation even if `--yes` is absent.
+
+Removed secrets disappear from ordinary reads and listings, but their version
+history remains. This is not secure erasure and does not revoke a credential at
+its external provider. Use `sotto history` and `sotto rollback` for recovery.
+
 ### Share a secret
 
 `sotto share` encrypts one secret into a one-time link. The key sits after the `#` in the link,
@@ -326,15 +393,16 @@ tokens they created in the organisation, naming each so you can recreate it. Rot
 is written afterwards. Values the member has already seen stay exposed, so change them at their
 source.
 
-#### Organisation plan
+#### Legacy organisation entitlements
 
 `sotto org plan <org-id>` reads the configured server's current entitlement view for that
 organisation. You must be logged in (`sotto login`); the local vault does not need to be unlocked.
-It prints the assigned tier, the effective tier (the tier whose limits apply now), the trial end
-when the organisation has one, and either member and organisation-project limits or
-`limits: none (Team)`.
+It prints the assigned tier, effective tier, stored trial end, and either member and
+organisation-project limits or `limits: none (Team)`. These fields preserve compatibility with
+existing organisation-tier records and deployments; they do not describe current Sotto Cloud
+person-based pricing or a new Cloud trial offer.
 
-Illustrative output on Sotto Cloud for a free organisation whose trial has ended:
+Illustrative output from a legacy organisation-tier record:
 
 ```text
 tier:      free
@@ -343,8 +411,8 @@ trial:     ends 2026-07-16T09:00:00Z
 limits:    3 members, 1 org project(s)
 ```
 
-A self-hosted server applies no plan limits, so it always reports the effective tier as `team`,
-whatever tier and trial end the organisation has stored:
+A self-hosted server applies no plan limits, so it reports the effective tier as `team`, whatever
+tier and trial end the organisation has stored:
 
 ```text
 tier:      free
@@ -353,7 +421,8 @@ trial:     ends 2026-07-16T09:00:00Z
 limits:    none (Team)
 ```
 
-These examples are illustrative; real organisations may show different tiers, trials, and limits.
+These examples show stored compatibility fields, not current Cloud offers. Real deployments may
+show different stored tiers, trial dates, and limits.
 
 #### Organisation audit log
 
@@ -370,9 +439,9 @@ event as `timestamp  action  actor`, with optional `target=...`, `env=...`, and 
 is a bounded activity/metadata view, not a way to retrieve secret values, and it does not provide
 pagination or a complete historical archive.
 
-On Sotto Cloud, the organisation needs effective Team entitlement, including an active Team trial.
-Self-hosted deployments skip this plan gate, but the caller still needs the owner/admin role. If no
-events are available, the command prints no rows and exits successfully.
+This command retains the legacy organisation Team-entitlement gate. Self-hosted deployments skip
+that plan gate, but the caller still needs the owner/admin role. If no events are available, the
+command prints no rows and exits successfully.
 
 ### Machine tokens and CI
 
@@ -463,6 +532,38 @@ Without a `sotto.toml` or local identity:
 ```
 
 An absent `sotto.toml` means no project is selected. A malformed or unreadable file is an error.
+
+### Lock, unlock and log out
+
+For an already-initialised local identity, lock the vault, check its state, then
+unlock it when you need it again:
+
+```sh
+sotto lock
+sotto status
+sotto unlock
+```
+
+`sotto lock` clears the cached local master-key session used by subsequent CLI
+commands. It does not delete your identity, encrypted vault or saved sync-server
+login. `sotto unlock` uses your master password when no valid cached session is
+available. Commands that need local decryption also request unlocking when needed.
+See [Inspect local status](#inspect-local-status) for the status fields.
+
+The local session lasts 12 hours from when the key is cached, not from your last
+activity. Expiry is checked when the cached key is read. Running `sotto unlock`
+while already unlocked does not extend that lifetime. Neither locking nor expiry
+clears plaintext already held by running applications.
+
+To clear the CLI's saved sync-server login as well, run both commands:
+
+```sh
+sotto lock
+sotto logout
+```
+
+`sotto logout` removes the CLI's stored server session token, independently of the
+local unlock cache. It does not sign out browser sessions or other devices.
 
 ### Cloud status
 

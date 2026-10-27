@@ -5,12 +5,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as api from "../api";
 import { CloudAccountPanel } from "../CloudAccountPanel";
 
-vi.mock("../api", () => ({
+vi.mock("../api", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../api")>(),
   cancelPersonalBilling: vi.fn(),
   createPersonalCheckout: vi.fn(),
   createPersonalPortal: vi.fn(),
   fetchCloudExportChunk: vi.fn(),
   fetchCloudNotices: vi.fn(),
+  fetchCloudContactStatus: vi.fn(),
   fetchEligibility: vi.fn(),
   fetchOrgs: vi.fn(),
   fetchPayerTransferCapabilities: vi.fn(),
@@ -47,6 +49,7 @@ describe("CloudAccountPanel billing portal", () => {
       payer: "personal", deploymentMode: "cloud",
     });
     vi.mocked(api.fetchCloudNotices).mockResolvedValue([]);
+    vi.mocked(api.fetchCloudContactStatus).mockRejectedValue(new api.UnsupportedCloudContactError());
     vi.mocked(api.fetchPayerTransferCapabilities).mockResolvedValue({ available: false, setupAvailable: false });
     vi.mocked(api.me).mockResolvedValue(null);
     vi.mocked(api.fetchOrgs).mockResolvedValue([]);
