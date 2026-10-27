@@ -12,9 +12,12 @@ vi.mock("../api", () => ({
   fetchCloudExportChunk: vi.fn(),
   fetchCloudNotices: vi.fn(),
   fetchEligibility: vi.fn(),
+  fetchOrgs: vi.fn(),
+  fetchPayerTransferCapabilities: vi.fn(),
   fetchPersonalLifecycle: vi.fn(),
   fetchPersonalQuote: vi.fn(),
   fetchPersonalOperation: vi.fn(),
+  me: vi.fn(),
   requestPersonalRefund: vi.fn(),
   startCloudExport: vi.fn(),
 }));
@@ -44,6 +47,9 @@ describe("CloudAccountPanel billing portal", () => {
       payer: "personal", deploymentMode: "cloud",
     });
     vi.mocked(api.fetchCloudNotices).mockResolvedValue([]);
+    vi.mocked(api.fetchPayerTransferCapabilities).mockResolvedValue({ available: false, setupAvailable: false });
+    vi.mocked(api.me).mockResolvedValue(null);
+    vi.mocked(api.fetchOrgs).mockResolvedValue([]);
     vi.mocked(api.fetchPersonalLifecycle).mockResolvedValue(lifecycle);
   });
 
